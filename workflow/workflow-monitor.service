@@ -1,0 +1,15 @@
+[Unit]
+Description=Workflow Monitor Service
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/bin/python3 /opt/workflow/workflow/monitor_service.py start
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

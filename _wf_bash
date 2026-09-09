@@ -1,0 +1,29 @@
+#!/bin/zsh
+
+# Simple completion test for wf
+_wf_complete() {
+    local cur prev opts repos
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    
+    case "${prev}" in
+        wf|wfcd)
+            # Get command options
+            opts="init start done switch cd branch ai shelve unshelve status config slack alias hook"
+            COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+            ;;
+        cd)
+            # Get repositories for cd command
+            repos=($(wf config show 2>/dev/null | grep -E "^  /" | awk '{print $1}' | xargs -I {} basename {}))
+            COMPREPLY=( $(compgen -W "${repos}" -- ${cur}) )
+            ;;
+        *)
+            COMPREPLY=()
+            ;;
+    esac
+}
+
+# Register completion
+complete -F _wf_complete wf
+complete -F _wf_complete wfcd

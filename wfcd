@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# wfcd - Direct executable that changes directory and starts new shell
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Get repo path from wf command
+REPO_PATH=$("$SCRIPT_DIR/wf" cd "$1" 2>/dev/null)
+
+if [[ -n "$REPO_PATH" && -d "$REPO_PATH" ]]; then
+    echo "Changed to: $REPO_PATH"
+    # Change directory and exec new shell to maintain it
+    cd "$REPO_PATH"
+    exec "$SHELL"
+else
+    # Show error from wf cd command
+    "$SCRIPT_DIR/wf" cd "$1"
+fi

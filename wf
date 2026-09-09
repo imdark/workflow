@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -e
+# Resolve the real path of this script, following symlinks (e.g. when
+# invoked via /usr/local/bin/wf -> <install dir>/wf), so we can find the
+# venv relative to the actual install directory rather than the symlink's.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+# Source the virtual environment from the original install directory
+source "$SCRIPT_DIR/.venv/bin/activate"
+exec python -m workflow.cli "$@"

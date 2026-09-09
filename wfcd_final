@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# wfcd - working directory changer
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+REPO_PATH=$("$SCRIPT_DIR/wf" cd "$1" 2>/dev/null)
+
+if [[ -n "$REPO_PATH" && -d "$REPO_PATH" ]]; then
+    # Use cd to change directory in current shell
+    cd "$REPO_PATH"
+    echo "Changed to: $REPO_PATH"
+    
+    # Optionally start a new shell to maintain the directory change
+    if [[ "$2" != "--no-shell" ]]; then
+        echo "Starting new shell in repository directory..."
+        exec zsh
+    fi
+else
+    # Show error from wf cd command
+    "$SCRIPT_DIR/wf" cd "$1"
+fi

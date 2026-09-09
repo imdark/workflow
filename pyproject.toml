@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "work-flow"
+version = "0.1.0"
+description = "Developer workflow CLI"
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    "keyring>=24.0.0",
+    "PyYAML>=6.0",
+    "jira>=3.0.0",
+    "typer[all]>=0.7.0",
+    "fastmcp>=2.0.0",
+]
+
+[tool.setuptools]
+packages = ["workflow"]
+
+[project.scripts]
+wf = "workflow.cli:app"

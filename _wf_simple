@@ -1,0 +1,50 @@
+#compdef wf wfcd
+
+_wf_complete_repos() {
+    local -a repos
+    repos=($(wf config show 2>/dev/null | grep -E "^  /" | awk '{print $1}' | xargs -I {} basename {}))
+    _describe 'repositories' repos
+}
+
+_wf_complete_commands() {
+    local -a commands
+    commands=(
+        'init:Initialize workflow configuration'
+        'start:Start working on a task' 
+        'done:Complete current task'
+        'switch:Switch to a different task'
+        'cd:Change to repository directory'
+        'branch:Manage git branches'
+        'ai:Launch AI session'
+        'shelve:Shelve current changes'
+        'unshelve:Restore shelved changes'
+        'status:Show current task status'
+        'config:Configure workflow settings'
+        'slack:Slack integration commands'
+        'alias:Manage command aliases'
+        'hook:Manage command hooks'
+    )
+    _describe 'commands' commands
+}
+
+_wf() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    _arguments -C \
+        '1: :->command' \
+        '*: :->args' && return 0
+
+    case $state in
+        command)
+            _wf_complete_commands
+            ;;
+        args)
+            case $line[1] in
+                cd)
+                    _wf_complete_repos
+                    ;;
+            esac
+            ;;
+    esac
+}
