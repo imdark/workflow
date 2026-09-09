@@ -6,6 +6,11 @@ import requests
 import time
 
 
+# Every endpoint here drives a real page, so the whole module needs a
+# Chrome with remote debugging (see the `chrome` fixture in conftest.py).
+pytestmark = pytest.mark.usefixtures("chrome")
+
+
 class TestPagesCommand:
     """Test pages listing"""
     

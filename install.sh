@@ -124,8 +124,17 @@ case "$CURRENT_SHELL" in
     echo "📝 Installing bash completion..."
     mkdir -p ~/.bash_completion.d
     source .venv/bin/activate
-    _WF_COMPLETE=bash_source wf > ~/.bash_completion.d/wf-completion.bash 2>/dev/null || true
-    echo "✅ Bash completion installed to ~/.bash_completion.d/wf-completion.bash"
+    # Typer's completion classes are named source_bash/complete_bash (Click's
+    # own bash_source/zsh_source names are not registered), and the variable
+    # name itself is derived from the program name, which cli.py pins to "wf".
+    # sed drops the leading blank line Typer emits.
+    if _WF_COMPLETE=source_bash wf | sed '/./,$!d' > ~/.bash_completion.d/wf-completion.bash && \
+       [ -s ~/.bash_completion.d/wf-completion.bash ]; then
+      echo "✅ Bash completion installed to ~/.bash_completion.d/wf-completion.bash"
+    else
+      rm -f ~/.bash_completion.d/wf-completion.bash
+      echo "⚠️  Could not generate bash completion; skipping"
+    fi
     
     # Add to bashrc if not already there
     if ! grep -q "wf-completion.bash" ~/.bashrc 2>/dev/null; then
@@ -139,8 +148,18 @@ case "$CURRENT_SHELL" in
     echo "📝 Installing zsh completion..."
     mkdir -p ~/.zsh/completion
     source .venv/bin/activate
-    _WF_COMPLETE=zsh_source wf > ~/.zsh/completion/_wf 2>/dev/null || true
-    echo "✅ Zsh completion installed to ~/.zsh/completion/_wf"
+    # See the note above: source_zsh, and _WF_COMPLETE only works because
+    # cli.py pins prog_name="wf". An empty _wf here silently shadows every
+    # other completion for `wf` on fpath, so don't leave one behind.
+    # sed strips the leading blank line Typer emits: zsh only honors
+    # `#compdef` on the very first line of the file.
+    if _WF_COMPLETE=source_zsh wf | sed '/./,$!d' > ~/.zsh/completion/_wf && \
+       [ -s ~/.zsh/completion/_wf ]; then
+      echo "✅ Zsh completion installed to ~/.zsh/completion/_wf"
+    else
+      rm -f ~/.zsh/completion/_wf
+      echo "⚠️  Could not generate zsh completion; skipping"
+    fi
     
     # Add to zshrc if not already there
     ZSHRC="$HOME/.zshrc"

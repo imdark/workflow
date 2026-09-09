@@ -1,9 +1,13 @@
 class Issue:
-    def __init__(self, key, title, description, updated=None):
+    def __init__(self, key, title, description, updated=None, url=None):
         self.key = key
         self.title = title
         self.description = description
         self.updated = updated
+        # Web URL for the issue, when the backend can supply one (Linear
+        # returns it directly; Jira/Markdown leave it None and callers fall
+        # back to backend.issue_url()).
+        self.url = url
 
 class TaskBackend:
     def get(self, key) -> Issue: ...
@@ -13,3 +17,4 @@ class TaskBackend:
     def move_to_done(self, issue): ...
     def move_to_review(self, issue): ...
     def create_issue(self, summary, description, issue_type="Task", project_key=None) -> Issue | None: ...
+    def issue_url(self, key) -> str | None: ...

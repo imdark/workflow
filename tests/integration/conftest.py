@@ -26,6 +26,45 @@ def test_state_dir(tmp_path):
     return state_dir
 
 
+def chrome_debug_port():
+    return int(os.environ.get("CHROME_DEBUG_PORT", CHROME_PORT))
+
+
+def chrome_ws_endpoint(port):
+    """Chrome's CDP websocket URL, or None when no debuggable Chrome is up.
+
+    Asks over `localhost` rather than 127.0.0.1 for the same reason
+    workflow.browser_daemon.discover_ws_endpoint does -- Chrome doesn't
+    always answer on the IPv4 literal.
+    """
+    try:
+        response = requests.get(f"http://localhost:{port}/json/version", timeout=2)
+        return response.json().get("webSocketDebuggerUrl")
+    except Exception:
+        return None
+
+
+@pytest.fixture(scope="session")
+def chrome():
+    """Skip unless a Chrome with remote debugging is available to drive.
+
+    Every endpoint except /health goes through the daemon's get_browser(),
+    which connects to an already-running Chrome over CDP. Without one those
+    endpoints return 500 (or a non-JSON body), so the tests are skipped
+    rather than reported as failures of this codebase.
+    """
+    port = chrome_debug_port()
+    endpoint = chrome_ws_endpoint(port)
+    if not endpoint:
+        pytest.skip(
+            f"no Chrome with remote debugging on port {port}. Start one with:\n"
+            f'  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" '
+            f"--remote-debugging-port={port}\n"
+            "or point CHROME_DEBUG_PORT at an existing one."
+        )
+    return endpoint
+
+
 def is_port_open(port):
     """Check if a port is open"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -75,7 +114,16 @@ def browser_daemon(clean_port, daemon_port, monkeypatch):
         env={**os.environ, "BROWSER_DAEMON_PORT": str(daemon_port)}
     )
     
-    wait_for_port(daemon_port, timeout=10)
+    started = wait_for_port(daemon_port, timeout=10)
+    if not started:
+        # Otherwise every test in the file fails against a dead daemon with
+        # a confusing connection error instead of the real reason.
+        proc.kill()
+        _, stderr = proc.communicate(timeout=5)
+        pytest.fail(
+            f"browser daemon did not come up on port {daemon_port}:\n"
+            f"{stderr.decode(errors='replace')[-2000:]}"
+        )
     time.sleep(1)
     
     yield daemon_port

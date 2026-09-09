@@ -926,6 +926,12 @@ class JiraBackend(TaskBackend):
         """Move an issue to Review status"""
         self._transition(issue.key, "Code Review")
 
+    def issue_url(self, key):
+        """Browse URL for an issue, built from the configured Jira server."""
+        key = getattr(key, "key", key)
+        server = (self.client._options.get("server") or "").rstrip("/")
+        return f"{server}/browse/{key}" if server else None
+
     def is_done(self, issue):
         """Check if an issue is in a done/completed state"""
         try:

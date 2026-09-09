@@ -80,6 +80,29 @@ def add_project(name: str, config: Dict[str, Any]) -> None:
     save_config(cfg)
 
 
+def update_project(name: str, changes: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge `changes` into an existing project and save.
+
+    Nested dicts (linear, jira) are merged a level deep so setting
+    linear.team doesn't drop a project's other Linear overrides. Returns
+    the updated project config.
+    """
+    cfg = load_config()
+
+    if "projects" not in cfg or name not in cfg["projects"]:
+        raise ValueError(f"Project '{name}' not found")
+
+    project = cfg["projects"][name]
+    for key, value in changes.items():
+        if isinstance(value, dict) and isinstance(project.get(key), dict):
+            project[key] = {**project[key], **value}
+        else:
+            project[key] = value
+
+    save_config(cfg)
+    return project
+
+
 def remove_project(name: str) -> None:
     """Remove a project configuration"""
     cfg = load_config()
@@ -129,10 +152,15 @@ def get_current_project() -> Optional[str]:
 
 
 def get_current_project_key() -> Optional[str]:
-    """Get the Jira project key for the current project"""
+    """Get the issue-key prefix for the current project.
+
+    That's the Jira project key or the Linear team key, depending on which
+    backend the project is tracked in -- both are the prefix in PROJ-123.
+    """
     config = get_current_project_config()
     if config:
-        return config.get("jira", {}).get("project")
+        return (config.get("jira", {}).get("project")
+                or config.get("linear", {}).get("team"))
     return None
 
 
@@ -279,6 +307,11 @@ def get_effective_config(auto_switch: bool = True) -> Dict[str, Any]:
         global_jira = cfg.get('jira', {})
         project_jira = project_config.get('jira', {})
         effective['jira'] = {**global_jira, **project_jira}
+    
+    # Same for Linear, so a project can set just its team and still inherit
+    # the global workspace slug and state overrides.
+    if 'linear' in project_config:
+        effective['linear'] = {**cfg.get('linear', {}), **project_config.get('linear', {})}
     
     return effective
 

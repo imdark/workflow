@@ -7,6 +7,11 @@ import time
 from pathlib import Path
 
 
+# Every endpoint here drives a real page, so the whole module needs a
+# Chrome with remote debugging (see the `chrome` fixture in conftest.py).
+pytestmark = pytest.mark.usefixtures("chrome")
+
+
 class TestScreenshotCommand:
     """Test screenshot functionality"""
     
@@ -69,8 +74,8 @@ class TestScreenshotCommand:
         assert "saved_path" in result
     
     def test_screenshot_different_formats(self, daemon_url, tmp_path):
-        """Screenshot should work with different paths"""
-        for filename in ["test1.png", "test2.jpg", "test3.webp"]:
+        """Screenshot should work with the formats pyppeteer supports"""
+        for filename in ["test1.png", "test2.jpg", "test3.jpeg"]:
             output_path = tmp_path / filename
             
             requests.put(
@@ -86,3 +91,20 @@ class TestScreenshotCommand:
                 timeout=30
             )
             assert response.status_code == 200
+
+    def test_screenshot_unsupported_format_errors_as_json(self, daemon_url, tmp_path):
+        """An unsupported format must fail as JSON, not a bodyless 500"""
+        requests.put(
+            f"{daemon_url}/open",
+            json={"url": "https://example.com"},
+            timeout=60
+        )
+        time.sleep(0.5)
+
+        response = requests.post(
+            f"{daemon_url}/screenshot",
+            json={"output": str(tmp_path / "shot.webp")},
+            timeout=30
+        )
+        assert response.status_code == 500
+        assert response.json()["status"] == "error"

@@ -269,7 +269,8 @@ def autocomplete_active_tasks(ctx, args, incomplete: str):
     if current_project:
         project_config = get_project(current_project)
         if project_config:
-            project_key = project_config.get("jira", {}).get("project")
+            project_key = (project_config.get("jira", {}).get("project")
+                           or project_config.get("linear", {}).get("team"))
     
     cfg = load_config()
     backend = get_backend(cfg)

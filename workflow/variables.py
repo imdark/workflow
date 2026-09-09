@@ -207,13 +207,24 @@ class VariableResolver:
         
         return None
     
+    def _default_tracker_key(self) -> str:
+        """The project/team key to ask the active backend about.
+
+        `jira_sprint`/`jira_field` variables predate the Linear backend, so
+        they keep their names but resolve against whichever backend is
+        configured -- a Linear cycle is the same idea as a Jira sprint.
+        """
+        if self.config.get("task_backend", "jira") == "linear":
+            return self.config.get("linear", {}).get("team") or ""
+        return self.config.get("jira", {}).get("project", "DEV")
+
     def _resolve_jira_sprint(self, var_config: Dict[str, Any]) -> Any:
-        """Resolve Jira sprint variable"""
+        """Resolve the active sprint (Jira) / cycle (Linear) variable"""
         try:
             from workflow.backends import get_backend
             backend = get_backend(self.config)
             
-            project_key = var_config.get("project_key", self.config.get("jira", {}).get("project", "DEV"))
+            project_key = var_config.get("project_key") or self._default_tracker_key()
             active_sprint = backend.get_active_sprint(project_key)
             
             if not active_sprint:
@@ -242,7 +253,7 @@ class VariableResolver:
             if not field_name:
                 return None
             
-            project_key = var_config.get("project_key", self.config.get("jira", {}).get("project", "DEV"))
+            project_key = var_config.get("project_key") or self._default_tracker_key()
             active_sprint = backend.get_active_sprint(project_key)
             
             if not active_sprint:

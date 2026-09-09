@@ -373,6 +373,13 @@ def generate_workflow_info() -> str:
             jira_cfg = cfg['jira']
             info.append(f"Jira URL: {jira_cfg.get('url', 'Unknown')}")
             info.append(f"Jira Project: {jira_cfg.get('project', 'Unknown')}")
+
+        if 'linear' in cfg:
+            # Deliberately no api_key here -- this text is handed to the LLM.
+            linear_cfg = cfg['linear']
+            info.append(f"Linear Team: {linear_cfg.get('team', 'Unknown')}")
+            if linear_cfg.get('workspace'):
+                info.append(f"Linear Workspace: {linear_cfg['workspace']}")
         
         if 'repositories' in cfg and cfg['repositories']:
             info.append(f"Configured repositories: {len(cfg['repositories'])}")

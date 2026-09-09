@@ -30,17 +30,77 @@ from workflow.teleop_issues import (
 from workflow.browser_client import BrowserClient, is_daemon_running, start_daemon
 from workflow.teleop_linear_sync import scan_new_issue_status, convert_new_issue, AlreadyConverted
 from workflow.config import set_slack_channel, set_slack_message_template, add_slack_user_mapping, get_slack_config
+from workflow.config import get_linear_config, save_linear_token_to_keychain, delete_linear_token_from_keychain
 from workflow.backends import get_backend
 from workflow.terminal import open_terminal_tabs
 from workflow.aliases import AliasManager
 from workflow.hooks import HookManager
 from workflow.variables import VariableResolver
 from workflow.notifications import get_notification_service
-from workflow.projects import add_project, remove_project, list_projects, get_project, set_current_project, get_current_project, migrate_to_project_config
+from workflow.projects import add_project, update_project, remove_project, list_projects, get_project, set_current_project, get_current_project, migrate_to_project_config
 from rich.console import Console
 from rich.table import Table
 
 console = Console(color_system=None)
+
+
+# Human-readable names for the task backends, used in output like
+# "🔗 Linear: https://..." so messages read correctly whichever one is active.
+_BACKEND_LABELS = {"jira": "Jira", "linear": "Linear", "markdown": "Local task"}
+
+
+def _backend_label(cfg=None):
+    """Display name of the active task backend."""
+    if cfg is None:
+        cfg = load_effective_config()
+    backend_type = cfg.get("task_backend", "jira")
+    return _BACKEND_LABELS.get(backend_type, backend_type.capitalize())
+
+
+def _project_tracker_key(project_config):
+    """The issue-key prefix a project's tasks carry, and what to call it.
+
+    Projects configure this as `jira.project` or `linear.team` depending on
+    the backend; both end up as the prefix in keys like PROJ-123.
+    """
+    jira_project = (project_config or {}).get("jira", {}).get("project")
+    if jira_project:
+        return "Jira Project", jira_project
+    linear_team = (project_config or {}).get("linear", {}).get("team")
+    if linear_team:
+        return "Linear Team", linear_team
+    if (project_config or {}).get("task_backend") == "markdown":
+        return "Markdown Prefix", (project_config or {}).get("name")
+    return "Project Key", None
+
+
+def _issue_link(backend, issue, cfg=None):
+    """Web URL for an issue, whichever backend it came from.
+
+    Prefers a URL the backend already attached to the issue (Linear returns
+    one per issue), then the backend's issue_url(), and finally builds a
+    Jira /browse/ link from the configured server for backends that predate
+    issue_url().
+    """
+    url = getattr(issue, "url", None)
+    if url:
+        return url
+
+    if backend is not None and hasattr(backend, "issue_url"):
+        try:
+            url = backend.issue_url(issue.key)
+            if url:
+                return url
+        except Exception:
+            pass
+
+    if cfg is None:
+        cfg = load_effective_config()
+    jira_url = cfg.get("jira", {}).get("url", "")
+    if jira_url and cfg.get("task_backend", "jira") == "jira":
+        return f"{jira_url.rstrip('/')}/browse/{issue.key}"
+    return None
+
 
 app = typer.Typer()
 
@@ -173,26 +233,69 @@ def test_action(
 @project_app.command("add")
 def project_add(
     name: str = typer.Argument(..., help="Project name"),
-    jira_url: str = typer.Option(..., help="Jira URL"),
-    jira_email: str = typer.Option(..., help="Jira email"),
-    jira_token: str = typer.Option(..., help="Jira API token"),
-    jira_project: str = typer.Option(..., help="Jira project key"),
+    jira_url: str = typer.Option(None, help="Jira URL"),
+    jira_email: str = typer.Option(None, help="Jira email"),
+    jira_token: str = typer.Option(None, help="Jira API token"),
+    jira_project: str = typer.Option(None, help="Jira project key"),
+    linear_team: str = typer.Option(None, help="Linear team key (use instead of the --jira-* options)"),
+    markdown: bool = typer.Option(False, "--markdown", help="Track tasks as local markdown files in ~/.wf/tasks/<name>"),
     default_repo: str = typer.Option(None, help="Default repository path")
 ):
-    """Add a new project configuration"""
+    """Add a new project configuration, tracked in Jira, Linear or local markdown"""
     try:
-        project_config = {
-            "name": jira_project,
-            "jira": {
-                "url": jira_url,
-                "email": jira_email,
-                "token": jira_token,
-                "project": jira_project
-            },
-            "repositories": {},
-            "git_enabled": True,
-            "github_enabled": False
-        }
+        chosen = [f for f, on in (
+            ("--markdown", markdown), ("--linear-team", linear_team), ("--jira-*", jira_project),
+        ) if on]
+        if len(chosen) > 1:
+            console.print(f"❌ Pass only one tracker: {', '.join(chosen)} were all given")
+            return
+
+        if markdown:
+            project_config = {
+                # The markdown backend derives task keys (PERSONAL-1) and its
+                # ~/.wf/tasks/<dir> from the project name, so mirror it here.
+                "name": name.upper(),
+                "task_backend": "markdown",
+                "repositories": {},
+                "git_enabled": True,
+                "github_enabled": False,
+            }
+        elif linear_team:
+            project_config = {
+                "name": linear_team.upper(),
+                "task_backend": "linear",
+                # The API key lives in the Keychain, not per-project config.
+                "linear": {"team": linear_team.upper()},
+                "repositories": {},
+                "git_enabled": True,
+                "github_enabled": False,
+            }
+        else:
+            missing = [
+                flag for flag, value in (
+                    ("--jira-url", jira_url), ("--jira-email", jira_email),
+                    ("--jira-token", jira_token), ("--jira-project", jira_project),
+                ) if not value
+            ]
+            if missing:
+                console.print(f"❌ Missing required options: {', '.join(missing)}")
+                console.print("💡 For a Linear-tracked project use: wf project add <name> --linear-team <KEY>")
+                console.print("💡 For local markdown tasks use:    wf project add <name> --markdown")
+                return
+
+            project_config = {
+                "name": jira_project,
+                "task_backend": "jira",
+                "jira": {
+                    "url": jira_url,
+                    "email": jira_email,
+                    "token": jira_token,
+                    "project": jira_project
+                },
+                "repositories": {},
+                "git_enabled": True,
+                "github_enabled": False
+            }
         
         if default_repo:
             project_config["repositories"][default_repo] = {"base_branch": "main"}
@@ -200,13 +303,72 @@ def project_add(
         
         add_project(name, project_config)
         console.print(f"✅ Added project: {name}")
-        console.print(f"🔗 Jira: {jira_url}")
-        console.print(f"📝 Jira Project: {jira_project}")
+        tracker_label, tracker_key = _project_tracker_key(project_config)
+        if jira_url:
+            console.print(f"🔗 Jira: {jira_url}")
+        console.print(f"📝 {tracker_label}: {tracker_key}")
+        if markdown:
+            console.print(f"📂 Tasks: {Path.home() / '.wf' / 'tasks' / name.lower()}")
         if default_repo:
             console.print(f"📁 Default Repository: {default_repo}")
             
     except Exception as e:
         console.print(f"❌ Error adding project: {e}")
+
+
+@project_app.command("set-linear-team")
+def project_set_linear_team(
+    team: str = typer.Argument(..., help="Linear team key (e.g. PAN)"),
+    project: str = typer.Option(None, "--project", help="Project to change (default: the current one)"),
+    force: bool = typer.Option(False, "--force", help="Skip checking the key against the Linear API"),
+):
+    """Point a project at a different Linear team, keeping its repositories.
+
+    `wf config set linear.team` only writes the global default, which a
+    project's own linear block overrides -- this changes the project.
+    """
+    project = project or get_current_project()
+    if not project:
+        console.print("❌ No current project. Pass --project <name> or run: wf project change <name>")
+        return
+
+    existing = get_project(project)
+    if existing is None:
+        console.print(f"❌ Project '{project}' not found")
+        return
+
+    team = team.strip().upper()
+
+    if not force:
+        from workflow.backends import get_backend
+
+        backend = get_backend(load_effective_config(), force_type="linear")
+        if not backend:
+            return
+        try:
+            keys = [t["key"].upper() for t in backend._teams()]
+        except Exception as e:
+            console.print(f"❌ Could not check the team key against Linear: {e}")
+            console.print("💡 Set it anyway with --force")
+            return
+        if team not in keys:
+            console.print(f"❌ No Linear team with key {team}. Available: {', '.join(sorted(keys)) or '(none)'}")
+            return
+
+    previous = (existing.get("linear") or {}).get("team")
+    updated = update_project(project, {
+        "task_backend": "linear",
+        "linear": {"team": team},
+        # `name` is the key shown by `wf project list` and used as the issue
+        # prefix, so it has to move with the team.
+        "name": team,
+    })
+
+    console.print(f"✅ {project}: Linear team {previous or '(not set)'} -> {updated['linear']['team']}")
+    if existing.get("task_backend") not in (None, "linear"):
+        console.print(f"🔄 Switched task_backend from {existing['task_backend']} to linear")
+    repos = updated.get("repositories", {})
+    console.print(f"📁 Repositories kept: {len(repos)}")
 
 
 @project_app.command("remove")
@@ -233,11 +395,11 @@ def project_list():
         console.print("Configured projects:")
         for i, (project_name, project_config) in enumerate(projects.items(), 1):
             marker = " (current)" if project_name == current else ""
-            jira_project = project_config.get("jira", {}).get("project", "Unknown")
+            tracker_label, tracker_key = _project_tracker_key(project_config)
             repos = project_config.get("repositories", {})
             default_repo = project_config.get("default_repo")
             console.print(f"{i}. {project_name}{marker}")
-            console.print(f"   Jira Project: {jira_project}")
+            console.print(f"   {tracker_label}: {tracker_key or 'Unknown'}")
             console.print(f"   Repositories: {len(repos)}")
             if default_repo:
                 console.print(f"   Default Repo: {default_repo}")
@@ -281,10 +443,10 @@ def project_change(name: str = typer.Argument(..., help="Project name")):
         # Show project info
         project = get_project(name)
         if project:
-            jira_project = project.get("jira", {}).get("project", "Unknown")
+            tracker_label, tracker_key = _project_tracker_key(project)
             repos = project.get("repositories", {})
             default_repo = project.get("default_repo")
-            console.print(f"🔗 Jira Project: {jira_project}")
+            console.print(f"🔗 {tracker_label}: {tracker_key or 'Unknown'}")
             console.print(f"📁 Repositories: {len(repos)}")
             if default_repo:
                 console.print(f"⭐ Default Repo: {default_repo}")
@@ -305,10 +467,10 @@ def project_current():
         console.print(f"Current project: {current}")
         project = get_project(current)
         if project:
-            jira_project = project.get("jira", {}).get("project", "Unknown")
+            tracker_label, tracker_key = _project_tracker_key(project)
             repos = project.get("repositories", {})
             default_repo = project.get("default_repo")
-            console.print(f"🔗 Jira Project: {jira_project}")
+            console.print(f"🔗 {tracker_label}: {tracker_key or 'Unknown'}")
             console.print(f"📁 Repositories: {len(repos)}")
             if default_repo:
                 console.print(f"⭐ Default Repo: {default_repo}")
@@ -579,13 +741,31 @@ def repo_list():
 
 @config_app.command()
 def set(
-    key: str = typer.Argument(..., help="Configuration key (git_enabled, github_enabled, github_token)"),
-    value: str = typer.Argument(..., help="Configuration value (true/false or GitHub token)")
+    key: str = typer.Argument(..., help="Configuration key (git_enabled, github_enabled, github_token, task_backend, linear.<setting>)"),
+    value: str = typer.Argument(..., help="Configuration value")
 ):
     """Set configuration values"""
+    from workflow.backends import BACKEND_TYPES
+
     cfg = load_config()
     
-    if key in ["git_enabled", "github_enabled"]:
+    if key == "task_backend":
+        if value not in BACKEND_TYPES:
+            typer.echo(f"Error: task_backend must be one of: {', '.join(BACKEND_TYPES)}")
+            return
+        cfg["task_backend"] = value
+    elif key.startswith("linear."):
+        # Dotted path so Linear's nested settings (linear.team,
+        # linear.workspace, linear.states.review, ...) are all reachable.
+        parts = key.split(".")[1:]
+        section = cfg.setdefault("linear", {})
+        for part in parts[:-1]:
+            section = section.setdefault(part, {})
+        section[parts[-1]] = value.upper() if parts == ["team"] else value
+        save_config(cfg)
+        typer.echo(f"✅ Set {key} to {section[parts[-1]]}")
+        return
+    elif key in ["git_enabled", "github_enabled"]:
         if value.lower() in ["true", "yes", "y", "1"]:
             cfg[key] = True
         elif value.lower() in ["false", "no", "n", "0"]:
@@ -602,7 +782,7 @@ def set(
         os.environ["GITHUB_TOKEN"] = value
         typer.echo("✅ GitHub token saved and GitHub integration enabled")
     else:
-        typer.echo("Error: Supported keys are 'git_enabled', 'github_enabled', and 'github_token'")
+        typer.echo("Error: Supported keys are 'git_enabled', 'github_enabled', 'github_token', 'task_backend', and 'linear.<setting>'")
         return
     
     save_config(cfg)
@@ -614,6 +794,15 @@ def show():
     """Show current configuration"""
     cfg = load_config()
     import os
+    backend_type = cfg.get('task_backend', 'jira')
+    typer.echo(f"Task backend: {backend_type}")
+    if backend_type == 'jira':
+        typer.echo(f"  Jira URL: {cfg.get('jira', {}).get('url') or '(not set)'}")
+        typer.echo(f"  Jira project: {cfg.get('jira', {}).get('project') or '(not set)'}")
+    elif backend_type == 'linear':
+        linear_cfg = get_linear_config()
+        typer.echo(f"  Linear API key: {'✅' if linear_cfg.get('api_key') else '❌'}")
+        typer.echo(f"  Linear team: {linear_cfg.get('team') or '(not set)'}")
     typer.echo(f"Git enabled: {cfg.get('git_enabled', True)}")
     typer.echo(f"GitHub enabled: {cfg.get('github_enabled', True)}")
     
@@ -691,7 +880,7 @@ def autocomplete_active_tasks(ctx, args, incomplete: str):
     if current_project:
         project_config = get_project(current_project)
         if project_config:
-            project_key = project_config.get("jira", {}).get("project")
+            project_key = _project_tracker_key(project_config)[1]
     
     cfg = load_config()
     backend = get_backend(cfg)
@@ -780,7 +969,7 @@ def repo_branches(
 @config_app.command()
 def add_field(
     name: str = typer.Argument(..., help="Name of the custom field (used in --field-name=value)"),
-    field_identifier: str = typer.Argument(None, help="Jira field name or ID (auto-detected if not provided)"),
+    field_identifier: str = typer.Argument(None, help="Field name or ID (auto-detected if not provided)"),
     project_key: str = typer.Option("", help="Project key this field applies to (optional)"),
     default: str = typer.Option("", help="Default value for this field (optional - use {active_sprint}, {active_sprint_id}, or {active_sprint_state} variables)")
 ):
@@ -833,7 +1022,7 @@ def add_field(
 def search_fields(
     query: str = typer.Argument("", help="Search query for field names (empty = show all)")
 ):
-    """Search Jira fields by name"""
+    """Search the task backend's fields by name"""
     from workflow.backends import get_backend
     from workflow.config import load_config
     
@@ -1102,7 +1291,14 @@ def list_boards():
     
     try:
         cfg = load_effective_config()
+        if cfg.get("task_backend", "jira") != "jira":
+            console.print("ℹ️  Boards are a Jira concept - this command needs the Jira backend")
+            console.print("💡 Linear's equivalent is cycles; see 'wf config linear-status'")
+            return
+
         backend = get_backend(cfg)
+        if not backend:
+            return
         
         console.print("🔍 Fetching Jira boards...")
         
@@ -1260,6 +1456,121 @@ def config_delete_jira_token():
         console.print("✅ Jira token removed from macOS Keychain")
     else:
         console.print("❌ Failed to remove token from Keychain (may not exist)")
+
+
+@config_app.command("linear-token")
+def config_set_linear_token(
+    token: str = typer.Argument(None, help="Linear API key (prompted for if omitted)")
+):
+    """Store a Linear API key in the macOS Keychain"""
+    if not token:
+        token = typer.prompt("Linear API key (https://linear.app/<team-name>/settings/account/security/api-keys)", hide_input=True)
+
+    token = token.strip()
+    if not token:
+        console.print("❌ No API key provided")
+        return
+
+    if not save_linear_token_to_keychain(token):
+        console.print("❌ Failed to save the API key to the Keychain")
+        console.print("💡 Without a Keychain you can export LINEAR_API_KEY instead")
+        return
+
+    console.print("✅ Linear API key saved to macOS Keychain")
+
+    # Verify straight away -- a bad key is much cheaper to find out about
+    # here than on the next `wf start`.
+    try:
+        from workflow.backends.linear import LinearBackend
+        backend = LinearBackend(load_effective_config())
+        viewer = backend._viewer()
+        console.print(f"🔗 Authenticated as {viewer.get('displayName') or viewer.get('name')} ({viewer.get('email')})")
+        teams = backend._teams()
+        console.print(f"👥 Teams: {', '.join(t['key'] for t in teams) or '(none)'}")
+        if not get_linear_config().get("team") and len(teams) > 1:
+            console.print("💡 Set a default team: wf config set linear.team <TEAM-KEY>")
+    except Exception as e:
+        console.print(f"⚠️  Saved, but could not verify the key: {e}")
+
+
+@config_app.command("linear-token-delete")
+def config_delete_linear_token():
+    """Remove the Linear API key from the macOS Keychain"""
+    if delete_linear_token_from_keychain():
+        console.print("✅ Linear API key removed from macOS Keychain")
+    else:
+        console.print("❌ Failed to remove the API key from the Keychain (may not exist)")
+
+
+@config_app.command("linear-migrate-token")
+def config_migrate_linear_token():
+    """Move a Linear API key out of ~/.wf/config.yaml into the Keychain"""
+    from workflow.config import migrate_linear_token_to_keychain
+
+    success, message = migrate_linear_token_to_keychain()
+    console.print(f"{'✅' if success else '❌'} {message}")
+
+
+@config_app.command("linear-teams")
+def config_linear_teams():
+    """List Linear teams and their workflow states.
+
+    Use this to find the exact state names for linear.states.* when the
+    workspace's states aren't named the way the auto-detection expects.
+    """
+    from workflow.backends import get_backend
+
+    backend = get_backend(load_effective_config(), force_type="linear")
+    if not backend:
+        return
+
+    try:
+        teams = backend._teams()
+    except Exception as e:
+        console.print(f"❌ Could not fetch Linear teams: {e}")
+        return
+
+    if not teams:
+        console.print("No Linear teams found for this API key")
+        return
+
+    default_team = get_linear_config().get("team")
+    for team in teams:
+        marker = " (default)" if default_team and team["key"].upper() == default_team.upper() else ""
+        console.print(f"\n👥 [bold]{team['key']}[/bold] - {team['name']}{marker}")
+        states = sorted(team["states"]["nodes"], key=lambda st: st.get("position") or 0)
+        for state in states:
+            console.print(rf"   {state['name']} \[{state['type']}]")
+
+
+@config_app.command("linear-status")
+def config_linear_status():
+    """Show how the Linear backend is configured and which states it will use"""
+    linear_cfg = get_linear_config()
+
+    console.print(f"API key: {'✅ found' if linear_cfg.get('api_key') else '❌ missing'}")
+    console.print(f"Default team: {linear_cfg.get('team') or '(not set)'}")
+    console.print(f"Workspace slug: {linear_cfg.get('workspace') or '(not set)'}")
+
+    if not linear_cfg.get("api_key"):
+        console.print("\n💡 Store a key with: wf config linear-token")
+        return
+
+    from workflow.backends import get_backend
+
+    backend = get_backend(load_effective_config(), force_type="linear")
+    if not backend:
+        return
+
+    console.print("\n[bold]Transitions[/bold] (what wf start / review / done will set)")
+    for target, command in (("in_progress", "wf start"), ("review", "wf review"), ("done", "wf done")):
+        try:
+            state = backend._resolve_state(target)
+            override = (linear_cfg.get("states") or {}).get(target)
+            source = "configured" if override else "auto-detected"
+            console.print(rf"   {command} -> {state['name']} \[{state['type']}] ({source})")
+        except Exception as e:
+            console.print(f"   {command} -> ❌ {e}")
 
 
 @config_app.command()
@@ -1469,7 +1780,7 @@ def create(
 ):
     """
     Create a task without starting work on it:
-    - Create the issue in Jira
+    - Create the issue in the configured task backend
     - Do NOT move to In Progress
     - Do NOT create git branch
     - Do NOT set as current task
@@ -1483,10 +1794,9 @@ def create(
     
     if issue:
         typer.echo(f"✅ Created task {issue.key}: {issue.title}")
-        jira_url = cfg.get("jira", {}).get("url", "")
-        if jira_url:
-            jira_link = f"{jira_url.rstrip('/')}/browse/{issue.key}"
-            typer.echo(f"🔗 View in Jira: {jira_link}")
+        link = _issue_link(backend, issue, cfg)
+        if link:
+            typer.echo(f"🔗 View in {_backend_label(cfg)}: {link}")
     else:
         typer.echo(f"❌ Failed to create task")
 
@@ -2141,7 +2451,7 @@ def start(
             issue = backend.get_or_create(task)
         except KeyError as e:
             typer.echo(f"❌ Configuration error: {e}")
-            typer.echo("💡 Please check your Jira configuration with 'wf config show'")
+            typer.echo("💡 Please check your task backend configuration with 'wf config show'")
             raise typer.Exit(1)
         except Exception as e:
             typer.echo(f"❌ Error processing task '{task}': {e}")
@@ -4042,14 +4352,13 @@ def status():
                     break
         typer.echo(f"📝 Local Task: {task_file}")
     else:
-        # Get Jira URL from config and create task link
-        if cfg.get("jira"):
-            jira_url = cfg.get("jira", {}).get("url", "")
-            if jira_url:
-                jira_link = f"{jira_url.rstrip('/')}/browse/{issue.key}"
-                typer.echo(f"🔗 Jira: {jira_link}")
+        # Ask the backend for the issue's web URL (Jira builds it from the
+        # configured server, Linear returns it on the issue itself).
+        link = _issue_link(backend, issue, cfg)
+        if link:
+            typer.echo(f"🔗 {_backend_label(cfg)}: {link}")
         else:
-            typer.echo("ℹ️ Jira URL not configured")
+            typer.echo(f"ℹ️ {_backend_label(cfg)} URL not configured")
     
     # Try multiple possible attribute names for title
     title = getattr(issue, 'summary', None) or getattr(issue, 'title', None) or str(issue)
@@ -5369,7 +5678,7 @@ def task_list(
     status: str = typer.Option(None, "--status", "-s", help="Filter by status"),
     project: str = typer.Option(None, "--project", "-p", help="Project name"),
     all_projects: bool = typer.Option(False, "--all", "-a", help="Show tasks from all projects"),
-    on: str = typer.Option(None, "--on", help="Backend to use (jira or markdown)")
+    on: str = typer.Option(None, "--on", help="Backend to use (jira, linear or markdown)")
 ):
     """List tasks with optional filtering"""
     from collections import defaultdict
@@ -5377,22 +5686,27 @@ def task_list(
     cfg = get_effective_config()
     backend_type = on or cfg.get('task_backend', 'jira')
     
-    status_order = {'To Do': 0, 'Open': 0, 'In Progress': 1, 'In Review': 2, 'Verification': 3, 'Blocked': 4, 'Done': 5, 'Closed': 5, 'Resolved': 5}
+    # Includes Linear's default state names (Triage/Backlog/Todo/Canceled)
+    # alongside Jira's, so either backend sorts sensibly.
+    status_order = {'Triage': 0, 'Backlog': 0, 'To Do': 0, 'Todo': 0, 'Open': 0,
+                    'In Progress': 1, 'In Review': 2, 'Verification': 3, 'Blocked': 4,
+                    'Done': 5, 'Closed': 5, 'Resolved': 5, 'Canceled': 6, 'Cancelled': 6}
     
     def sort_key(task):
         status_idx = status_order.get(task.status, 99)
         return (status_idx, task.key)
     
-    if backend_type == 'jira':
+    if backend_type in ('jira', 'linear'):
+        label = _BACKEND_LABELS.get(backend_type, backend_type.capitalize())
         current_proj = get_current_project()
         if current_proj:
-            typer.echo(f"📋 Pulling tasks from Jira based on current project: {current_proj}")
+            typer.echo(f"📋 Pulling tasks from {label} based on current project: {current_proj}")
         else:
-            typer.echo("📋 Pulling tasks from Jira (no project configured)")
+            typer.echo(f"📋 Pulling tasks from {label} (no project configured)")
         from workflow.backends import get_backend
-        backend = get_backend(cfg, force_type='jira')
+        backend = get_backend(cfg, force_type=backend_type)
         if not backend:
-            typer.echo("❌ Failed to connect to Jira. Please check your configuration.")
+            typer.echo(f"❌ Failed to connect to {label}. Please check your configuration.")
             return
         
         tasks = backend.list_tasks(project_name=project, status=status)
@@ -5406,7 +5720,8 @@ def task_list(
                 typer.echo("No tasks found.")
             return
         
-        # For Jira, group by project key extracted from issue key (e.g., "PROJ" from "PROJ-123")
+        # Group by the key prefix (Jira project key / Linear team key),
+        # e.g. "PROJ" from "PROJ-123"
         from collections import defaultdict
         tasks_by_project = defaultdict(list)
         for task in tasks:
@@ -5414,22 +5729,26 @@ def task_list(
             tasks_by_project[proj].append(task)
         
         for proj, proj_tasks in sorted(tasks_by_project.items()):
-            jira_url = cfg.get("jira", {}).get("url", "")
-            
             typer.echo(f"\n📁 Project: {proj}")
             typer.echo("-" * 60)
             
             for task in sorted(proj_tasks, key=sort_key):
                 status_emoji = {
+                    "Triage": "🔍",
+                    "Backlog": "📥",
                     "To Do": "⬜",
+                    "Todo": "⬜",
                     "In Progress": "🔄",
                     "In Review": "👀",
-                    "Done": "✅"
+                    "Done": "✅",
+                    "Canceled": "🚫",
+                    "Cancelled": "🚫",
                 }.get(task.status, "⬜")
                 
                 typer.echo(f"  {status_emoji} {task.key}: {task.title}")
-                if jira_url:
-                    typer.echo(f"     Link: {jira_url.rstrip('/')}/browse/{task.key}")
+                link = _issue_link(backend, task, cfg)
+                if link:
+                    typer.echo(f"     Link: {link}")
                 typer.echo(f"     Status: {task.status} | Type: {task.issue_type} | Priority: {task.priority}")
                 if task.labels:
                     typer.echo(f"     Labels: {', '.join(task.labels)}")
@@ -5820,26 +6139,29 @@ def task_edit(
 
 @task_app.command("backend")
 def task_backend(
-    backend_type: str = typer.Argument(None, help="Backend to use (jira, markdown, or 'show' to see current)")
+    backend_type: str = typer.Argument(None, help="Backend to use (jira, linear, markdown, or 'show' to see current)")
 ):
-    """Switch between Jira and Markdown backends"""
+    """Switch between the Jira, Linear and Markdown backends"""
     from workflow.config import load_config, save_config
+    from workflow.backends import BACKEND_TYPES
 
     cfg = load_config()
     # Only use 'task_backend' config key
     current_backend = cfg.get('task_backend', 'jira')
+    available = ", ".join(BACKEND_TYPES)
 
     if backend_type is None or backend_type == "show":
         typer.echo(f"Current backend: {current_backend}")
-        typer.echo(f"Available backends: jira, markdown")
+        typer.echo(f"Available backends: {available}")
         typer.echo(f"\n💡 To switch backends:")
-        typer.echo(f"   wf task backend markdown")
-        typer.echo(f"   wf task backend jira")
+        for name in BACKEND_TYPES:
+            if name != current_backend:
+                typer.echo(f"   wf task backend {name}")
         return
 
-    if backend_type not in ['jira', 'markdown']:
+    if backend_type not in BACKEND_TYPES:
         typer.echo(f"❌ Unknown backend: {backend_type}")
-        typer.echo(f"Available backends: jira, markdown")
+        typer.echo(f"Available backends: {available}")
         return
 
     # Use 'task_backend' key for consistency with get_backend
@@ -5852,6 +6174,16 @@ def task_backend(
         typer.echo(f"\n💡 Markdown backend stores tasks in: ~/.wf/tasks/")
         typer.echo(f"   Use 'wf task list' to see your tasks")
         typer.echo(f"   Use 'wf task create \"My Task\"' to create a task")
+    elif backend_type == 'linear':
+        has_key = bool(get_linear_config().get("api_key"))
+        team = get_linear_config().get("team")
+        if not has_key:
+            typer.echo(f"\n💡 Store an API key first: wf config linear-token")
+            typer.echo(f"   (create one at https://linear.app/<team-name>/settings/account/security/api-keys)")
+        if not team:
+            typer.echo(f"   Set your default team: wf config set linear.team <TEAM-KEY>")
+        if has_key and team:
+            typer.echo(f"\n💡 Using Linear team {team} - 'wf task list' to see your issues")
 
 
 task_comment_app = typer.Typer(help="Task comment management", no_args_is_help=True)
@@ -6727,4 +7059,7 @@ if __name__ == "__main__":
     # If not an alias, run normal CLI
     if len(sys.argv) == 1:
         sys.argv.append("--help")
-    app()
+    # prog_name is pinned because the `wf` launcher execs `python -m workflow.cli`,
+    # so Click would otherwise derive "python -m workflow.cli" as the program name
+    # and generate shell completion (and its _WF_COMPLETE env var) under that name.
+    app(prog_name="wf")

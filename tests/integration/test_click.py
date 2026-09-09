@@ -6,6 +6,11 @@ import requests
 import time
 
 
+# Every endpoint here drives a real page, so the whole module needs a
+# Chrome with remote debugging (see the `chrome` fixture in conftest.py).
+pytestmark = pytest.mark.usefixtures("chrome")
+
+
 class TestClickCommand:
     """Test click functionality"""
     
@@ -18,9 +23,11 @@ class TestClickCommand:
         )
         time.sleep(1)
         
+        # `uid` is a CSS selector (BrowserClient.click names it `selector`);
+        # example.com's only link is the "More information..." anchor.
         response = requests.post(
             f"{daemon_url}/click",
-            json={"uid": "More information..."},
+            json={"uid": "a"},
             timeout=30
         )
         assert response.status_code == 200
@@ -56,4 +63,6 @@ class TestClickCommand:
             json={"uid": "nonexistent-element-12345"},
             timeout=30
         )
-        assert response.status_code in [200, 500]
+        assert response.status_code == 500
+        # Errors must stay JSON -- BrowserClient calls resp.json() on every reply.
+        assert response.json()["status"] == "error"

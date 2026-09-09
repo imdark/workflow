@@ -10,7 +10,6 @@ from datetime import datetime
 import asyncio
 import subprocess
 
-from workflow.backends.jira import JiraBackend
 from workflow.backends.markdown import MarkdownBackend
 from workflow.config import load_effective_config, get_jira_config
 from workflow.projects import list_projects, get_current_project, set_current_project
@@ -459,10 +458,11 @@ class TaskBoardApp(App):
             project_cfg = self.projects[self.current_project]
             task_backend = project_cfg.get("task_backend", task_backend)
         
-        if task_backend == "jira":
-            self.backend = JiraBackend(config)
-        else:
-            self.backend = MarkdownBackend(config)
+        from workflow.backends import get_backend
+        # get_backend() covers jira/linear/markdown and prints setup
+        # guidance for an unconfigured one; fall back to local tasks so the
+        # TUI still opens rather than crashing on a missing API key.
+        self.backend = get_backend(config, force_type=task_backend) or MarkdownBackend(config)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)

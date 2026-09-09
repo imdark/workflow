@@ -5,7 +5,8 @@ from pathlib import Path
 STATE = Path.home() / ".wf" / "state.yaml"
 
 def _load():
-    return yaml.safe_load(STATE.read_text()) if STATE.exists() else {}
+    # safe_load returns None for an empty file, so coerce to a dict.
+    return (yaml.safe_load(STATE.read_text()) or {}) if STATE.exists() else {}
 
 def _save(d):
     STATE.write_text(yaml.dump(d, default_flow_style=False))
@@ -66,6 +67,16 @@ def clear_shelved_changes(repo_path):
         _save(d)
 
 
+def _normalize_task_key(task_key: str) -> str:
+    """AI session keys are stored uppercase.
+
+    Issue keys are case-insensitive everywhere else in the workflow (`wf
+    start pan-1` and `wf start PAN-1` are the same task), so without this a
+    session started under one spelling was invisible to the other.
+    """
+    return str(task_key).strip().upper()
+
+
 def get_task_dir(task_key: str) -> Path:
     """Get the task directory for storing AI session info"""
     task_dir = Path.home() / ".wf" / "tasks" / task_key.lower()
@@ -90,14 +101,23 @@ def set_ai_session(task_key: str, pid: int, started_at: str = None):
     d = _load()
     if "ai_sessions" not in d:
         d["ai_sessions"] = {}
-    d["ai_sessions"][task_key] = {"pid": pid, "started_at": started_at}
+    d["ai_sessions"][_normalize_task_key(task_key)] = {"pid": pid, "started_at": started_at}
     _save(d)
 
 
 def get_ai_session(task_key: str) -> dict:
     """Get AI session info for a task"""
-    d = _load()
-    return d.get("ai_sessions", {}).get(task_key)
+    sessions = _load().get("ai_sessions") or {}
+    key = _normalize_task_key(task_key)
+
+    if key in sessions:
+        return sessions[key]
+
+    # Tolerate entries written before keys were normalized.
+    for stored_key, info in sessions.items():
+        if _normalize_task_key(stored_key) == key:
+            return info
+    return None
 
 
 def has_ai_session(task_key: str) -> bool:
@@ -125,15 +145,21 @@ def clear_ai_session(task_key: str):
         pid_file.unlink()
     
     d = _load()
-    if "ai_sessions" in d and task_key in d["ai_sessions"]:
-        del d["ai_sessions"][task_key]
+    sessions = d.get("ai_sessions") or {}
+    key = _normalize_task_key(task_key)
+
+    # Drop every entry that matches case-insensitively, so a legacy
+    # lowercase entry gets cleared alongside the normalized one.
+    matching = [k for k in sessions if _normalize_task_key(k) == key]
+    if matching:
+        for k in matching:
+            del sessions[k]
         _save(d)
 
 
 def get_all_ai_sessions() -> dict:
     """Get all AI sessions (cleaning up stale ones)"""
-    d = _load()
-    sessions = d.get("ai_sessions", {})
+    sessions = _load().get("ai_sessions") or {}
     cleaned = {}
     
     for task_key, info in sessions.items():
@@ -141,7 +167,9 @@ def get_all_ai_sessions() -> dict:
         if pid:
             try:
                 os.kill(pid, 0)
-                cleaned[task_key] = info
+                # Normalized so callers can match against an issue key
+                # directly, whatever case the entry was written in.
+                cleaned[_normalize_task_key(task_key)] = info
             except OSError:
                 clear_ai_session(task_key)
     

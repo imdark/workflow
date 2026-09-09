@@ -13,6 +13,7 @@ except ImportError:
     KEYRING_AVAILABLE = False
 
 KEYCHAIN_SERVICE = "workflow.jira"
+KEYCHAIN_SERVICE_LINEAR = "workflow.linear"
 
 def get_jira_token_from_keychain():
     """Retrieve Jira API token from macOS Keychain"""
@@ -82,6 +83,78 @@ def get_jira_config():
     return jira_config
 
 
+
+def get_linear_token_from_keychain():
+    """Retrieve Linear API key from macOS Keychain"""
+    if not KEYRING_AVAILABLE:
+        return None
+    try:
+        return keyring.get_password(KEYCHAIN_SERVICE_LINEAR, "api_key")
+    except Exception:
+        return None
+
+def save_linear_token_to_keychain(token: str):
+    """Store Linear API key in macOS Keychain"""
+    if not KEYRING_AVAILABLE:
+        return False
+    try:
+        keyring.set_password(KEYCHAIN_SERVICE_LINEAR, "api_key", token)
+        return True
+    except Exception:
+        return False
+
+def delete_linear_token_from_keychain():
+    """Remove Linear API key from macOS Keychain"""
+    if not KEYRING_AVAILABLE:
+        return False
+    try:
+        keyring.delete_password(KEYCHAIN_SERVICE_LINEAR, "api_key")
+        return True
+    except Exception:
+        return False
+
+def migrate_linear_token_to_keychain():
+    """Migrate an existing Linear API key from config into the Keychain"""
+    if not KEYRING_AVAILABLE:
+        return False, "Keyring not available"
+
+    cfg = load_config()
+    token = cfg.get("linear", {}).get("api_key")
+
+    if not token:
+        return False, "No API key found in config"
+
+    if save_linear_token_to_keychain(token):
+        del cfg["linear"]["api_key"]
+        save_config(cfg)
+        return True, "API key migrated to Keychain successfully"
+    return False, "Failed to save API key to Keychain"
+
+
+def get_linear_config():
+    """Get Linear configuration with the API key from Keychain if available.
+
+    Mirrors get_jira_config(): the Keychain copy wins over one left in the
+    config file, and LINEAR_API_KEY in the environment wins over both so CI
+    and one-off shells don't need a Keychain entry.
+    """
+    import os
+
+    cfg = load_config()
+    linear_config = cfg.get("linear", {}).copy()
+
+    env_token = os.environ.get("LINEAR_API_KEY")
+    if env_token:
+        linear_config["api_key"] = env_token
+        return linear_config
+
+    keychain_token = get_linear_token_from_keychain()
+    if keychain_token:
+        linear_config["api_key"] = keychain_token
+
+    return linear_config
+
+
 CFG = Path.home() / ".wf" / "config.yaml"
 
 def load_config(interactive=False):
@@ -96,14 +169,14 @@ def load_config(interactive=False):
     enable_slack = input("Enable Slack integration? (y/n): ").lower().startswith('y')
     slack_webhook = input("Slack webhook URL (leave empty to skip): ").strip() if enable_slack else None
     
+    backend_choice = (input("Task backend? (jira/linear/markdown) [jira]: ").strip().lower() or "jira")
+    if backend_choice not in ("jira", "linear", "markdown"):
+        print(f"Unknown backend '{backend_choice}', defaulting to jira")
+        backend_choice = "jira"
+
     cfg = {
-        "backend": "jira",
-        "jira": {
-            "url": input("Jira URL: "),
-            "email": input("Jira Email: "),
-            "token": input("Jira Token (get one at https://id.atlassian.com/manage-profile/security/api-tokens): "),
-            "project": input("Jira Project Key (found in your Jira project URL, e.g., 'PROJ' from https://your-domain.atlassian.net/browse/PROJ): "),
-        },
+        "backend": backend_choice,
+        "task_backend": backend_choice,
         "repositories": {},
         "git_enabled": enable_git,
         "github_enabled": enable_github,
@@ -119,6 +192,25 @@ def load_config(interactive=False):
         },
         "ai": {"provider": "claude"},
     }
+
+    if backend_choice == "jira":
+        cfg["jira"] = {
+            "url": input("Jira URL: "),
+            "email": input("Jira Email: "),
+            "token": input("Jira Token (get one at https://id.atlassian.com/manage-profile/security/api-tokens): "),
+            "project": input("Jira Project Key (found in your Jira project URL, e.g., 'PROJ' from https://your-domain.atlassian.net/browse/PROJ): "),
+        }
+    elif backend_choice == "linear":
+        api_key = input("Linear API key (create one at https://linear.app/<team-name>/settings/account/security/api-keys): ").strip()
+        cfg["linear"] = {
+            "team": input("Linear team key (the prefix on your issue IDs, e.g. 'ENG' from ENG-123): ").strip().upper(),
+            "workspace": input("Linear workspace URL slug (from https://linear.app/<slug>/, optional): ").strip(),
+        }
+        # Prefer the Keychain so the key never lands in a plaintext config file.
+        if api_key and not save_linear_token_to_keychain(api_key):
+            cfg["linear"]["api_key"] = api_key
+            print("⚠️  Keychain unavailable - storing the Linear API key in ~/.wf/config.yaml")
+
     CFG.write_text(yaml.dump(cfg))
     return cfg
 

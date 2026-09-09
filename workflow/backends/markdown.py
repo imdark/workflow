@@ -581,6 +581,11 @@ class MarkdownBackend(TaskBackend):
         workflow_file = project_dir / 'workflow.yaml'
         workflow_file.write_text(yaml.dump(workflow), encoding='utf-8')
 
+    def issue_url(self, key) -> Optional[str]:
+        """Local tasks are files, not web pages -- the CLI prints the file
+        path for this backend instead."""
+        return None
+
     # Stub methods for Jira compatibility
     def find_field_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         """Find a field by name (Jira-specific, returns None for markdown backend)"""

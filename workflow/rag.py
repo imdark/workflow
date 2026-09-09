@@ -626,6 +626,13 @@ GitHub enabled: {cfg.get('github_enabled', False)}"""
                 content += f"""
 Jira URL: {jira_cfg.get('url', 'Unknown')}
 Jira Project: {jira_cfg.get('project', 'Unknown')}"""
+
+            if 'linear' in cfg:
+                # No api_key -- this content gets indexed and fed to the LLM.
+                linear_cfg = cfg['linear']
+                content += f"""
+Linear Team: {linear_cfg.get('team', 'Unknown')}
+Linear Workspace: {linear_cfg.get('workspace', 'Unknown')}"""
             
             if 'repositories' in cfg and cfg['repositories']:
                 content += f"\nConfigured repositories: {len(cfg['repositories'])}"

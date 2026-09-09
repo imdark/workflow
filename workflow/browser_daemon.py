@@ -259,17 +259,37 @@ async def eval_handler(request):
 
 
 async def wait_handler(request):
+    """Wait for text to appear on the page, or for a CSS selector to match.
+
+    `text` is matched against the page's visible text -- it used to be
+    handed to waitForSelector, which treated it as a CSS selector, so
+    `wf browser wait "Example"` could never succeed the way its help
+    promised. Pass `selector` instead to wait on a selector.
+    """
     global current_page
     data = await request.json()
     text = data.get("text", "")
+    selector = data.get("selector", "")
     timeout = data.get("timeout", 30000)
-    
+
+    if not text and not selector:
+        return web.json_response(
+            {"status": "error", "error": "pass either 'text' or 'selector'"}, status=400
+        )
+
     b = await get_browser()
     if current_page is None:
         pages = await b.pages()
         current_page = pages[0] if pages else await b.newPage()
-    
-    await current_page.waitForSelector(text, timeout=timeout)
+
+    if selector:
+        await current_page.waitForSelector(selector, timeout=timeout)
+    else:
+        await current_page.waitForFunction(
+            "needle => !!document.body && document.body.innerText.includes(needle)",
+            {"timeout": timeout},
+            text,
+        )
     return web.json_response({"status": "ok"})
 
 
@@ -324,8 +344,30 @@ def load_daemon_state():
     return None
 
 
+@web.middleware
+async def json_errors(request, handler):
+    """Report every daemon failure as {"status": "error", "error": ...} JSON.
+
+    workflow/browser_client.py calls resp.json() unconditionally, so an
+    unhandled exception in a handler used to reach callers as aiohttp's HTML
+    error page and a JSONDecodeError -- and a pyppeteer wait timeout as a
+    bodyless 504, since aiohttp maps asyncio.TimeoutError to 504. Handlers
+    that already build their own error response return before this sees
+    anything.
+    """
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as e:
+        return web.json_response(
+            {"status": "error", "error": f"{type(e).__name__}: {e}"},
+            status=500,
+        )
+
+
 async def start_server():
-    app = web.Application()
+    app = web.Application(middlewares=[json_errors])
     app.router.add_get('/health', health)
     app.router.add_post('/screenshot', screenshot)
     app.router.add_post('/snapshot', snapshot)
