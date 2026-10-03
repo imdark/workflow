@@ -30,6 +30,8 @@ from typing import Optional
 
 PROTOCOL_VERSION = "2025-06-18"
 POLL_SECONDS = 2.0
+# Matches the server's cap on a question's detail (inventory jobs.ts MAX_DETAIL).
+MAX_DETAIL = 200_000
 
 TOOLS = [
     {
@@ -130,7 +132,9 @@ def call_tool(questions: Questions, name: str, args: dict) -> dict:
             tool_input = args.get("input") or {}
             answer = questions.ask(
                 "permission", f"Allow {tool}?",
-                json.dumps(tool_input, ensure_ascii=False, indent=2)[:4000],
+                # Compact and uncut up to the server's cap: NotesGraph parses it
+                # to show an edit as a diff, and clipped JSON does not parse.
+                json.dumps(tool_input, ensure_ascii=False)[:MAX_DETAIL],
             )
             # The shape Claude Code expects back from a permission prompt tool.
             if answer.get("allowed"):
