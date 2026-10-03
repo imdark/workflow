@@ -461,3 +461,20 @@ def test_a_workflow_job_needs_a_connection(tmp_path, monkeypatch):
     monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path)
     with pytest.raises(RuntimeError, match="workflow job needs a NotesGraph connection"):
         run_job(job(model="workflow"), config={}, use_tmux=False)
+
+
+def test_a_workflow_job_asks_and_remembers_like_claude_code(tmp_path, monkeypatch, started):
+    """Workflow is Claude Code started as a wf task: same ask/approve tools,
+    same ask-before-guessing and save-the-answer system prompt."""
+    monkeypatch.setattr("workflow.deploy.jobs._watch",
+                        lambda *a: {"result": "", "steps": 1, "session": None})
+    run_job(job(model="workflow"), config={}, use_tmux=False, client=client())
+
+    spec = json.loads((tmp_path / "job-1234abcd" / "cmd.json").read_text())
+    argv = spec["argv"]
+    assert spec["provider"] == "workflow"
+    assert argv[argv.index("--permission-prompt-tool") + 1] == "mcp__run__approve"
+    assert argv[argv.index("--append-system-prompt") + 1] == CLAUDE_CODE_SYSTEM_PROMPT
+    allowed = next(a for a in argv if a.startswith("--allowedTools="))
+    assert "mcp__run__ask_user" in allowed and "mcp__notesgraph" in allowed
+    assert int(spec["env"]["MCP_TOOL_TIMEOUT"]) >= 60 * 60 * 1000
