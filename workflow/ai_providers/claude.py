@@ -16,6 +16,65 @@ def get_skills_for_session(issue=None, repo_path=None):
     return get_ai_skills(issue, repo_path)
 
 
+def skills_plugin_dir(issue, task_key, task_dir: Path, repo_path=None):
+    """Write the session's wf skills as a Claude plugin; returns its directory.
+
+    None when there are no skills or no task to file them under. Shared with
+    agent jobs (see deploy.jobs), which pass it to `claude --plugin-dir`.
+    """
+    skills = get_skills_for_session(issue, repo_path)
+    if not (skills and task_key):
+        return None
+    try:
+        # Create or reuse plugin directory
+        plugin_dir = task_dir / "claude-plugin"
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create or update skills subdirectory
+        skills_dir = plugin_dir / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write plugin.json if not exists or update
+        plugin_json = {
+            "name": "workflow-skills",
+            "version": "1.0.0",
+            "skills": ["./skills/"]
+        }
+        import json
+        plugin_json_file = plugin_dir / "plugin.json"
+        plugin_json_file.write_text(json.dumps(plugin_json, indent=2))
+
+        # Track existing skill files to detect deletions
+        existing_skills = set(f.name for f in skills_dir.glob("*.md"))
+        current_skills = set()
+
+        # Create/update skill files
+        for skill in skills:
+            skill_filename = skill['name'].lower().replace(' ', '-').replace('/', '-') + ".md"
+            current_skills.add(skill_filename)
+            skill_file = skills_dir / skill_filename
+            new_content = f"""---
+name: {skill['name']}
+description: Workflow skill - {skill['scope']} scope
+---
+
+{skill['content']}
+"""
+            # Only write if content changed
+            if not skill_file.exists() or skill_file.read_text() != new_content:
+                skill_file.write_text(new_content)
+
+        # Remove skills that are no longer in config
+        for old_skill in existing_skills - current_skills:
+            (skills_dir / old_skill).unlink()
+
+        print(f"DEBUG: Using plugin at {plugin_dir}", file=sys.stderr)
+        return plugin_dir
+    except Exception as e:
+        print(f"DEBUG: Failed to setup plugin: {e}", file=sys.stderr)
+        return None
+
+
 class ClaudeProvider(AIProvider):
     name = "claude"
 
@@ -58,60 +117,9 @@ class ClaudeProvider(AIProvider):
         except:
             pass
         
-        # Get skills and create plugin directory in task folder
-        skills = get_skills_for_session(issue or current_issue, repo_path)
-        plugin_dir = None
-        plugin_arg = ""
-        
-        if skills and task_key:
-            try:
-                # Create or reuse plugin directory
-                plugin_dir = task_dir / "claude-plugin"
-                plugin_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Create or update skills subdirectory
-                skills_dir = plugin_dir / "skills"
-                skills_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Write plugin.json if not exists or update
-                plugin_json = {
-                    "name": "workflow-skills",
-                    "version": "1.0.0",
-                    "skills": ["./skills/"]
-                }
-                import json
-                plugin_json_file = plugin_dir / "plugin.json"
-                plugin_json_file.write_text(json.dumps(plugin_json, indent=2))
-                
-                # Track existing skill files to detect deletions
-                existing_skills = set(f.name for f in skills_dir.glob("*.md"))
-                current_skills = set()
-                
-                # Create/update skill files
-                for skill in skills:
-                    skill_filename = skill['name'].lower().replace(' ', '-').replace('/', '-') + ".md"
-                    current_skills.add(skill_filename)
-                    skill_file = skills_dir / skill_filename
-                    new_content = f"""---
-name: {skill['name']}
-description: Workflow skill - {skill['scope']} scope
----
+        plugin_dir = skills_plugin_dir(issue or current_issue, task_key, task_dir, repo_path)
+        plugin_arg = f"--plugin-dir {plugin_dir}" if plugin_dir else ""
 
-{skill['content']}
-"""
-                    # Only write if content changed
-                    if not skill_file.exists() or skill_file.read_text() != new_content:
-                        skill_file.write_text(new_content)
-                
-                # Remove skills that are no longer in config
-                for old_skill in existing_skills - current_skills:
-                    (skills_dir / old_skill).unlink()
-                
-                plugin_arg = f"--plugin-dir {plugin_dir}"
-                print(f"DEBUG: Using plugin at {plugin_dir}", file=sys.stderr)
-            except Exception as e:
-                print(f"DEBUG: Failed to setup plugin: {e}", file=sys.stderr)
-        
         task_dir.mkdir(parents=True, exist_ok=True)
         
         # Clean up any existing prompt file from previous runs
@@ -127,16 +135,11 @@ description: Workflow skill - {skill['scope']} scope
 
             # Route this session's model traffic through the capture proxy so
             # the real conversation is recorded, rather than the ANSI terminal
-            # transcript `script` produces below.
-            captured = apply_proxy_env()
-            if captured:
-                print(f"DEBUG: capturing via {captured.get('ANTHROPIC_BASE_URL')}", file=sys.stderr)
-
-            # Log this session in as the current project's Claude account.
-            from workflow import claude_accounts
-            account_dir = claude_accounts.apply()
-            if account_dir:
-                print(f"DEBUG: claude account dir {account_dir}", file=sys.stderr)
+            # transcript `script` produces below; log it in as the current
+            # project's Claude account.
+            from workflow.session import apply_claude_env
+            for name, value in apply_claude_env().items():
+                print(f"DEBUG: {name}={value}", file=sys.stderr)
 
             # Build command with optional plugin dir
             if plugin_arg:

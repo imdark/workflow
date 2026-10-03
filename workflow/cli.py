@@ -2482,38 +2482,22 @@ def start(
 
     # Get repository info if git is enabled
     # Check both global repositories AND project-specific repositories
-    from workflow.projects import get_project_repositories, get_default_repo
-    global_repos = get_repositories()
-    project_repos = get_project_repositories()
-    
-    # Merge both sources
-    repos = {}
-    repos.update(global_repos)
-    repos.update(project_repos)
-    
+    from workflow.session import configured_repos, resolve_repo
+    repos = configured_repos()
+
     if is_git_enabled():
         if not repo_path and repos:
-            # First, check if cwd is in one of the repos
-            from workflow.projects import get_cwd_repo
-            cwd_repo = get_cwd_repo()
-            if cwd_repo and cwd_repo in repos:
-                repo_path = cwd_repo
+            repo_path, how = resolve_repo(repos)
+            if how == "cwd match":
                 typer.echo(f"📁 Using repository (cwd match): {repo_path}")
-            # Second, try to use the default repo if configured
-            elif default_repo := get_default_repo():
-                if default_repo in repos:
-                    repo_path = default_repo
-                    typer.echo(f"📁 Using default repository: {repo_path}")
-            else:
-                # Filter out repos that don't exist on disk
-                valid_repos = {k: v for k, v in repos.items() if Path(k).exists()}
-                if valid_repos:
-                    repo_path = list(valid_repos.keys())[0]
-                    typer.echo(f"📁 Using repository: {repo_path}")
-                    if len(valid_repos) > 1:
-                        typer.echo(f"💡 Tip: Set a default repo with 'wf project set-default-repo <repo-path>'")
-                else:
-                    typer.echo("No valid repositories found on disk.")
+            elif how == "default":
+                typer.echo(f"📁 Using default repository: {repo_path}")
+            elif how == "first":
+                typer.echo(f"📁 Using repository: {repo_path}")
+                if sum(Path(k).exists() for k in repos) > 1:
+                    typer.echo(f"💡 Tip: Set a default repo with 'wf project set-default-repo <repo-path>'")
+            elif not any(Path(k).exists() for k in repos):
+                typer.echo("No valid repositories found on disk.")
         elif not repo_path:
             typer.echo("No repositories configured. Use 'wf config repo-add' to add one or disable git integration with 'wf config set git_enabled false'.")
             return
@@ -2570,10 +2554,8 @@ def start(
                     )
         
         # Create git branch
-        repo_config = repos.get(repo_path, {})
-        branch_base = base or repo_config.get("base_branch")
-        if not branch_base:
-            branch_base = get_default_branch(repo_path)
+        from workflow.session import base_branch_for
+        branch_base = base_branch_for(repo_path, repos, base)
         
         # Check for uncommitted changes on non-default branch (someone is working)
         has_changes = has_uncommitted_changes(repo_path) if repo_path else False
@@ -2595,18 +2577,13 @@ def start(
         
         try:
             if use_worktree and (ai_active or same_issue_active or any_ai_active or (has_changes and current_branch and current_branch != branch_base)):
-                # Generate branch name for the new task
-                branch_name = f"{issue.key.lower()}-{issue.title.replace(' ', '-')}"
-                
-                # Create worktree for the new branch
-                worktree_path = create_worktree(repo_path, branch_name, branch_base)
+                # Create a worktree for the task's branch, with its commit prefix
+                from workflow.session import start_in_worktree
+                worktree_path = start_in_worktree(issue, repo_path, branch_base)
                 typer.echo(f"✅ Created worktree at: {worktree_path}")
-                
+
                 # Update repo_path to the worktree for subsequent operations
                 working_repo_path = worktree_path
-                
-                # Set commit prefix in the worktree
-                set_commit_prefix(issue.key, working_repo_path)
             else:
                 # Normal branch creation in the main repository
                 # Skip uncommitted changes check if AI is active or we're using worktree for changes

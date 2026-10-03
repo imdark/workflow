@@ -198,6 +198,10 @@ def _provider_argv(job: Job, config: dict) -> tuple:
 
 
 CLAUDE_CODE_MODEL = "claude-code"
+# Claude Code started the way `wf start` + `wf ai` start a task: a ticket in
+# the task backend, wf's branch and worktree, the project's Claude account,
+# its skills and task memory (see `start_job_task`).
+WORKFLOW_MODEL = "workflow"
 
 # Appended to Claude Code's own system prompt for a claude-code job. The
 # point is that the agent asks rather than guesses, and that each answer is
@@ -243,11 +247,12 @@ ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
 
 def claude_code_argv(job: Job, prompt: str, job_dir: Path,
-                     client: "JobClient") -> tuple:
+                     client: "JobClient", plugin_dir: Optional[Path] = None) -> tuple:
     """Claude Code with NotesGraph's tools and a way to ask the user.
 
     Returns (argv, env). The MCP config carries the NotesGraph token, so it
     is written owner-only and removed when the run ends (see run_job).
+    `plugin_dir` carries the task's wf skills, as `wf ai` passes them.
     """
     mcp_path = job_dir / "mcp.json"
     mcp_config = {"mcpServers": {
@@ -278,6 +283,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         # the prompt that follows it.
         f"--allowedTools={','.join(CLAUDE_CODE_ALLOWED_TOOLS)}",
         "--permission-prompt-tool", "mcp__run__approve",
+        *(["--plugin-dir", str(plugin_dir)] if plugin_dir else []),
         # No --max-turns: Claude Code counts every tool call as a turn, so an
         # agent's step limit (sized for the in-tab loop) ended real work a
         # couple of dozen calls in. The run's time limit bounds it instead.
@@ -332,6 +338,88 @@ def _drop_worktree_if_empty(job_dir: Path) -> None:
     _git("-C", str(tree), "worktree", "remove", str(tree))
 
 
+def _task_title(job: Job) -> str:
+    """A ticket title for a job: the first line of what it was asked to do."""
+    for line in (job.instructions or "").splitlines():
+        if line.strip():
+            line = " ".join(line.split())
+            return line if len(line) <= 72 else line[:71] + "…"
+    return job.agent_name or f"Agent job {job.id[:8]}"
+
+
+def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
+    """Start a workflow job the way `wf start` starts a task.
+
+    Returns (issue, workdir, repo_path). The job becomes a task in the
+    configured backend, moved to In Progress; it is created once and its
+    key kept in the job directory, so a re-claimed job keeps its ticket.
+    In a configured repo the task's branch goes in a worktree beside the
+    repo (`session.start_in_worktree`) -- never the checkout the runner
+    was started in. Outside one, the job runs in its job directory.
+
+    Unlike `wf start` it leaves this machine's current task alone: a job
+    in the background must not change what the terminal is working on.
+    """
+    from contextlib import chdir
+
+    from workflow.backends import get_backend
+    from workflow.config import is_git_enabled, load_effective_config
+    from workflow.session import (base_branch_for, configured_repos,
+                                  resolve_repo, start_in_worktree)
+
+    backend = get_backend(load_effective_config())
+    task_file = job_dir / "task.json"
+    issue = None
+    if task_file.exists():
+        try:
+            issue = backend.get(json.loads(task_file.read_text())["key"])
+        except Exception:
+            issue = None
+    if issue is None:
+        issue = backend.create_issue(_task_title(job), _prompt(job), "Task")
+        if issue is None:
+            raise RuntimeError("the task backend could not create a task for this job")
+        task_file.write_text(json.dumps({"key": issue.key}))
+    backend.move_to_in_progress(issue, custom_fields={})
+
+    repo_path = None
+    if is_git_enabled():
+        repos = configured_repos()
+        with chdir(cwd):
+            repo_path, _ = resolve_repo(repos)
+        if repo_path:
+            workdir = Path(start_in_worktree(issue, repo_path, base_branch_for(repo_path, repos)))
+            return issue, workdir, str(workdir)
+    return issue, job_dir, repo_path
+
+
+def _job_context(issue, job: Job, workdir: Path) -> str:
+    """The prompt `wf ai` would build for the task, or the job's own."""
+    try:
+        from workflow.ai_context import build_context
+        return build_context(issue, repo_path=str(workdir))
+    except Exception:
+        return _prompt(job)
+
+
+def _save_session(issue, job_dir: Path, workdir: Path) -> None:
+    """File the run's transcript in the task's memory, as `wf ai` does."""
+    from contextlib import chdir
+
+    from workflow.memory import save_meta, save_session
+
+    log = job_dir / "log.txt"
+    if not log.exists():
+        return
+    try:
+        save_session(issue, log.read_text(encoding="utf-8", errors="replace"))
+        # save_meta reads the branch from the current directory.
+        with chdir(workdir):
+            save_meta(issue, CLAUDE_CODE_MODEL)
+    except Exception:
+        pass
+
+
 def _launch(job_dir: Path, session: Optional[str]) -> Optional[subprocess.Popen]:
     """Start job_exec, inside a detached tmux session when there is one.
 
@@ -384,6 +472,11 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: int = 900,
     toward `timeout`. It runs in its own worktree of the repo at `cwd`
     (default: the runner's), never in that checkout (see `job_workdir`).
 
+    A "workflow" job is the same Claude Code, started as a task the way
+    `wf start` and `wf ai` start one -- ticket, branch, worktree, Claude
+    account, skills, task memory -- in the repo `cwd` resolves to; see
+    `start_job_task`.
+
     Returns {"result", "steps", "session"}. When the capture proxy is
     reachable -- directly or down a reverse tunnel -- the conversation is
     recorded and billed to the account that owns the tunnel, so nothing
@@ -402,23 +495,47 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: int = 900,
 
     env: dict = {}
     workdir: Optional[Path] = None
-    if job.model == CLAUDE_CODE_MODEL:
+    issue = repo_path = None
+    if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL):
         if client is None:
-            raise RuntimeError("a claude-code job needs a NotesGraph connection")
-        provider = "claude-code"
+            raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
+        provider = job.model
+    if job.model == CLAUDE_CODE_MODEL:
         argv, env = claude_code_argv(job, _prompt(job), job_dir, client)
         workdir = job_workdir(job_dir, cwd or Path.cwd())
+    elif job.model == WORKFLOW_MODEL:
+        issue, workdir, repo_path = start_job_task(job, job_dir, cwd or Path.cwd())
+        from workflow.ai_providers.claude import skills_plugin_dir
+        from workflow.session import apply_claude_env
+        plugin_dir = skills_plugin_dir(issue, issue.key.lower(),
+                                       Path.home() / ".wf" / "tasks" / issue.key.lower(),
+                                       repo_path)
+        argv, env = claude_code_argv(job, _job_context(issue, job, workdir),
+                                     job_dir, client, plugin_dir)
+        # Same Claude account and capture proxy as `wf ai`.
+        env.update(apply_claude_env(dict(os.environ)))
     else:
         provider, argv = _provider_argv(job, config)
     (job_dir / "cmd.json").write_text(json.dumps(
         {"argv": argv, "provider": provider, "env": env,
          "cwd": str(workdir) if workdir else None}))
+    if repo_path:
+        from workflow.pid_manager import create_ai_pid_file
+        from workflow.session import task_branch_name
+        # So `wf start` sees this repo is busy, as it does for `wf ai`.
+        create_ai_pid_file(repo_path, issue.key, task_branch_name(issue))
     try:
         return _watch(job, job_dir, timeout, on_tick, use_tmux, tick_seconds)
     finally:
         # Holds the NotesGraph token; nothing needs it once the run is over.
         (job_dir / "mcp.json").unlink(missing_ok=True)
-        _drop_worktree_if_empty(job_dir)
+        if job.model == CLAUDE_CODE_MODEL:
+            _drop_worktree_if_empty(job_dir)
+        if issue is not None:
+            _save_session(issue, job_dir, workdir)
+        if repo_path:
+            from workflow.pid_manager import remove_ai_pid_file
+            remove_ai_pid_file(repo_path)
 
 
 def _watch(job: Job, job_dir: Path, timeout: int,

@@ -321,7 +321,8 @@ def create_branch(issue, base, repo_path: Optional[str] = None, skip_uncommitted
     console = Console(color_system=None)
     
     # Generate initial branch name
-    base_name = f"{issue.key.lower()}-{issue.title.replace(' ', '-')}"
+    from workflow.session import task_branch_name
+    base_name = task_branch_name(issue)
     
     # Check for uncommitted changes before switching branches
     if not skip_uncommitted_check and has_uncommitted_changes(repo_path):
