@@ -10,7 +10,7 @@ NotesGraph.
 
 Files in <job-dir>:
     cmd.json     written by the runner: {"argv": [...], "provider": "...",
-                 "env": {...extra environment}}
+                 "env": {...extra environment}, "cwd": "where to run" | null}
     log.txt      the transcript, appended as the run goes
     result.json  {"result": str, "steps": int, "error": str|null}
     exit_code    written last; its presence means the run is over
@@ -49,6 +49,11 @@ class Narrator:
 
     Claude's stream-json is rendered event by event; any other provider's
     output, and any line that isn't JSON, passes through as it is.
+
+    A subagent's events (they carry `parent_tool_use_id`) are indented under
+    a ↳ and do not count as the run's own turns. Claude can emit more than
+    one `result` -- the main turn ends, background agents report back, and
+    it carries on -- so the outcome is the last one, said once by `finish`.
     """
 
     def __init__(self, out: TextIO, log: TextIO):
@@ -56,9 +61,13 @@ class Narrator:
         self.result: Optional[str] = None
         self.error: Optional[str] = None
         self.steps = 0
+        self.cost: Optional[float] = None
+        self.started = False
         self.plain: list = []
 
-    def say(self, text: str) -> None:
+    def say(self, text: str, sub: bool = False) -> None:
+        if sub:
+            text = "\n".join(f"    ↳ {line}" for line in text.split("\n"))
         for stream in (self.out, self.log):
             stream.write(text if text.endswith("\n") else text + "\n")
             stream.flush()
@@ -79,38 +88,54 @@ class Narrator:
 
     def _event(self, event: dict) -> None:
         kind = event.get("type")
+        sub = bool(event.get("parent_tool_use_id"))
         if kind == "system" and event.get("subtype") == "init":
+            if sub:
+                return
+            if self.started:
+                # The same run picking up again after background work.
+                self.say("▶ continuing")
+                return
+            self.started = True
             model = event.get("model") or "?"
             self.say(f"▶ started · model {model} · {event.get('cwd', '')}")
         elif kind == "assistant":
-            self.steps += 1
+            if not sub:
+                self.steps += 1
             for part in (event.get("message") or {}).get("content") or []:
                 if part.get("type") == "text" and part.get("text", "").strip():
-                    self.say(part["text"].rstrip())
+                    self.say(part["text"].rstrip(), sub)
                 elif part.get("type") == "tool_use":
                     name = part.get("name", "tool")
                     if name.endswith("__ask_user"):
                         # The question is the event worth seeing, not the call.
                         question = (part.get("input") or {}).get("question", "")
-                        self.say(f"? asking you: {question}  (answer in NotesGraph)")
+                        self.say(f"? asking you: {question}  (answer in NotesGraph)", sub)
                     else:
-                        self.say(f"→ {name}  {_short(part.get('input', {}))}")
+                        self.say(f"→ {name}  {_short(part.get('input', {}))}", sub)
         elif kind == "user":
             for part in (event.get("message") or {}).get("content") or []:
                 if isinstance(part, dict) and part.get("type") == "tool_result":
                     text = _tool_result_text(part.get("content"))
                     mark = "✗" if part.get("is_error") else "←"
-                    self.say(f"  {mark} {_short(text, TOOL_RESULT_CHARS)}")
-        elif kind == "result":
+                    self.say(f"  {mark} {_short(text, TOOL_RESULT_CHARS)}", sub)
+        elif kind == "result" and not sub:
             self.steps = int(event.get("num_turns") or self.steps)
             cost = event.get("total_cost_usd")
-            tail = f" · ${cost:.4f}" if isinstance(cost, (int, float)) else ""
+            self.cost = cost if isinstance(cost, (int, float)) else self.cost
             if event.get("is_error") or event.get("subtype") != "success":
+                self.result = None
                 self.error = str(event.get("result") or event.get("subtype") or "failed")
-                self.say(f"✗ failed after {self.steps} turns{tail}: {_short(self.error, 300)}")
             else:
-                self.result = str(event.get("result") or "")
-                self.say(f"✓ finished in {self.steps} turns{tail}")
+                self.result, self.error = str(event.get("result") or ""), None
+
+    def finish(self) -> None:
+        """Say how the run ended, once, from its last result."""
+        tail = f" · ${self.cost:.4f}" if self.cost is not None else ""
+        if self.error is not None:
+            self.say(f"✗ failed after {self.steps} turns{tail}: {_short(self.error, 300)}")
+        elif self.result is not None:
+            self.say(f"✓ finished in {self.steps} turns{tail}")
 
 
 def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
@@ -128,10 +153,12 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, env={**os.environ, **(spec.get("env") or {})},
+                cwd=spec.get("cwd") or None,
             )
             for line in proc.stdout:
                 narrator.feed(line)
             code = proc.wait()
+            narrator.finish()
         except FileNotFoundError:
             narrator.error = f"'{argv[0]}' is not on PATH on this device"
             narrator.say(f"✗ {narrator.error}")

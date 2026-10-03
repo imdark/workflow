@@ -5,6 +5,8 @@ tested is the runner's contract: it claims, it reports exactly once per
 outcome, and a failing job never takes the loop down.
 """
 
+import json
+
 import pytest
 
 from workflow.deploy.jobs import Job, JobClient, serve
@@ -277,3 +279,37 @@ def test_a_missing_token_is_a_clear_error():
     client.token = None
     with pytest.raises(NotesGraphError, match="notes-login"):
         client.claim("laptop", "runner-1")
+
+
+# --- narrating background agents ------------------------------------------
+
+def test_the_last_result_is_the_outcome_and_subagents_are_marked():
+    import io
+
+    from workflow.deploy.job_exec import Narrator
+
+    out, log = io.StringIO(), io.StringIO()
+    n = Narrator(out, log)
+    for event in [
+        {"type": "system", "subtype": "init", "model": "m", "cwd": "/w"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Agent", "input": {"description": "look"}}]}},
+        {"type": "system", "subtype": "init", "model": "m", "cwd": "/w",
+         "parent_tool_use_id": "t1"},
+        {"type": "assistant", "parent_tool_use_id": "t1", "message": {"content": [
+            {"type": "tool_use", "name": "Grep", "input": {"pattern": "x"}}]}},
+        {"type": "result", "subtype": "success", "result": "early", "num_turns": 16},
+        {"type": "system", "subtype": "init", "model": "m", "cwd": "/w"},
+        {"type": "result", "subtype": "error_max_turns", "is_error": True,
+         "num_turns": 25, "total_cost_usd": 4.0},
+    ]:
+        n.feed(json.dumps(event))
+    n.finish()
+
+    text = out.getvalue()
+    assert text.count("▶ started") == 1 and "▶ continuing" in text
+    assert '    ↳ → Grep  {"pattern": "x"}' in text
+    assert "✓ finished" not in text
+    assert text.rstrip().endswith("✗ failed after 25 turns · $4.0000: error_max_turns")
+    assert n.result is None and n.error == "error_max_turns"
+    assert n.steps == 25

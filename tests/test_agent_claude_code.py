@@ -237,7 +237,8 @@ def test_the_token_file_is_removed_after_the_run(tmp_path, monkeypatch):
         return [sys.executable, "-c", "print('done')"], {}
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv", fake_argv)
 
-    out = run_job(job(), config={}, use_tmux=False, client=client(), tick_seconds=0.05)
+    out = run_job(job(), config={}, use_tmux=False, client=client(), tick_seconds=0.05,
+                  cwd=tmp_path)
     assert out["result"] == "done"
     assert not (tmp_path / "job-1234abcd" / "mcp.json").exists()
 
@@ -251,7 +252,7 @@ def test_time_spent_waiting_for_the_user_does_not_count(tmp_path, monkeypatch):
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
                         lambda j, p, d, c: ([sys.executable, "-c", script], {}))
 
-    out = run_job(job(), config={}, timeout=1, use_tmux=False, client=client(),
+    out = run_job(job(), config={}, timeout=1, use_tmux=False, client=client(), cwd=tmp_path,
                   tick_seconds=0.1)
     assert out["result"] == "answered"
 
@@ -261,5 +262,68 @@ def test_without_a_question_the_limit_still_applies(tmp_path, monkeypatch):
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
                         lambda j, p, d, c: ([sys.executable, "-c", "import time; time.sleep(5)"], {}))
     with pytest.raises(RuntimeError, match="exceeded 1s"):
-        run_job(job(), config={}, timeout=1, use_tmux=False, client=client(),
+        run_job(job(), config={}, timeout=1, use_tmux=False, client=client(), cwd=tmp_path,
                 tick_seconds=0.1)
+
+
+def test_claude_code_has_no_turn_limit(tmp_path):
+    """The step limit is for the in-tab loop; Claude Code counts each tool call."""
+    argv, _ = claude_code_argv(job(maxSteps=8), "go", tmp_path, client())
+    assert not any(a.startswith("--max-turns") for a in argv)
+
+
+# --- where it runs --------------------------------------------------------
+
+def git(cwd, *args):
+    import subprocess
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture
+def repo(tmp_path):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    git(root, "init", "-q", "-b", "main")
+    git(root, "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-q", "--allow-empty", "-m", "start")
+    return root
+
+
+def run_in(repo, tmp_path, monkeypatch, script):
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
+    monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
+                        lambda j, p, d, c: ([sys.executable, "-c", script], {}))
+    return run_job(job(), config={}, use_tmux=False, client=client(),
+                   tick_seconds=0.05, cwd=repo)
+
+
+def test_it_branches_and_commits_in_its_own_worktree(repo, tmp_path, monkeypatch):
+    script = ("import os, subprocess as s; print(os.getcwd()); "
+              "s.run(['git', 'checkout', '-q', '-b', 'agent-work'], check=True); "
+              "s.run(['git', '-c', 'user.email=a@a', '-c', 'user.name=a', 'commit', "
+              "'-q', '--allow-empty', '-m', 'agent'], check=True)")
+    out = run_in(repo, tmp_path, monkeypatch, script)
+
+    assert out["result"].endswith("job-1234abcd/repo")
+    # The checkout someone is working in has not moved...
+    assert git(repo, "branch", "--show-current") == "main"
+    # ...and the agent's branch is a branch of the same repo.
+    assert git(repo, "log", "-1", "--format=%s", "agent-work") == "agent"
+    # Everything is on a branch, so the worktree itself is gone.
+    assert not (tmp_path / "jobs" / "job-1234abcd" / "repo").exists()
+
+
+def test_a_worktree_with_uncommitted_changes_is_kept(repo, tmp_path, monkeypatch):
+    run_in(repo, tmp_path, monkeypatch,
+           "open('half-done.txt', 'w').write('x'); print('stopped')")
+    tree = tmp_path / "jobs" / "job-1234abcd" / "repo"
+    assert (tree / "half-done.txt").exists()
+    assert not (repo / "half-done.txt").exists()
+
+
+def test_outside_a_repo_it_runs_in_the_job_directory(tmp_path, monkeypatch):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    out = run_in(plain, tmp_path, monkeypatch, "import os; print(os.getcwd())")
+    assert out["result"].endswith("job-1234abcd")

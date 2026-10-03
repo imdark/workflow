@@ -278,12 +278,58 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         # the prompt that follows it.
         f"--allowedTools={','.join(CLAUDE_CODE_ALLOWED_TOOLS)}",
         "--permission-prompt-tool", "mcp__run__approve",
+        # No --max-turns: Claude Code counts every tool call as a turn, so an
+        # agent's step limit (sized for the in-tab loop) ended real work a
+        # couple of dozen calls in. The run's time limit bounds it instead.
+        prompt,
     ]
-    if job.max_steps:
-        # Claude counts turns, not tool calls; leave room for asking.
-        argv.append(f"--max-turns={max(job.max_steps, 8) * 3}")
-    argv.append(prompt)
     return argv, {"MCP_TOOL_TIMEOUT": str(ASK_TIMEOUT_MS)}
+
+
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True)
+
+
+def job_workdir(job_dir: Path, cwd: Path) -> Path:
+    """Where a claude-code job runs.
+
+    Inside a git repo, that is a worktree of it under the job directory, at
+    the runner's HEAD: the agent can branch and commit there without moving
+    the checkout someone is working in. Branches it makes are ordinary
+    branches of the repo. Outside a repo, the job directory itself.
+    """
+    top = _git("-C", str(cwd), "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        return job_dir
+    root = Path(top.stdout.strip())
+    tree = job_dir / "repo"
+    # A re-claimed job carries on in the worktree its first attempt left.
+    if not tree.exists():
+        added = _git("-C", str(root), "worktree", "add", "--detach", str(tree), "HEAD")
+        if added.returncode != 0:
+            raise RuntimeError(f"could not make a worktree: {added.stderr.strip()[:300]}")
+    return tree / cwd.resolve().relative_to(root.resolve())
+
+
+def _drop_worktree_if_empty(job_dir: Path) -> None:
+    """Remove a job's worktree unless removing it would lose work.
+
+    It stays when it has uncommitted changes, or commits on a detached HEAD
+    that no branch holds; commits on a branch outlive the worktree.
+    """
+    tree = job_dir / "repo"
+    if not tree.exists():
+        return
+    status = _git("-C", str(tree), "status", "--porcelain")
+    if status.returncode != 0 or status.stdout.strip():
+        return
+    on_branch = _git("-C", str(tree), "symbolic-ref", "-q", "HEAD").returncode == 0
+    if not on_branch:
+        held = _git("-C", str(tree), "branch", "-a", "--contains", "HEAD")
+        if not held.stdout.strip():
+            # Commits made on the detached HEAD: nothing else points at them.
+            return
+    _git("-C", str(tree), "worktree", "remove", str(tree))
 
 
 def _launch(job_dir: Path, session: Optional[str]) -> Optional[subprocess.Popen]:
@@ -323,7 +369,8 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: int = 900,
             on_tick: Optional[Callable[[str], bool]] = None,
             use_tmux: Optional[bool] = None,
             tick_seconds: float = TICK_SECONDS,
-            client: Optional["JobClient"] = None) -> dict:
+            client: Optional["JobClient"] = None,
+            cwd: Optional[Path] = None) -> dict:
     """Execute one job through the configured AI provider.
 
     Runs non-interactively, in a tmux session named by `tmux_session_name`
@@ -334,7 +381,8 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: int = 900,
     A job whose model is "claude-code" runs Claude Code with NotesGraph's
     tools and can ask the user questions (`client` is then required, to
     reach NotesGraph). Time spent waiting for an answer does not count
-    toward `timeout`.
+    toward `timeout`. It runs in its own worktree of the repo at `cwd`
+    (default: the runner's), never in that checkout (see `job_workdir`).
 
     Returns {"result", "steps", "session"}. When the capture proxy is
     reachable -- directly or down a reverse tunnel -- the conversation is
@@ -353,20 +401,24 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: int = 900,
         (job_dir / stale).unlink(missing_ok=True)
 
     env: dict = {}
+    workdir: Optional[Path] = None
     if job.model == CLAUDE_CODE_MODEL:
         if client is None:
             raise RuntimeError("a claude-code job needs a NotesGraph connection")
         provider = "claude-code"
         argv, env = claude_code_argv(job, _prompt(job), job_dir, client)
+        workdir = job_workdir(job_dir, cwd or Path.cwd())
     else:
         provider, argv = _provider_argv(job, config)
-    (job_dir / "cmd.json").write_text(
-        json.dumps({"argv": argv, "provider": provider, "env": env}))
+    (job_dir / "cmd.json").write_text(json.dumps(
+        {"argv": argv, "provider": provider, "env": env,
+         "cwd": str(workdir) if workdir else None}))
     try:
         return _watch(job, job_dir, timeout, on_tick, use_tmux, tick_seconds)
     finally:
         # Holds the NotesGraph token; nothing needs it once the run is over.
         (job_dir / "mcp.json").unlink(missing_ok=True)
+        _drop_worktree_if_empty(job_dir)
 
 
 def _watch(job: Job, job_dir: Path, timeout: int,
