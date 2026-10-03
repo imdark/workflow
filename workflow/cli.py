@@ -298,6 +298,10 @@ def project_add(
             }
         
         if default_repo:
+            # Store an absolute path so repo lookups work from any directory
+            default_repo = str(Path(default_repo).expanduser().resolve())
+            if not Path(default_repo).exists():
+                console.print(f"⚠️  Repository path does not exist yet: {default_repo}")
             project_config["repositories"][default_repo] = {"base_branch": "main"}
             project_config["default_repo"] = default_repo
         
@@ -541,9 +545,12 @@ def project_add_repo(
         
         # Verify the repository path exists
         from pathlib import Path
-        if not Path(repo_path).exists():
+        if not Path(repo_path).expanduser().exists():
             console.print(f"❌ Repository path '{repo_path}' does not exist.")
             return
+
+        # Store an absolute path so lookups work from any directory
+        repo_path = str(Path(repo_path).expanduser().resolve())
         
         # Verify it's a git repository
         try:
@@ -671,10 +678,13 @@ def repo_add(
     
     else:
         # It's a local path
-        if not Path(path_or_url).exists():
+        if not Path(path_or_url).expanduser().exists():
             console.print(f"❌ Error: Path '{path_or_url}' does not exist")
             console.print(f"💡 If you want to clone a repository, provide a GitHub URL instead")
             return
+
+        # Store an absolute path so lookups work from any directory
+        repo_path = str(Path(path_or_url).expanduser().resolve())
     
     # Check if it's a valid git repository
     try:
@@ -4160,9 +4170,49 @@ def test_trigger(
 app.add_typer(hook_app, name="hook")
 
 
+def autocomplete_repos(ctx, args, incomplete: str):
+    """
+    Autocomplete repository names for `wf cd`, across every project.
+
+    Each candidate is described by the project it belongs to, and the current
+    project's repositories are offered first -- the same order `wf cd` lists
+    them in. Matching is prefix-only because Typer drops any candidate that
+    doesn't start with what's been typed.
+    """
+    from workflow.projects import list_projects, get_current_project
+
+    try:
+        all_projects = list_projects()
+    except Exception:
+        return []
+
+    current_project = get_current_project()
+    incomplete_lower = (incomplete or "").lower()
+
+    # Current project's repositories first, mirroring how `wf cd` lists them
+    ordered = sorted(all_projects.items(), key=lambda item: item[0] != current_project)
+
+    completions = []
+    # A dict, not a set(): the `config set` command shadows the set builtin here.
+    seen = {}
+    for project_name, project_config in ordered:
+        for repo_path in project_config.get("repositories", {}):
+            name = Path(repo_path).name
+            if name in seen or not name.lower().startswith(incomplete_lower):
+                continue
+            seen[name] = True
+            completions.append((name, project_name))
+
+    return completions
+
+
 @app.command()
 def cd(
-    repo_name: str = typer.Argument(None, help="Repository name (tab completion available)")
+    repo_name: str = typer.Argument(
+        None,
+        autocompletion=autocomplete_repos,
+        help="Repository name (tab completion available)",
+    )
 ):
     """Change directory to a configured repository folder from any project"""
     import os
@@ -4263,12 +4313,11 @@ def cd(
         return
     
     # Check if repository exists
-    if not Path(matching_repo).exists():
-        typer.echo(f"❌ Repository path does not exist: {matching_repo}")
-        return
-    
-    # Use subprocess to change directory in parent shell using same approach as wf start
     repo_path = str(Path(matching_repo).expanduser())
+    if not Path(repo_path).exists():
+        typer.echo(f"❌ Repository path does not exist: {matching_repo}")
+        typer.echo(f"💡 Re-add it with an absolute path: wf project add-repo {matching_project} <path>")
+        return
     
     # Get shell commands from hooks BEFORE creating AppleScript
     from workflow.hooks import HookManager
@@ -4282,6 +4331,14 @@ def cd(
     
     # Build the command string
     cmd_parts = [f"cd '{repo_path}'"]
+
+    # Switch the shell to this project's Claude account, so a bare `claude`
+    # run in that directory authenticates as the right one.
+    from workflow import claude_accounts
+    account_export = claude_accounts.shell_export(matching_project)
+    if account_export:
+        cmd_parts.append(account_export)
+
     if shell_commands:
         cmd_parts.extend(shell_commands)
     else:
@@ -6299,6 +6356,23 @@ app.add_typer(doc_app, name="doc")
 
 explore_app = typer.Typer(help="Explore and store project context for AI", no_args_is_help=True)
 app.add_typer(explore_app, name="explore")
+
+# Capturing model proxy + the conversation memory it builds.
+from workflow.cli_proxy import proxy_app, mem_app
+app.add_typer(proxy_app, name="proxy")
+app.add_typer(mem_app, name="mem")
+
+# Per-project Claude accounts.
+from workflow.cli_auth import auth_app
+app.add_typer(auth_app, name="auth")
+
+# Deployment registry and the fleet it records.
+from workflow.cli_deploy import deploy_app
+app.add_typer(deploy_app, name="deploy")
+
+# Remote agent execution on registered devices.
+from workflow.cli_agent import agent_app
+app.add_typer(agent_app, name="agent")
 
 from commands.explore import explore as explore_cmd, list as explore_list, delete as explore_delete
 

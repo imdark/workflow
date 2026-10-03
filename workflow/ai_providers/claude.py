@@ -7,7 +7,7 @@ import time
 import shutil
 from datetime import datetime
 from pathlib import Path
-from workflow.ai_providers.base import AIProvider
+from workflow.ai_providers.base import AIProvider, apply_proxy_env
 
 
 def get_skills_for_session(issue=None, repo_path=None):
@@ -124,7 +124,20 @@ description: Workflow skill - {skill['scope']} scope
         
         try:
             prompt_file.write_text(context)
-            
+
+            # Route this session's model traffic through the capture proxy so
+            # the real conversation is recorded, rather than the ANSI terminal
+            # transcript `script` produces below.
+            captured = apply_proxy_env()
+            if captured:
+                print(f"DEBUG: capturing via {captured.get('ANTHROPIC_BASE_URL')}", file=sys.stderr)
+
+            # Log this session in as the current project's Claude account.
+            from workflow import claude_accounts
+            account_dir = claude_accounts.apply()
+            if account_dir:
+                print(f"DEBUG: claude account dir {account_dir}", file=sys.stderr)
+
             # Build command with optional plugin dir
             if plugin_arg:
                 script_cmd = f'script -q {transcript_file} bash -c \'cat {prompt_file} | claude {plugin_arg}\''

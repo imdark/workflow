@@ -333,12 +333,20 @@ def set_default_repo(project_name: str, repo_path: str) -> None:
     if "projects" not in cfg or project_name not in cfg["projects"]:
         raise ValueError(f"Project '{project_name}' not found")
     
-    # Verify the repository exists in the project
+    # Verify the repository exists in the project. Repositories are stored as
+    # absolute paths, so match a relative or ~-prefixed argument against those.
     project = cfg["projects"][project_name]
     repos = project.get("repositories", {})
-    
+
     if repo_path not in repos:
-        raise ValueError(f"Repository '{repo_path}' not found in project '{project_name}'")
+        resolved = str(Path(repo_path).expanduser().resolve())
+        match = next(
+            (key for key in repos if str(Path(key).expanduser().resolve()) == resolved),
+            None,
+        )
+        if not match:
+            raise ValueError(f"Repository '{repo_path}' not found in project '{project_name}'")
+        repo_path = match
     
     project["default_repo"] = repo_path
     save_config(cfg)
