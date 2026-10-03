@@ -16,8 +16,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from workflow.deploy import agent_mcp
+from workflow.backends.base import Issue
 from workflow.deploy.jobs import (CLAUDE_CODE_SYSTEM_PROMPT, Job, JobClient,
-                                  claude_code_argv, run_job)
+                                  claude_code_argv, run_job, start_job_task)
+from workflow.session import task_branch_name
 
 
 class FakeInventory:
@@ -223,46 +225,77 @@ def test_the_system_prompt_asks_before_guessing_and_saves_answers():
     assert "keyword_search" in prompt
 
 
+class FakeBackend:
+    """A task backend that records what `wf start` would do to a ticket."""
+
+    def __init__(self):
+        self.issues, self.created, self.in_progress = {}, [], []
+
+    def create_issue(self, summary, description, issue_type="Task", project_key=None):
+        issue = Issue(f"NG-{len(self.issues) + 1}", summary, description)
+        self.issues[issue.key] = issue
+        self.created.append(issue)
+        return issue
+
+    def get(self, key):
+        return self.issues[key]
+
+    def move_to_in_progress(self, issue, custom_fields=None):
+        self.in_progress.append(issue.key)
+
+
+@pytest.fixture
+def started(tmp_path, monkeypatch):
+    """Stand in for the wf task setup, so run_job tests run just the job."""
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path)
+    issue = Issue("NG-1", "Find a show", "")
+    calls = {"saved": 0}
+    monkeypatch.setattr("workflow.deploy.jobs.start_job_task",
+                        lambda j, d, c: (issue, d, None))
+    monkeypatch.setattr("workflow.deploy.jobs._job_context", lambda i, j, w: "go")
+    monkeypatch.setattr("workflow.deploy.jobs._save_session",
+                        lambda i, d, w: calls.__setitem__("saved", calls["saved"] + 1))
+    monkeypatch.setattr("workflow.ai_providers.claude.skills_plugin_dir", lambda *a: None)
+    monkeypatch.setattr("workflow.session.apply_claude_env", lambda env=None: {})
+    return calls
+
+
 def test_a_claude_code_job_needs_a_connection(tmp_path, monkeypatch):
     monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path)
     with pytest.raises(RuntimeError, match="NotesGraph connection"):
         run_job(job(), config={}, use_tmux=False)
 
 
-def test_the_token_file_is_removed_after_the_run(tmp_path, monkeypatch):
-    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path)
-
-    def fake_argv(j, prompt, job_dir, c):
+def test_the_token_file_is_removed_after_the_run(tmp_path, monkeypatch, started):
+    def fake_argv(j, prompt, job_dir, c, plugin_dir=None):
         (job_dir / "mcp.json").write_text("{}")
         return [sys.executable, "-c", "print('done')"], {}
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv", fake_argv)
 
-    out = run_job(job(), config={}, use_tmux=False, client=client(), tick_seconds=0.05,
-                  cwd=tmp_path)
+    out = run_job(job(model="workflow"), config={}, use_tmux=False, client=client(), tick_seconds=0.05)
     assert out["result"] == "done"
     assert not (tmp_path / "job-1234abcd" / "mcp.json").exists()
+    assert started["saved"] == 1, "the run is filed in the task's memory"
 
 
-def test_time_spent_waiting_for_the_user_does_not_count(tmp_path, monkeypatch):
+def test_time_spent_waiting_for_the_user_does_not_count(tmp_path, monkeypatch, started):
     """A 1s limit, a run that spends 2s waiting on a question: it finishes."""
-    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path)
     marker = tmp_path / "job-1234abcd" / "waiting-q1"
     script = (f"import pathlib, time; m = pathlib.Path({str(marker)!r}); "
               "m.write_text('q'); time.sleep(2); m.unlink(); print('answered')")
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
-                        lambda j, p, d, c: ([sys.executable, "-c", script], {}))
+                        lambda *a: ([sys.executable, "-c", script], {}))
 
-    out = run_job(job(), config={}, timeout=1, use_tmux=False, client=client(), cwd=tmp_path,
+    out = run_job(job(model="workflow"), config={}, timeout=1, use_tmux=False, client=client(),
                   tick_seconds=0.1)
     assert out["result"] == "answered"
 
 
-def test_without_a_question_the_limit_still_applies(tmp_path, monkeypatch):
-    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path)
+def test_without_a_question_the_limit_still_applies(tmp_path, monkeypatch, started):
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
-                        lambda j, p, d, c: ([sys.executable, "-c", "import time; time.sleep(5)"], {}))
+                        lambda *a: ([sys.executable, "-c", "import time; time.sleep(5)"], {}))
     with pytest.raises(RuntimeError, match="exceeded 1s"):
-        run_job(job(), config={}, timeout=1, use_tmux=False, client=client(), cwd=tmp_path,
+        run_job(job(model="workflow"), config={}, timeout=1, use_tmux=False, client=client(),
                 tick_seconds=0.1)
 
 
@@ -272,7 +305,13 @@ def test_claude_code_has_no_turn_limit(tmp_path):
     assert not any(a.startswith("--max-turns") for a in argv)
 
 
-# --- where it runs --------------------------------------------------------
+def test_the_tasks_skills_go_in_as_a_plugin(tmp_path):
+    argv, _ = claude_code_argv(job(), "go", tmp_path, client(), tmp_path / "plugin")
+    assert argv[argv.index("--plugin-dir") + 1] == str(tmp_path / "plugin")
+    assert argv[-1] == "go"
+
+
+# --- starting it as a wf task ---------------------------------------------
 
 def git(cwd, *args):
     import subprocess
@@ -282,18 +321,98 @@ def git(cwd, *args):
 
 @pytest.fixture
 def repo(tmp_path):
-    root = tmp_path / "checkout"
-    root.mkdir()
+    root = tmp_path / "code" / "notes"
+    root.mkdir(parents=True)
     git(root, "init", "-q", "-b", "main")
     git(root, "-c", "user.email=t@t", "-c", "user.name=t",
         "commit", "-q", "--allow-empty", "-m", "start")
     return root
 
 
-def run_in(repo, tmp_path, monkeypatch, script):
+@pytest.fixture
+def wf(repo, monkeypatch):
+    """wf configured with one repo and the fake backend."""
+    backend = FakeBackend()
+    monkeypatch.setattr("workflow.backends.get_backend", lambda cfg, force_type=None: backend)
+    monkeypatch.setattr("workflow.config.load_effective_config", lambda: {})
+    monkeypatch.setattr("workflow.config.is_git_enabled", lambda: True)
+    monkeypatch.setattr("workflow.session.configured_repos",
+                        lambda: {str(repo): {"base_branch": "main"}})
+    monkeypatch.setattr("workflow.projects.get_current_project_repositories",
+                        lambda: {str(repo): {}})
+    monkeypatch.setattr("workflow.projects.get_default_repo", lambda project_name=None: None)
+    monkeypatch.setattr("workflow.git_utils.add_claude_trust", lambda path: None)
+    return backend
+
+
+def test_a_job_becomes_a_task_in_progress_on_its_own_branch(repo, wf, tmp_path):
+    job_dir = tmp_path / "jobs" / "j1"
+    job_dir.mkdir(parents=True)
+
+    issue, workdir, repo_path = start_job_task(job(), job_dir, repo)
+
+    assert [i.title for i in wf.created] == ["Find a show to watch with Cosmo"]
+    assert wf.in_progress == [issue.key]
+    # wf start's branch and worktree: beside the repo, never in it.
+    assert git(workdir, "branch", "--show-current") == "ng-1-Find-a-show-to-watch-with-Cosmo"
+    assert workdir.parent == repo.parent and workdir.name.startswith("notes-ng-1-")
+    assert repo_path == str(workdir)
+    assert git(workdir, "config", "commit.template") == "[NG-1]"
+    # The checkout the runner started in has not moved.
+    assert git(repo, "branch", "--show-current") == "main"
+
+
+def test_a_reclaimed_job_keeps_its_ticket_and_worktree(repo, wf, tmp_path):
+    job_dir = tmp_path / "jobs" / "j1"
+    job_dir.mkdir(parents=True)
+
+    first = start_job_task(job(), job_dir, repo)
+    again = start_job_task(job(), job_dir, repo)
+
+    assert len(wf.created) == 1
+    assert again[0].key == first[0].key and again[1] == first[1]
+
+
+def test_outside_a_configured_repo_it_runs_in_the_job_directory(wf, tmp_path, monkeypatch):
+    monkeypatch.setattr("workflow.session.configured_repos", lambda: {})
+    job_dir = tmp_path / "jobs" / "j1"
+    job_dir.mkdir(parents=True)
+    issue, workdir, repo_path = start_job_task(job(), job_dir, tmp_path)
+    assert workdir == job_dir and repo_path is None
+    assert wf.in_progress == [issue.key]
+
+
+def test_branch_names_drop_what_git_refuses():
+    issue = Issue("NG-7", "Fix: the ~board? [mobile]", "")
+    assert task_branch_name(issue) == "ng-7-Fix-the-board-mobile"
+
+
+def test_wf_start_and_jobs_name_branches_the_same(monkeypatch):
+    """create_branch (wf start's normal path) uses the shared name."""
+    import workflow.git_utils as g
+    names = []
+
+    class FakeGit:
+        def checkout(self, *args):
+            names.append(args[-1])
+
+    class FakeRepo:
+        git = FakeGit()
+    monkeypatch.setattr(g, "get_repo", lambda path=None: FakeRepo())
+    monkeypatch.setattr(g, "select_base_branch", lambda base, path=None: base)
+    monkeypatch.setattr(g, "checkout_branch", lambda name, path=None: True)
+    issue = Issue("NG-7", "Fix: the board", "")
+    g.create_branch(issue, "main", "/r", skip_uncommitted_check=True)
+    assert names == [task_branch_name(issue)]
+
+
+# --- a plain claude-code job ----------------------------------------------
+
+def run_claude_code_in(repo, tmp_path, monkeypatch, script):
+    """A plain claude-code job: its own worktree under the job directory."""
     monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
-                        lambda j, p, d, c: ([sys.executable, "-c", script], {}))
+                        lambda *a: ([sys.executable, "-c", script], {}))
     return run_job(job(), config={}, use_tmux=False, client=client(),
                    tick_seconds=0.05, cwd=repo)
 
@@ -303,7 +422,7 @@ def test_it_branches_and_commits_in_its_own_worktree(repo, tmp_path, monkeypatch
               "s.run(['git', 'checkout', '-q', '-b', 'agent-work'], check=True); "
               "s.run(['git', '-c', 'user.email=a@a', '-c', 'user.name=a', 'commit', "
               "'-q', '--allow-empty', '-m', 'agent'], check=True)")
-    out = run_in(repo, tmp_path, monkeypatch, script)
+    out = run_claude_code_in(repo, tmp_path, monkeypatch, script)
 
     assert out["result"].endswith("job-1234abcd/repo")
     # The checkout someone is working in has not moved...
@@ -315,8 +434,8 @@ def test_it_branches_and_commits_in_its_own_worktree(repo, tmp_path, monkeypatch
 
 
 def test_a_worktree_with_uncommitted_changes_is_kept(repo, tmp_path, monkeypatch):
-    run_in(repo, tmp_path, monkeypatch,
-           "open('half-done.txt', 'w').write('x'); print('stopped')")
+    run_claude_code_in(repo, tmp_path, monkeypatch,
+                       "open('half-done.txt', 'w').write('x'); print('stopped')")
     tree = tmp_path / "jobs" / "job-1234abcd" / "repo"
     assert (tree / "half-done.txt").exists()
     assert not (repo / "half-done.txt").exists()
@@ -325,5 +444,20 @@ def test_a_worktree_with_uncommitted_changes_is_kept(repo, tmp_path, monkeypatch
 def test_outside_a_repo_it_runs_in_the_job_directory(tmp_path, monkeypatch):
     plain = tmp_path / "plain"
     plain.mkdir()
-    out = run_in(plain, tmp_path, monkeypatch, "import os; print(os.getcwd())")
+    out = run_claude_code_in(plain, tmp_path, monkeypatch, "import os; print(os.getcwd())")
     assert out["result"].endswith("job-1234abcd")
+
+
+def test_a_claude_code_job_is_not_a_wf_task(repo, tmp_path, monkeypatch):
+    """Only the workflow model makes tickets and wf branches."""
+    def no_task(*a):
+        raise AssertionError("a claude-code job must not start a wf task")
+    monkeypatch.setattr("workflow.deploy.jobs.start_job_task", no_task)
+    out = run_claude_code_in(repo, tmp_path, monkeypatch, "print('ok')")
+    assert out["result"] == "ok"
+
+
+def test_a_workflow_job_needs_a_connection(tmp_path, monkeypatch):
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="workflow job needs a NotesGraph connection"):
+        run_job(job(model="workflow"), config={}, use_tmux=False)

@@ -145,7 +145,7 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
     with open(job_dir / "log.txt", "a", encoding="utf-8") as log:
         narrator = Narrator(out, log)
         narrator.say(f"$ {argv[0]} … ({spec.get('provider', argv[0])}, job {job_dir.name})")
-        if spec.get("provider") == "claude-code":
+        if spec.get("provider") in ("claude-code", "workflow"):
             narrator.say("  Claude can read and write your notes, and will ask you in "
                          "NotesGraph when it needs something.")
         code = 1
