@@ -4189,9 +4189,16 @@ def cd(
         None,
         autocompletion=autocomplete_repos,
         help="Repository name (tab completion available)",
-    )
+    ),
+    no_desktop: bool = typer.Option(
+        False, "--no-desktop", help="Don't launch the project's apps or arrange its windows",
+    ),
 ):
-    """Change directory to a configured repository folder from any project"""
+    """Change directory to a configured repository folder from any project.
+
+    Also opens the apps and window layout configured for the repo or its
+    project -- see `wf desktop`.
+    """
     import os
     from pathlib import Path
     import subprocess
@@ -4346,6 +4353,14 @@ def cd(
         typer.echo(f"📁 Changed to: {repo_path} (project: {matching_project})")
     else:
         typer.echo(f"📁 Changed to: {repo_path} (project: {matching_project}) - not current project")
+
+    if not no_desktop:
+        from workflow import desktop
+        from workflow.cli_desktop import report
+        try:
+            report(desktop.apply(matching_project, matching_repo, cd_context))
+        except Exception as e:
+            typer.echo(f"⚠️  Desktop setup failed: {e}")
 
 @app.command()
 def status():
@@ -6342,6 +6357,10 @@ app.add_typer(mem_app, name="mem")
 # Per-project Claude accounts.
 from workflow.cli_auth import auth_app
 app.add_typer(auth_app, name="auth")
+
+# Apps and window layouts `wf cd` sets up per project or repo.
+from workflow.cli_desktop import desktop_app
+app.add_typer(desktop_app, name="desktop")
 
 # Deployment registry and the fleet it records.
 from workflow.cli_deploy import deploy_app

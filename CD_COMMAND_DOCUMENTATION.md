@@ -100,3 +100,58 @@ The `wf cd` command integrates seamlessly with your existing workflow configurat
 **Directory change not working**
 - Use `wfcd` alias instead of `wf cd` directly
 - Ensure the wrapper function is loaded in your shell
+## Desktop setup per project or repo
+
+`wf cd` can also open the apps you work with in a repo and arrange their
+windows. Configure it per project, and override or extend it per repository:
+
+```bash
+# Every repo in the current project: VS Code on the left with the repo open
+wf desktop add "Visual Studio Code" --open '{repo_path}' --position left
+wf desktop add Slack --background
+wf desktop focus Terminal            # end up back in the terminal
+
+# Just the api repo: Chrome on the right of the second screen
+wf desktop add "Google Chrome" --repo api --open http://localhost:3000 --position right --screen 2
+
+wf desktop show --repo api           # what `wf cd api` will do
+wf desktop apply --repo api          # do it now, without changing directory
+wfcd api --no-desktop                # change directory only
+```
+
+Positions: `full`, `left`, `right`, `top`, `bottom`, `top-left`, `top-right`,
+`bottom-left`, `bottom-right`, `left-third`, `center-third`, `right-third`,
+`left-two-thirds`, `right-two-thirds`, `center`. For exact placement, arrange
+the windows by hand and run `wf desktop capture [APP...] [--repo NAME]` to
+record their bounds, or pass `--bounds x,y,width,height` (`wf desktop screens`
+lists the screen areas).
+
+The same thing in `~/.wf/config.yaml`:
+
+```yaml
+projects:
+  work:
+    desktop:
+      apps:
+        - Slack
+        - app: Visual Studio Code
+          open: "{repo_path}"          # also {repo_name}, {project}
+          position: left
+      focus: Terminal
+    repositories:
+      ~/code/api:
+        base_branch: main
+        desktop:
+          # inherit: false             # ignore the project's apps
+          apps:
+            - app: Google Chrome
+              open: http://localhost:3000
+              position: right
+              screen: 2
+```
+
+A repo's apps are added to its project's; an app listed in both takes the
+repo's entry. Apps are started with `open -a`. Moving windows needs your
+terminal app allowed under System Settings › Privacy & Security ›
+Accessibility; windows that couldn't be placed are logged to
+`~/.wf/logs/desktop.log`.
