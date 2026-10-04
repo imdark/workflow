@@ -616,3 +616,123 @@ def deploy_recipes():
                     console.print(f"    {step.name}: [dim]{step.run}[/dim]{flag}")
             elif label == "restart":
                 console.print("  restart: [dim]none — a deploy never bounces this target[/dim]")
+
+
+# ── Cloud deploys (per project) ──────────────────────────────────────────────
+
+@deploy_app.command("cloud-config")
+def deploy_cloud_config(
+    command: Optional[str] = typer.Option(None, "--command", "-c",
+                                          help="Deploy command, run in the checkout"),
+    repo: Optional[str] = typer.Option(None, "--repo",
+                                       help="Checkout to deploy from (default: project default repo)"),
+    branch: Optional[str] = typer.Option(None, "--branch", "-b", help="Branch that gets deployed"),
+    verify_url: Optional[str] = typer.Option(None, "--verify-url",
+                                             help="URL that must answer after a deploy"),
+):
+    """Show or set the current project's cloud deploy."""
+    from workflow.deploy.cloud import CONFIG_KEY
+    from workflow.projects import get_current_project, get_default_repo, get_project, update_project
+
+    project = get_current_project()
+    if not project:
+        console.print("❌ No current project. Use 'wf project change <name>'.")
+        raise typer.Exit(1)
+
+    section = dict((get_project(project) or {}).get(CONFIG_KEY) or {})
+    changes = {"command": command, "repo": repo, "branch": branch, "verify_url": verify_url}
+    section.update({k: v for k, v in changes.items() if v is not None})
+    if any(v is not None for v in changes.values()):
+        section.setdefault("repo", get_default_repo(project))
+        section.setdefault("branch", "main")
+        update_project(project, {CONFIG_KEY: section})
+        console.print(f"✅ Cloud deploy for '{project}' saved")
+
+    if not section:
+        console.print(f"No cloud deploy for '{project}'. Set one with "
+                      "'wf deploy cloud-config --command <cmd> --verify-url <url>'.")
+        return
+    for key in ("repo", "branch", "command", "verify_url"):
+        console.print(f"   {key}: {section.get(key) or '[dim]-[/dim]'}")
+
+
+@deploy_app.command("cloud")
+def deploy_cloud(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    plan: bool = typer.Option(False, "--plan", help="Show what would ship without deploying"),
+):
+    """Deploy the project's merged code to its cloud service.
+
+    Tasks whose branches have merged move to Merged; a successful deploy
+    moves them to Deployed, and a passing verify URL to Done.
+    """
+    from workflow import ship
+    from workflow.backends import get_backend
+    from workflow.config import load_effective_config
+    from workflow.deploy import cloud
+    from workflow.projects import get_current_project_config
+    from workflow.session import task_branch_name
+
+    target = cloud.target_from(get_current_project_config())
+    if not target:
+        console.print("❌ This project has no cloud deploy. Set one with "
+                      "'wf deploy cloud-config --command <cmd> --verify-url <url>'.")
+        raise typer.Exit(1)
+
+    backend = get_backend(load_effective_config())
+    for task in ship.promote_merged(
+            backend, _project_tasks(backend),
+            lambda t: ship.is_merged(target.repo, task_branch_name(t), target.branch)):
+        console.print(f"   🔀 {task.key} merged → {ship.MERGED}")
+    shipping = [t for t in _project_tasks(backend) if t.status == ship.MERGED]
+
+    console.print(f"\n[bold]{target.repo}[/bold] @ origin/{target.branch} → [dim]{target.command}[/dim]")
+    if shipping:
+        console.print("   ships: " + ", ".join(t.key for t in shipping))
+    else:
+        console.print("   [dim]no Merged tasks waiting on a deploy[/dim]")
+    if plan:
+        console.print("\n[dim]--plan: nothing was deployed[/dim]")
+        return
+
+    problem = cloud.sync_checkout(target)
+    if problem:
+        console.print(f"❌ {problem}")
+        raise typer.Exit(1)
+    revision = cloud.head_revision(target)
+
+    if not yes and not typer.confirm(f"Deploy {revision} to the cloud?", default=True):
+        console.print("   skipped")
+        return
+
+    code = cloud.run_deploy(target)
+    if code != 0:
+        console.print(f"❌ Deploy exited {code}; no task statuses changed")
+        raise typer.Exit(code)
+    console.print(f"✅ Deployed {revision}")
+    for task in ship.promote(backend, shipping, ship.MERGED, ship.DEPLOYED):
+        console.print(f"   🚀 {task.key} → {ship.DEPLOYED}")
+
+    if not target.verify_url:
+        console.print("   [dim]no verify URL; tasks stay Deployed until checked[/dim]")
+        return
+    ok, detail = cloud.verify(target.verify_url)
+    if not ok:
+        console.print(f"⚠️  {target.verify_url} answered {detail}; tasks stay {ship.DEPLOYED}")
+        raise typer.Exit(1)
+    console.print(f"   ✅ {target.verify_url} answered {detail}")
+    shipped = {t.key for t in shipping}
+    deployed = [t for t in _project_tasks(backend) if t.key in shipped]
+    for task in ship.promote(backend, deployed, ship.DEPLOYED, ship.DONE):
+        console.print(f"   ✔ {task.key} → {ship.DONE}")
+
+
+def _project_tasks(backend) -> list:
+    """The current project's tasks, when the backend can hold shipping stages.
+
+    Only the markdown backend stores arbitrary statuses; Jira and Linear
+    tasks keep moving through their own workflows.
+    """
+    if backend is None or not hasattr(backend, "transition_task"):
+        return []
+    return [t for t in backend.list_tasks() if hasattr(t, "status")]
