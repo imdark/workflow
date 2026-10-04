@@ -11,6 +11,9 @@ claims queued jobs for this device, runs them through the configured AI
 provider, and reports the result back. Each job runs in its own tmux
 session (`wf agent attach` to watch one) and its transcript is streamed to
 the server as it goes, so the same text shows in NotesGraph.
+
+Several jobs run at once (`--max-jobs`): each has its own job directory,
+worktree and tmux session, so they don't share a checkout.
 """
 
 import codecs
@@ -21,6 +24,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +43,13 @@ DEFAULT_POLL_SECONDS = 5
 TICK_SECONDS = 2
 # Per-job working directories: prompt, transcript, result.
 JOB_ROOT = Path.home() / ".wf" / "agent-jobs"
+# Jobs one runner works on at once.
+DEFAULT_MAX_JOBS = 4
+# Held while a job is set up or torn down. Those steps chdir (process-wide,
+# so a concurrent job would resolve paths against the wrong directory) and
+# add or remove git worktrees, which race on the repo's own bookkeeping.
+# They take seconds; the runs themselves go in parallel.
+_SETUP_LOCK = threading.RLock()
 
 
 @dataclass
@@ -427,6 +438,9 @@ def _launch(job_dir: Path, session: Optional[str]) -> Optional[subprocess.Popen]
     it and the runner only watches files.
     """
     argv = [sys.executable, "-m", "workflow.deploy.job_exec", str(job_dir)]
+    with _SETUP_LOCK:
+        # Not while another job's setup has chdir'd somewhere else.
+        cwd = os.getcwd()
     if session:
         # A runner that died can leave the previous attempt's session behind
         # when the job is re-claimed; replace it rather than failing.
@@ -434,11 +448,11 @@ def _launch(job_dir: Path, session: Optional[str]) -> Optional[subprocess.Popen]
                        capture_output=True)
         subprocess.run(
             ["tmux", "new-session", "-d", "-s", session, "-x", "200", "-y", "50",
-             "-c", os.getcwd(), shlex.join(argv)],
+             "-c", cwd, shlex.join(argv)],
             check=True, capture_output=True,
         )
         return None
-    return subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+    return subprocess.Popen(argv, cwd=cwd, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
 
@@ -496,46 +510,48 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: int = 900,
     env: dict = {}
     workdir: Optional[Path] = None
     issue = repo_path = None
-    if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL):
-        if client is None:
-            raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
-        provider = job.model
-    if job.model == CLAUDE_CODE_MODEL:
-        argv, env = claude_code_argv(job, _prompt(job), job_dir, client)
-        workdir = job_workdir(job_dir, cwd or Path.cwd())
-    elif job.model == WORKFLOW_MODEL:
-        issue, workdir, repo_path = start_job_task(job, job_dir, cwd or Path.cwd())
-        from workflow.ai_providers.claude import skills_plugin_dir
-        from workflow.session import apply_claude_env
-        plugin_dir = skills_plugin_dir(issue, issue.key.lower(),
-                                       Path.home() / ".wf" / "tasks" / issue.key.lower(),
-                                       repo_path)
-        argv, env = claude_code_argv(job, _job_context(issue, job, workdir),
-                                     job_dir, client, plugin_dir)
-        # Same Claude account and capture proxy as `wf ai`.
-        env.update(apply_claude_env(dict(os.environ)))
-    else:
-        provider, argv = _provider_argv(job, config)
-    (job_dir / "cmd.json").write_text(json.dumps(
-        {"argv": argv, "provider": provider, "env": env,
-         "cwd": str(workdir) if workdir else None}))
-    if repo_path:
-        from workflow.pid_manager import create_ai_pid_file
-        from workflow.session import task_branch_name
-        # So `wf start` sees this repo is busy, as it does for `wf ai`.
-        create_ai_pid_file(repo_path, issue.key, task_branch_name(issue))
+    with _SETUP_LOCK:
+        if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL):
+            if client is None:
+                raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
+            provider = job.model
+        if job.model == CLAUDE_CODE_MODEL:
+            argv, env = claude_code_argv(job, _prompt(job), job_dir, client)
+            workdir = job_workdir(job_dir, cwd or Path.cwd())
+        elif job.model == WORKFLOW_MODEL:
+            issue, workdir, repo_path = start_job_task(job, job_dir, cwd or Path.cwd())
+            from workflow.ai_providers.claude import skills_plugin_dir
+            from workflow.session import apply_claude_env
+            plugin_dir = skills_plugin_dir(issue, issue.key.lower(),
+                                           Path.home() / ".wf" / "tasks" / issue.key.lower(),
+                                           repo_path)
+            argv, env = claude_code_argv(job, _job_context(issue, job, workdir),
+                                         job_dir, client, plugin_dir)
+            # Same Claude account and capture proxy as `wf ai`.
+            env.update(apply_claude_env(dict(os.environ)))
+        else:
+            provider, argv = _provider_argv(job, config)
+        (job_dir / "cmd.json").write_text(json.dumps(
+            {"argv": argv, "provider": provider, "env": env,
+             "cwd": str(workdir) if workdir else None}))
+        if repo_path:
+            from workflow.pid_manager import create_ai_pid_file
+            from workflow.session import task_branch_name
+            # So `wf start` sees this repo is busy, as it does for `wf ai`.
+            create_ai_pid_file(repo_path, issue.key, task_branch_name(issue))
     try:
         return _watch(job, job_dir, timeout, on_tick, use_tmux, tick_seconds)
     finally:
         # Holds the NotesGraph token; nothing needs it once the run is over.
         (job_dir / "mcp.json").unlink(missing_ok=True)
-        if job.model == CLAUDE_CODE_MODEL:
-            _drop_worktree_if_empty(job_dir)
-        if issue is not None:
-            _save_session(issue, job_dir, workdir)
-        if repo_path:
-            from workflow.pid_manager import remove_ai_pid_file
-            remove_ai_pid_file(repo_path)
+        with _SETUP_LOCK:
+            if job.model == CLAUDE_CODE_MODEL:
+                _drop_worktree_if_empty(job_dir)
+            if issue is not None:
+                _save_session(issue, job_dir, workdir)
+            if repo_path:
+                from workflow.pid_manager import remove_ai_pid_file
+                remove_ai_pid_file(repo_path)
 
 
 def _watch(job: Job, job_dir: Path, timeout: int,
@@ -626,18 +642,67 @@ class _Reporter:
         return (job or {}).get("status") == "cancelled"
 
 
+def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
+    """Run a claimed job and report how it ended. True if it finished."""
+    session = tmux_session_name(job.id) if shutil.which("tmux") else None
+    emit("claimed", job, session or "")
+    reporter = _Reporter(client, job.id, session)
+    try:
+        outcome = run_job(job, config, on_tick=reporter,
+                          use_tmux=session is not None, client=client)
+        client.report(job.id, status="done", result=outcome["result"],
+                      steps=outcome["steps"],
+                      **({"logAppend": reporter.pending} if reporter.pending else {}))
+        emit("done", job)
+        return True
+    except JobCancelled:
+        emit("cancelled", job)
+    except Exception as e:
+        try:
+            client.report(job.id, status="error", error=str(e)[:2000],
+                          **({"logAppend": reporter.pending} if reporter.pending else {}))
+        except NotesGraphError:
+            pass
+        emit("failed", job, str(e))
+    return False
+
+
 def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
           poll_seconds: int = DEFAULT_POLL_SECONDS, once: bool = False,
-          on_event=None, config=None) -> int:
-    """Claim and run jobs until interrupted. Returns how many ran."""
+          on_event=None, config=None, max_jobs: int = DEFAULT_MAX_JOBS) -> int:
+    """Claim and run jobs until interrupted. Returns how many ran.
+
+    Up to `max_jobs` run at once, each on its own thread; with every slot
+    taken nothing more is claimed, so the rest stay queued on the server
+    for another runner. A slot that frees up is filled straight away, and
+    jobs queued together start together rather than one per poll. `once`
+    runs at most one job, here, and returns.
+
+    The threads are daemons: Ctrl-C ends the runner without waiting for
+    them, as it always ended mid-job. Their leases lapse and the jobs are
+    claimed again.
+    """
     runner_id = runner_id or f"{socket.gethostname()}-{int(time.time())}"
     emit = on_event or (lambda *a, **k: None)
     completed = 0
+    counted = threading.Lock()
+    slots = threading.BoundedSemaphore(max(1, max_jobs))
+
+    def work(job: Job) -> None:
+        nonlocal completed
+        try:
+            if _run_claimed(client, job, config, emit):
+                with counted:
+                    completed += 1
+        finally:
+            slots.release()
 
     while True:
+        slots.acquire()
         try:
             job = client.claim(device_key, runner_id)
         except NotesGraphError as e:
+            slots.release()
             emit("error", f"claim failed: {e}")
             if once:
                 return completed
@@ -645,31 +710,14 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
             continue
 
         if not job:
+            slots.release()
             if once:
                 return completed
             time.sleep(poll_seconds)
             continue
 
-        session = tmux_session_name(job.id) if shutil.which("tmux") else None
-        emit("claimed", job, session or "")
-        reporter = _Reporter(client, job.id, session)
-        try:
-            outcome = run_job(job, config, on_tick=reporter,
-                              use_tmux=session is not None, client=client)
-            client.report(job.id, status="done", result=outcome["result"],
-                          steps=outcome["steps"],
-                          **({"logAppend": reporter.pending} if reporter.pending else {}))
-            completed += 1
-            emit("done", job)
-        except JobCancelled:
-            emit("cancelled", job)
-        except Exception as e:
-            try:
-                client.report(job.id, status="error", error=str(e)[:2000],
-                              **({"logAppend": reporter.pending} if reporter.pending else {}))
-            except NotesGraphError:
-                pass
-            emit("failed", job, str(e))
-
         if once:
+            work(job)
             return completed
+        threading.Thread(target=work, args=(job,), name=f"job-{job.id[:8]}",
+                         daemon=True).start()

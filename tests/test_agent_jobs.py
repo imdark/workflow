@@ -81,6 +81,88 @@ def test_an_unreachable_inventory_does_not_crash_the_runner():
     assert serve(client, "laptop", once=True) == 0
 
 
+class _Stop(Exception):
+    """Ends a test's serve loop: claim raising it propagates out."""
+
+
+def serve_until(client, done, **kw):
+    """Run serve on a thread until `done` is set, then stop it."""
+    import threading
+
+    claim = client.claim
+
+    def claim_or_stop(device_key, runner_id):
+        if done.is_set():
+            raise _Stop()
+        return claim(device_key, runner_id)
+
+    client.claim = claim_or_stop
+    errors = []
+
+    def run():
+        try:
+            serve(client, "laptop", poll_seconds=0.01, **kw)
+        except _Stop:
+            pass
+        except Exception as e:  # surfaced to the test below
+            errors.append(e)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    assert done.wait(5), "the jobs never finished"
+    thread.join(5)
+    assert not errors
+
+
+def test_queued_jobs_run_side_by_side(monkeypatch):
+    """Each job has its own worktree, so one need not wait for another."""
+    import threading
+
+    both_running = threading.Barrier(2, timeout=5)
+    finished, done = [], threading.Event()
+
+    def run(job, cfg=None, **kw):
+        # Only gets past here once the other job is running too.
+        both_running.wait()
+        finished.append(job.id)
+        if len(finished) == 2:
+            done.set()
+        return {"result": job.id, "steps": 1, "session": None}
+
+    monkeypatch.setattr("workflow.deploy.jobs.run_job", run)
+    client = FakeClient([payload("j1"), payload("j2")])
+
+    serve_until(client, done)
+    assert sorted(r["job"] for r in client.reports if r["status"] == "done") == ["j1", "j2"]
+
+
+def test_no_more_than_max_jobs_run_at_once(monkeypatch):
+    import threading
+    import time
+
+    lock, running, peak = threading.Lock(), [0], [0]
+    finished, done = [], threading.Event()
+
+    def run(job, cfg=None, **kw):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.05)
+        with lock:
+            running[0] -= 1
+            finished.append(job.id)
+            if len(finished) == 3:
+                done.set()
+        return {"result": job.id, "steps": 1, "session": None}
+
+    monkeypatch.setattr("workflow.deploy.jobs.run_job", run)
+    client = FakeClient([payload("j1"), payload("j2"), payload("j3")])
+
+    serve_until(client, done, max_jobs=2)
+    assert peak[0] == 2
+    assert len([r for r in client.reports if r["status"] == "done"]) == 3
+
+
 def test_the_prompt_carries_instructions_and_context():
     from workflow.deploy.jobs import _provider_argv
 
