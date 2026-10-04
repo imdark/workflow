@@ -2759,7 +2759,7 @@ def switch(
 @app.command()
 def done(reviewers: str = typer.Option(None, help="Comma-separated list of reviewers"), repo_path: str = typer.Option(None, help="Repository path")):
     cfg = load_config()
-    backend = get_backend(cfg)
+    backend = get_backend(load_effective_config())
     issue = get_current_task()
 
     if not issue:
@@ -2776,6 +2776,8 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
     repos.update(global_repos)
     repos.update(project_repos)
 
+    pr = None
+    pr_created = False
     if is_git_enabled():
         if not repos:
             typer.echo("No repositories configured. Use 'wf repo-add' to add one.")
@@ -2906,13 +2908,16 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                                 typer.echo("   Run: wf config set github_enabled true")
                             typer.echo("Skipping PR creation.")
     
-    # Move task to appropriate final state
+    # A task is never Done here: it's Committed once its PR is up, and only
+    # reaches Done after it merges and `wf deploy cloud` ships it live.
+    from workflow import ship
     if pr_created:
-        backend.move_to_review(issue)
-        typer.echo(f"📋 Task {issue.key} moved to Code Review")
+        if ship.advance(backend, issue, ship.COMMITTED):
+            typer.echo(f"📋 Task {issue.key} → {ship.COMMITTED} (PR open). It becomes "
+                       f"{ship.DONE} once merged and deployed with 'wf deploy cloud'.")
     else:
-        backend.move_to_done(issue)
-        typer.echo(f"✅ Task {issue.key} marked as Done")
+        typer.echo(f"⚠️  Nothing was committed for {issue.key}, so it stays where it is. "
+                   f"A task is {ship.DONE} only once committed, merged and deployed.")
     
     # Post PR to Slack if created
     if pr and pr.get("url") and not pr.get("url").startswith("existing"):
