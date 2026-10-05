@@ -395,3 +395,35 @@ def test_the_last_result_is_the_outcome_and_subagents_are_marked():
     assert text.rstrip().endswith("✗ failed after 25 turns · $4.0000: error_max_turns")
     assert n.result is None and n.error == "error_max_turns"
     assert n.steps == 25
+
+
+# --- command jobs (NotesGraph monitors) -------------------------------------
+
+def test_a_command_job_returns_its_output(tmp_path, monkeypatch):
+    from workflow.deploy.jobs import run_job
+
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
+    out = run_job(Job.from_payload(payload(model="command", instructions="echo rows: 42")),
+                  config={"agent": {"allow_commands": True}}, use_tmux=False,
+                  tick_seconds=0.05)
+    assert "rows: 42" in out["result"]
+
+
+def test_a_failing_command_is_an_error_with_its_output(tmp_path, monkeypatch):
+    from workflow.deploy.jobs import run_job
+
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
+    with pytest.raises(RuntimeError, match="no such table"):
+        run_job(Job.from_payload(payload(model="command",
+                                         instructions="echo 'no such table' >&2; exit 3")),
+                config={"agent": {"allow_commands": True}}, use_tmux=False,
+                tick_seconds=0.05)
+
+
+def test_commands_need_the_device_owners_opt_in(tmp_path, monkeypatch):
+    from workflow.deploy.jobs import run_job
+
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
+    with pytest.raises(RuntimeError, match="allow_commands"):
+        run_job(Job.from_payload(payload(model="command", instructions="echo hi")),
+                config={}, use_tmux=False, tick_seconds=0.05)
