@@ -29,6 +29,7 @@ class FakeInventory:
         self.answer, self.allowed = answer, allowed
         self.answer_after, self.job_status = answer_after, job_status
         self.asked = []
+        self.titles = []
         self.polls = 0
         inventory = self
 
@@ -47,6 +48,10 @@ class FakeInventory:
             def do_POST(self):
                 assert self.headers["Authorization"] == "Bearer pat"
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path.endswith("/title"):
+                    inventory.titles.append((self.path, body))
+                    self._send({"job": {"id": "job-1", "title": body["title"]}})
+                    return
                 inventory.asked.append(body)
                 inventory.asked_at = time.monotonic()
                 self._send({"question": {"id": "q1", "answeredAt": None, **body}})
@@ -99,7 +104,25 @@ def test_it_speaks_enough_mcp_to_be_loaded():
     assert agent_mcp.handle(q, {"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
 
     tools = agent_mcp.handle(q, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert {t["name"] for t in tools["result"]["tools"]} == {"ask_user", "approve"}
+    assert {t["name"] for t in tools["result"]["tools"]} == {"ask_user", "approve", "set_title"}
+
+
+def test_set_title_renames_the_job_without_waiting(inventory):
+    inv = inventory()
+    result = agent_mcp.call_tool(inv.questions(), "set_title",
+                                 {"title": "  Pick a show\nto watch with Cosmo "})
+    assert result["isError"] is False
+    assert result_text(result) == "Run renamed to: Pick a show to watch with Cosmo"
+    assert inv.titles == [("/api/inventory/workspaces/ws-1/jobs/job-1/title",
+                           {"title": "Pick a show to watch with Cosmo"})]
+    assert inv.asked == [], "naming the run is not a question"
+
+
+def test_set_title_needs_a_title(inventory):
+    inv = inventory()
+    result = agent_mcp.call_tool(inv.questions(), "set_title", {"title": "  "})
+    assert result["isError"] is True
+    assert inv.titles == []
 
 
 def test_ask_user_waits_for_the_answer_and_returns_it(inventory, tmp_path):
@@ -118,7 +141,8 @@ def test_ask_user_waits_for_the_answer_and_returns_it(inventory, tmp_path):
 
     assert result_text(result) == "My son, 7 years old"
     assert result["isError"] is False
-    assert inv.asked == [{"kind": "question", "text": "Who is Cosmo, and how old?", "detail": None}]
+    assert inv.asked == [{"kind": "question", "text": "Who is Cosmo, and how old?",
+                          "detail": None, "options": []}]
     assert inv.polls >= 2
     assert "waiting-q1" in seen_marker
     assert not list(tmp_path.glob("waiting-*")), "marker must go once answered"
