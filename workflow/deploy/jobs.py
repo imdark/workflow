@@ -220,6 +220,26 @@ WORKFLOW_MODEL = "workflow"
 RESEARCH_MODEL = "research"
 # Jobs that run Claude Code against NotesGraph, so need a client to reach it.
 CLAUDE_MODELS = (CLAUDE_CODE_MODEL, WORKFLOW_MODEL, RESEARCH_MODEL)
+# A plain shell command, for NotesGraph monitors that read something on this
+# machine (a script, a database through psql/sqlite3). Its output is the
+# result. No AI is involved, and no permission prompt either, so it runs only
+# where the owner has said so: `agent.allow_commands: true` in the wf config.
+COMMAND_MODEL = "command"
+# A monitor's command reads a value; one still going after this is stuck.
+COMMAND_TIMEOUT_SECONDS = 60
+
+
+def command_argv(job: "Job", config: dict) -> list:
+    """`sh -c <command>` for a command job, if this device allows them."""
+    if not ((config.get("agent") or {}).get("allow_commands")):
+        raise RuntimeError(
+            "This device doesn't run commands for NotesGraph monitors. To allow it, "
+            "set agent.allow_commands: true in ~/.wf/config.yaml and restart "
+            "wf agent serve.")
+    command = (job.instructions or "").strip()
+    if not command:
+        raise RuntimeError("The monitor sent no command to run.")
+    return ["sh", "-c", command]
 
 # Appended to Claude Code's own system prompt for a claude-code job. The
 # point is that the agent asks rather than guesses, and that each answer is
@@ -624,6 +644,11 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             argv, env = research_argv(job, _prompt(job), job_dir, client, config)
             # Research reads the world, not a repo: the job directory, no worktree.
             workdir = job_dir
+        elif job.model == COMMAND_MODEL:
+            provider, argv = COMMAND_MODEL, command_argv(job, config)
+            workdir = job_dir
+            if timeout is None:
+                timeout = COMMAND_TIMEOUT_SECONDS
         elif job.model == WORKFLOW_MODEL:
             issue, workdir, repo_path = start_job_task(job, job_dir, cwd or Path.cwd())
             from workflow.ai_providers.claude import skills_plugin_dir
