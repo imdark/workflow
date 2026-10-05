@@ -2757,10 +2757,23 @@ def switch(
         typer.echo("Git integration is disabled. Skipping commit prefix setup.")
 
 @app.command()
-def done(reviewers: str = typer.Option(None, help="Comma-separated list of reviewers"), repo_path: str = typer.Option(None, help="Repository path")):
+def done(reviewers: str = typer.Option(None, help="Comma-separated list of reviewers"), repo_path: str = typer.Option(None, help="Repository path"),
+         task: str = typer.Option(None, "--task", help="Task key to finish instead of the current task (background agents don't set one)")):
     cfg = load_config()
     backend = get_backend(load_effective_config())
-    issue = get_current_task()
+    # A background agent runs without a terminal: take the defaults rather
+    # than block on a prompt nobody can answer.
+    interactive = sys.stdin.isatty()
+    if task:
+        try:
+            issue = backend.get(task)
+        except Exception:
+            issue = None
+        if not issue:
+            typer.echo(f"Task {task} not found.")
+            return
+    else:
+        issue = get_current_task()
 
     if not issue:
         typer.echo("No current task set. Use 'wf start' to begin a task.")
@@ -2874,7 +2887,7 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                         typer.echo(f"❌ Failed to create PR for {current_repo_path}: {e}")
                 elif has_unpushed:
                     typer.echo(f"Branch '{current_branch}' has {commits_ahead} unpushed commit(s).")
-                    push = typer.confirm(f"Push commits and create PR for {current_repo_path}?", default=True)
+                    push = not interactive or typer.confirm(f"Push commits and create PR for {current_repo_path}?", default=True)
                     if push:
                         try:
                             from workflow.git_utils import push_branch
@@ -2928,7 +2941,7 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
         completion_pr = pr if (pr and pr.get("url")) else None
         if post_task_complete(cfg, issue, completion_pr):
             typer.echo("📢 Posted task completion to Slack")
-    else:
+    elif interactive:
         # Ask user if they want to configure Slack
         configure_slack = typer.confirm("📢 Slack is not configured. Would you like to configure it now to post task completion?", default=False)
         if configure_slack:

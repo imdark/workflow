@@ -131,6 +131,14 @@ MEMORY:
 {mem['summary']}
 """)
     
+    # Agents used to stop once the code worked, leaving the branch unshipped.
+    context_parts.append(f"""
+WHEN YOU ARE DONE:
+Once the implementation is complete and verified, ship it: commit all your
+changes on this branch, then run `wf done --task {issue.key}`. That pushes the
+branch, opens a PR and moves the task to Committed. Don't stop before this.
+""")
+
     # Add MCP tools information
     context_parts.append("""
 AVAILABLE MCP TOOLS:
