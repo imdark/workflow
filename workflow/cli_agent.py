@@ -54,12 +54,14 @@ def agent_serve(
     device: Optional[str] = typer.Option(None, "--device", "-d", help="Target id (default: this machine)"),
     interval: int = typer.Option(5, "--interval", "-i", help="Seconds between polls"),
     once: bool = typer.Option(False, "--once", help="Run at most one job, then exit"),
+    max_jobs: int = typer.Option(4, "--max-jobs", "-j", min=1,
+                                 help="Jobs to run at once, each in its own worktree"),
 ):
     """Claim and run agent jobs queued for this device.
 
     Polls the inventory; nothing connects inward, so this works from behind
-    NAT. Ctrl-C to stop — a job already running is left to finish and its
-    lease lapses if this process dies.
+    NAT. Up to --max-jobs run side by side. Ctrl-C to stop — a job already
+    running is left to finish and its lease lapses if this process dies.
     """
     from workflow.deploy.jobs import serve as serve_jobs
     from workflow.deploy.prereqs import check_tmux, tmux_missing_message
@@ -75,7 +77,7 @@ def agent_serve(
 
     client, target = _client_and_device(device)
     console.print(f"🤖 Serving agent jobs for [bold]{target.id}[/bold] "
-                  f"(every {interval}s, Ctrl-C to stop)")
+                  f"(every {interval}s, up to {max_jobs} at once, Ctrl-C to stop)")
 
     def on_event(kind, job=None, detail=""):
         if kind == "claimed":
@@ -93,7 +95,7 @@ def agent_serve(
 
     try:
         ran = serve_jobs(client, target.id, poll_seconds=interval, once=once,
-                         on_event=on_event)
+                         on_event=on_event, max_jobs=max_jobs)
     except KeyboardInterrupt:
         console.print("\n🛑 Stopped")
         return
