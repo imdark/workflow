@@ -223,6 +223,11 @@ by them from a note. You have NotesGraph tools (mcp__notesgraph__*) to search,
 read and write their notes, and mcp__run__ask_user to ask them a question.
 They are not watching a terminal; they see your questions in NotesGraph.
 
+Your run is listed in NotesGraph under the text of the block it started
+from. Once you know what you are doing, name it with mcp__run__set_title:
+a few words a person would recognise, e.g. "Pick a show to watch with
+Cosmo". Rename it if the work turns out to be something else.
+
 Do not guess facts about the user's life: the people in it, their ages,
 relationships, preferences, plans, constraints. For each one you need:
 1. Look in NotesGraph first (keyword_search and semantic_search; read the
@@ -239,7 +244,10 @@ relationships, preferences, plans, constraints. For each one you need:
    2026-10-02)."
 
 Ask before anything irreversible or outside NotesGraph that you were not
-plainly asked to do. Tools that need permission are put to the user for
+plainly asked to do. When a question has a few likely answers (yes/no,
+which of these, go on or stop), pass them as `options` to
+mcp__run__ask_user so the user can pick one with a click.
+Tools that need permission are put to the user for
 you; if they deny one, find another way or explain what you could not do.
 
 Finish with your answer to the task itself.
@@ -248,7 +256,7 @@ Finish with your answer to the task itself.
 # Tools a claude-code job may use without asking. Everything else -- shell,
 # file edits -- goes through the permission prompt to the user.
 CLAUDE_CODE_ALLOWED_TOOLS = [
-    "mcp__notesgraph", "mcp__run__ask_user",
+    "mcp__notesgraph", "mcp__run__ask_user", "mcp__run__set_title",
     "WebSearch", "WebFetch", "Read", "Glob", "Grep",
 ]
 
@@ -467,7 +475,7 @@ class JobCancelled(Exception):
     """The job was cancelled from NotesGraph while it ran."""
 
 
-def run_job(job: Job, config: Optional[dict] = None, timeout: int = 900,
+def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = None,
             on_tick: Optional[Callable[[str], bool]] = None,
             use_tmux: Optional[bool] = None,
             tick_seconds: float = TICK_SECONDS,
@@ -482,8 +490,8 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: int = 900,
 
     A job whose model is "claude-code" runs Claude Code with NotesGraph's
     tools and can ask the user questions (`client` is then required, to
-    reach NotesGraph). Time spent waiting for an answer does not count
-    toward `timeout`. It runs in its own worktree of the repo at `cwd`
+    reach NotesGraph). There is no time limit unless `timeout` (seconds)
+    is given; time spent waiting for an answer does not count toward it. It runs in its own worktree of the repo at `cwd`
     (default: the runner's), never in that checkout (see `job_workdir`).
 
     A "workflow" job is the same Claude Code, started as a task the way
@@ -554,7 +562,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: int = 900,
                 remove_ai_pid_file(repo_path)
 
 
-def _watch(job: Job, job_dir: Path, timeout: int,
+def _watch(job: Job, job_dir: Path, timeout: Optional[int],
            on_tick: Optional[Callable[[str], bool]], use_tmux: bool,
            tick_seconds: float) -> dict:
     """Launch the prepared job and follow it to the end (see run_job)."""
@@ -569,7 +577,8 @@ def _watch(job: Job, job_dir: Path, timeout: int,
     # Incremental, so a multi-byte character split across two reads is held
     # back until its second half arrives instead of being mangled.
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    deadline = time.monotonic() + timeout
+    # No timeout: the run goes until it finishes or is cancelled.
+    deadline = time.monotonic() + timeout if timeout is not None else None
 
     def drain() -> str:
         nonlocal offset
@@ -589,7 +598,9 @@ def _watch(job: Job, job_dir: Path, timeout: int,
             raise JobCancelled()
         if done:
             break
-        if any(job_dir.glob("waiting-*")):
+        if deadline is None:
+            pass
+        elif any(job_dir.glob("waiting-*")):
             # Waiting on the user: their thinking time is not the run's.
             deadline += tick_seconds
         elif time.monotonic() > deadline:

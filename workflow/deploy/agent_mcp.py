@@ -1,13 +1,19 @@
-"""The two tools that let a Claude agent run pause for a person.
+"""The tools that let a Claude agent run talk to the person who started it.
 
     python -m workflow.deploy.agent_mcp      (stdio MCP server)
 
 Started by Claude Code for a "claude-code" job (see `jobs.claude_code_argv`).
-Both tools post to the job's questions on the NotesGraph server and block
+The first two post to the job's questions on the NotesGraph server and block
 until the person who started the run answers in NotesGraph:
 
-    ask_user   a free-text question -- "Who is Cosmo, and how old?"
+    ask_user   a question -- "Who is Cosmo, and how old?" -- optionally with
+               choices the person can pick with one click
     approve    Claude Code's --permission-prompt-tool: allow or deny a tool
+
+and one returns at once:
+
+    set_title  name the run in NotesGraph's run lists, which otherwise show
+               the text of the block it started from
 
 While a tool is blocked it keeps a `waiting-<question id>` file in the job
 directory, so the runner can stop counting that time against the job's
@@ -40,14 +46,38 @@ TOOLS = [
             "Ask the person who started this run a question and wait for their "
             "answer. Use it whenever you need a fact you could not find in "
             "NotesGraph or a decision only they can make. Ask one short, "
-            "specific question; group closely related unknowns into it."
+            "specific question; group closely related unknowns into it. When "
+            "the answer is one of a few choices (yes/no, which of these, go on "
+            "or stop), pass them as options so they can pick with one click; "
+            "they can still type something else."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "question": {"type": "string", "description": "The question, as you would ask it in person."},
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional short choices, e.g. [\"Yes, open the PR\", \"No, stop here\"]. At most 10.",
+                },
             },
             "required": ["question"],
+        },
+    },
+    {
+        "name": "set_title",
+        "description": (
+            "Name this run in NotesGraph's run list, which until then shows the "
+            "text of the block it started from. Call it once you know what you "
+            "are doing, with a few words a person would recognise; call it "
+            "again if the work turns out to be something else."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "A short title, e.g. \"Pick a show to watch with Cosmo\"."},
+            },
+            "required": ["title"],
         },
     },
     {
@@ -75,7 +105,8 @@ class Questions:
 
     def __init__(self, url: str, workspace: str, job: str, token: str,
                  job_dir: Optional[Path] = None, poll_seconds: float = POLL_SECONDS):
-        self.base = f"{url.rstrip('/')}/api/inventory/workspaces/{workspace}/jobs/{job}/questions"
+        self.job_url = f"{url.rstrip('/')}/api/inventory/workspaces/{workspace}/jobs/{job}"
+        self.base = f"{self.job_url}/questions"
         self.token, self.job_dir, self.poll_seconds = token, job_dir, poll_seconds
 
     def _request(self, method: str, url: str, payload: Optional[dict] = None) -> dict:
@@ -88,10 +119,16 @@ class Questions:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
 
-    def ask(self, kind: str, text: str, detail: Optional[str] = None) -> dict:
+    def set_title(self, title: str) -> str:
+        """Rename the job; returns the title the server kept."""
+        return self._request("POST", f"{self.job_url}/title", {"title": title})["job"]["title"]
+
+    def ask(self, kind: str, text: str, detail: Optional[str] = None,
+            options: Optional[list] = None) -> dict:
         """Post a question and block until it is answered; returns it."""
         question = self._request("POST", self.base,
-                                 {"kind": kind, "text": text, "detail": detail})["question"]
+                                 {"kind": kind, "text": text, "detail": detail,
+                                  "options": options or []})["question"]
         marker = self.job_dir / f"waiting-{question['id']}" if self.job_dir else None
         if marker:
             marker.write_text(text)
@@ -124,8 +161,22 @@ def call_tool(questions: Questions, name: str, args: dict) -> dict:
             asked = str(args.get("question") or "").strip()
             if not asked:
                 return text("question is required", error=True)
-            answer = questions.ask("question", asked)
+            options = args.get("options")
+            options = [str(o).strip() for o in options if str(o).strip()] if isinstance(options, list) else []
+            answer = questions.ask("question", asked, options=options)
             return text(answer.get("answer") or "")
+
+        if name == "set_title":
+            title = " ".join(str(args.get("title") or "").split())
+            if not title:
+                return text("title is required", error=True)
+            try:
+                kept = questions.set_title(title)
+            except urllib.error.HTTPError as e:
+                # A server from before run titles: the run keeps its block's
+                # text, which is no reason to stop the task.
+                return text(f"Could not rename the run ({e.code}); carry on.", error=True)
+            return text(f"Run renamed to: {kept}")
 
         if name == "approve":
             tool = str(args.get("tool_name") or "a tool")
