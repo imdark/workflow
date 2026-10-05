@@ -17,8 +17,9 @@ import pytest
 
 from workflow.deploy import agent_mcp
 from workflow.backends.base import Issue
-from workflow.deploy.jobs import (CLAUDE_CODE_SYSTEM_PROMPT, Job, JobClient,
-                                  claude_code_argv, run_job, start_job_task)
+from workflow.deploy.jobs import (CLAUDE_CODE_SYSTEM_PROMPT, RESEARCH_SYSTEM_PROMPT,
+                                  Job, JobClient, claude_code_argv, research_argv,
+                                  run_job, start_job_task)
 from workflow.session import task_branch_name
 
 
@@ -239,6 +240,71 @@ def test_claude_code_gets_notesgraph_and_a_way_to_ask(tmp_path):
     assert config["run"]["env"]["NG_JOB"] == "job-1234abcd"
     # It holds the token: owner-only.
     assert stat.S_IMODE((tmp_path / "mcp.json").stat().st_mode) == 0o600
+
+
+class FakeOmniSeek:
+    """OmniSeek's open liveness route, on a real local port."""
+
+    def __enter__(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200 if self.path == "/healthz" else 404)
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+            def log_message(self, *a):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        return self
+
+    def __exit__(self, *a):
+        self.server.shutdown()
+
+
+@pytest.fixture
+def omniseek_token(tmp_path, monkeypatch):
+    path = tmp_path / "omniseek_http.json"
+    path.write_text(json.dumps({"token": "seek-token"}))
+    monkeypatch.setattr("workflow.deploy.jobs.OMNISEEK_TOKEN_PATH", path)
+    return path
+
+
+def test_research_gets_omniseek_on_top_of_claude_code(tmp_path, omniseek_token):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    with FakeOmniSeek() as seek:
+        argv, env = research_argv(job(model="research"), "Survey X", job_dir, client(),
+                                  {"agent": {"omniseek": {"url": seek.url}}})
+
+    prompt = argv[argv.index("--append-system-prompt") + 1]
+    assert prompt.startswith(CLAUDE_CODE_SYSTEM_PROMPT) and RESEARCH_SYSTEM_PROMPT in prompt
+    allowed = next(a for a in argv if a.startswith("--allowedTools="))
+    assert "mcp__omniseek" in allowed and "mcp__notesgraph" in allowed
+    assert "Bash" not in allowed
+    assert argv[-1] == "Survey X"
+
+    servers = json.loads((job_dir / "mcp.json").read_text())["mcpServers"]
+    assert servers["omniseek"] == {"type": "http", "url": f"{seek.url}/mcp",
+                                   "headers": {"Authorization": "Bearer seek-token"}}
+    assert {"notesgraph", "run"} <= servers.keys()
+    assert stat.S_IMODE((job_dir / "mcp.json").stat().st_mode) == 0o600
+
+
+def test_research_says_how_to_fix_a_missing_omniseek(tmp_path, monkeypatch):
+    monkeypatch.setattr("workflow.deploy.jobs.OMNISEEK_TOKEN_PATH", tmp_path / "none.json")
+    with pytest.raises(RuntimeError, match="isn't set up"):
+        research_argv(job(model="research"), "Survey X", tmp_path, client(), {})
+
+
+def test_research_says_how_to_fix_a_stopped_omniseek(tmp_path, omniseek_token):
+    with FakeOmniSeek() as seek:
+        stopped = seek.url
+    with pytest.raises(RuntimeError, match="isn't running"):
+        research_argv(job(model="research"), "Survey X", tmp_path, client(),
+                      {"agent": {"omniseek": {"url": stopped}}})
 
 
 def test_the_system_prompt_asks_before_guessing_and_saves_answers():

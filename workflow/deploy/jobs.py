@@ -213,6 +213,13 @@ CLAUDE_CODE_MODEL = "claude-code"
 # the task backend, wf's branch and worktree, the project's Claude account,
 # its skills and task memory (see `start_job_task`).
 WORKFLOW_MODEL = "workflow"
+# Claude Code with OmniSeek (github.com/Battam1111/omniseek) attached: a
+# self-hosted MCP server of research tools -- cross-lingual search, reading
+# PDFs and pages, transcription, a scholarly and evidence graph. It has no
+# model of its own; Claude Code drives it (see `research_argv`).
+RESEARCH_MODEL = "research"
+# Jobs that run Claude Code against NotesGraph, so need a client to reach it.
+CLAUDE_MODELS = (CLAUDE_CODE_MODEL, WORKFLOW_MODEL, RESEARCH_MODEL)
 
 # Appended to Claude Code's own system prompt for a claude-code job. The
 # point is that the agent asks rather than guesses, and that each answer is
@@ -264,14 +271,94 @@ CLAUDE_CODE_ALLOWED_TOOLS = [
 # question waits for a person, who may be at dinner.
 ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
+# Added to CLAUDE_CODE_SYSTEM_PROMPT for a research job. The method follows
+# OmniSeek's own investigate skill: sweep wide, zoom in, then structure.
+RESEARCH_SYSTEM_PROMPT = """\
+This is a research run. Besides your usual tools you have OmniSeek
+(mcp__omniseek__*), a research toolkit that reaches what ordinary web search
+misses: sources in other languages, PDFs and papers, audio and video, forums
+and comment threads, and a scholarly citation graph.
+
+Work in three passes:
+1. Sweep: search broadly with omniseek_search, in more than one language when
+   the topic has non-English sources. Use omniseek_gather to run several
+   searches or reads at once rather than one after another.
+2. Zoom: read the most promising sources in full with omniseek_read (pages,
+   PDFs, arXiv) and, for papers, omniseek_paper_enrich or the graph tools to
+   follow citations, authors and related work.
+3. Structure: answer with what you found, grouped by finding. Back every
+   claim with its source URL; say plainly where sources disagree or where you
+   could not find support.
+
+Write the findings into the note you were started from, or a new note linked
+from it, with mcp__notesgraph, so they outlast the run.
+"""
+
+# What a research job may use without asking, on top of a claude-code job's.
+# OmniSeek's tools read and search; none of them act on the user's behalf.
+RESEARCH_ALLOWED_TOOLS = ["mcp__omniseek"]
+
+# Where OmniSeek listens by default (`python -m omniseek.serve_http`, or its
+# docker compose), and the token file it writes on first start.
+OMNISEEK_URL = "http://127.0.0.1:8765"
+OMNISEEK_TOKEN_PATH = Path.home() / ".omniseek" / "credentials" / "omniseek_http.json"
+
+
+def omniseek_endpoint(config: dict) -> tuple:
+    """(url, token) of this device's OmniSeek, checked to be up.
+
+    The URL is `agent.omniseek.url` in the wf config, else the default local
+    port. Raises with what to do when OmniSeek isn't installed or running, so
+    the run fails with that rather than with Claude finding no tools.
+    """
+    url = (((config.get("agent") or {}).get("omniseek") or {}).get("url")
+           or OMNISEEK_URL).rstrip("/")
+    try:
+        token = (json.loads(OMNISEEK_TOKEN_PATH.read_text()) or {}).get("token")
+    except (OSError, ValueError):
+        token = None
+    if not token:
+        raise RuntimeError(
+            f"OmniSeek isn't set up on this device: no token at {OMNISEEK_TOKEN_PATH}. "
+            "Install it (github.com/Battam1111/omniseek: docker compose up -d) and run again.")
+    try:
+        with urllib.request.urlopen(f"{url}/healthz", timeout=5) as response:
+            response.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(
+            f"OmniSeek isn't running on this device ({url}: {e}). "
+            "Start it (docker compose up -d in your omniseek checkout) and run again.") from e
+    return url, token
+
+
+def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
+                  config: dict) -> tuple:
+    """Claude Code as for a claude-code job, with OmniSeek's tools added."""
+    url, token = omniseek_endpoint(config)
+    return claude_code_argv(
+        job, prompt, job_dir, client,
+        extra_mcp={"omniseek": {
+            "type": "http",
+            "url": f"{url}/mcp",
+            "headers": {"Authorization": f"Bearer {token}"},
+        }},
+        extra_allowed=RESEARCH_ALLOWED_TOOLS,
+        extra_prompt=RESEARCH_SYSTEM_PROMPT,
+    )
+
 
 def claude_code_argv(job: Job, prompt: str, job_dir: Path,
-                     client: "JobClient", plugin_dir: Optional[Path] = None) -> tuple:
+                     client: "JobClient", plugin_dir: Optional[Path] = None,
+                     extra_mcp: Optional[dict] = None,
+                     extra_allowed: Optional[list] = None,
+                     extra_prompt: str = "") -> tuple:
     """Claude Code with NotesGraph's tools and a way to ask the user.
 
     Returns (argv, env). The MCP config carries the NotesGraph token, so it
     is written owner-only and removed when the run ends (see run_job).
     `plugin_dir` carries the task's wf skills, as `wf ai` passes them.
+    `extra_mcp`, `extra_allowed` and `extra_prompt` add MCP servers,
+    pre-approved tools and system prompt for a variant (see research_argv).
     """
     mcp_path = job_dir / "mcp.json"
     mcp_config = {"mcpServers": {
@@ -289,18 +376,21 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                     "NG_JOB": job.id, "NG_TOKEN": client.token or "",
                     "NG_JOB_DIR": str(job_dir)},
         },
+        **(extra_mcp or {}),
     }}
     fd = os.open(mcp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(mcp_config, f)
 
+    system_prompt = CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else "")
+    allowed = [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])]
     argv = [
         "claude", "--print", "--verbose", "--output-format", "stream-json",
         "--mcp-config", str(mcp_path), "--strict-mcp-config",
-        "--append-system-prompt", CLAUDE_CODE_SYSTEM_PROMPT,
+        "--append-system-prompt", system_prompt,
         # `=` form: --allowedTools is variadic and would otherwise swallow
         # the prompt that follows it.
-        f"--allowedTools={','.join(CLAUDE_CODE_ALLOWED_TOOLS)}",
+        f"--allowedTools={','.join(allowed)}",
         "--permission-prompt-tool", "mcp__run__approve",
         *(["--plugin-dir", str(plugin_dir)] if plugin_dir else []),
         # No --max-turns: Claude Code counts every tool call as a turn, so an
@@ -499,6 +589,10 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     account, skills, task memory -- in the repo `cwd` resolves to; see
     `start_job_task`.
 
+    A "research" job is Claude Code with this device's OmniSeek attached,
+    in the job directory; see `research_argv`. It fails up front if
+    OmniSeek isn't installed or running.
+
     Returns {"result", "steps", "session"}. When the capture proxy is
     reachable -- directly or down a reverse tunnel -- the conversation is
     recorded and billed to the account that owns the tunnel, so nothing
@@ -519,13 +613,17 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     workdir: Optional[Path] = None
     issue = repo_path = None
     with _SETUP_LOCK:
-        if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL):
+        if job.model in CLAUDE_MODELS:
             if client is None:
                 raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
             provider = job.model
         if job.model == CLAUDE_CODE_MODEL:
             argv, env = claude_code_argv(job, _prompt(job), job_dir, client)
             workdir = job_workdir(job_dir, cwd or Path.cwd())
+        elif job.model == RESEARCH_MODEL:
+            argv, env = research_argv(job, _prompt(job), job_dir, client, config)
+            # Research reads the world, not a repo: the job directory, no worktree.
+            workdir = job_dir
         elif job.model == WORKFLOW_MODEL:
             issue, workdir, repo_path = start_job_task(job, job_dir, cwd or Path.cwd())
             from workflow.ai_providers.claude import skills_plugin_dir
