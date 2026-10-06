@@ -17,7 +17,9 @@ and one returns at once:
 
 While a tool is blocked it keeps a `waiting-<question id>` file in the job
 directory, so the runner can stop counting that time against the job's
-time limit.
+time limit. On a Mac it also shows a desktop notification when it asks, so
+a run waiting on its person doesn't sit unnoticed; NG_NOTIFY=0 turns that
+off.
 
 Configured by environment, set by the runner: NG_URL, NG_WORKSPACE, NG_JOB,
 NG_TOKEN and NG_JOB_DIR. Speaks newline-delimited JSON-RPC on stdio; stdout
@@ -26,6 +28,7 @@ is the protocol, so nothing else may be printed there.
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -100,6 +103,32 @@ class JobCancelled(Exception):
     pass
 
 
+# Text goes in as arguments, not spliced into the script, so quotes and
+# backslashes in a question can't break it.
+_NOTIFY_SCRIPT = [
+    "on run argv",
+    'display notification (item 3 of argv) with title (item 1 of argv)'
+    ' subtitle (item 2 of argv) sound name "Glass"',
+    "end run",
+]
+
+
+def notify(title: str, subtitle: str, message: str) -> None:
+    """Show a macOS notification and return at once; a no-op elsewhere."""
+    if sys.platform != "darwin" or os.environ.get("NG_NOTIFY") == "0":
+        return
+    argv = ["osascript"]
+    for line in _NOTIFY_SCRIPT:
+        argv += ["-e", line]
+    try:
+        # Never wait on it, and keep it off stdout: that is the protocol.
+        subprocess.Popen(argv + [title, subtitle, message[:300]],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError:
+        pass  # no notification is no reason to fail the question
+
+
 class Questions:
     """Ask a job's questions over the inventory API and wait for answers."""
 
@@ -108,6 +137,7 @@ class Questions:
         self.job_url = f"{url.rstrip('/')}/api/inventory/workspaces/{workspace}/jobs/{job}"
         self.base = f"{self.job_url}/questions"
         self.token, self.job_dir, self.poll_seconds = token, job_dir, poll_seconds
+        self.title = ""  # the run's name once set_title has given it one
 
     def _request(self, method: str, url: str, payload: Optional[dict] = None) -> dict:
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -121,7 +151,8 @@ class Questions:
 
     def set_title(self, title: str) -> str:
         """Rename the job; returns the title the server kept."""
-        return self._request("POST", f"{self.job_url}/title", {"title": title})["job"]["title"]
+        self.title = self._request("POST", f"{self.job_url}/title", {"title": title})["job"]["title"]
+        return self.title
 
     def ask(self, kind: str, text: str, detail: Optional[str] = None,
             options: Optional[list] = None) -> dict:
@@ -132,6 +163,8 @@ class Questions:
         marker = self.job_dir / f"waiting-{question['id']}" if self.job_dir else None
         if marker:
             marker.write_text(text)
+        notify("Agent needs permission" if kind == "permission" else "Agent has a question",
+               self.title, text)
         try:
             while True:
                 try:
