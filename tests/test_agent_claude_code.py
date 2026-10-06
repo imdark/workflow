@@ -89,6 +89,17 @@ def inventory():
         inv.close()
 
 
+REAL_NOTIFY = agent_mcp.notify
+
+
+@pytest.fixture(autouse=True)
+def notified(monkeypatch):
+    """Keep tests from popping real notifications; record what would show."""
+    shown = []
+    monkeypatch.setattr(agent_mcp, "notify", lambda *a: shown.append(a))
+    return shown
+
+
 def result_text(result):
     return result["content"][0]["text"]
 
@@ -157,6 +168,37 @@ def test_a_cancelled_run_stops_waiting(inventory, tmp_path):
     assert not list(tmp_path.glob("waiting-*"))
 
 
+def test_asking_shows_a_notification_named_after_the_run(inventory, notified):
+    inv = inventory(answer="yes", allowed=True)
+    q = inv.questions()
+    agent_mcp.call_tool(q, "set_title", {"title": "Pick a show"})
+    agent_mcp.call_tool(q, "ask_user", {"question": "Who is Cosmo?"})
+    agent_mcp.call_tool(q, "approve", {"tool_name": "Bash", "input": {"command": "ls"}})
+    assert notified == [("Agent has a question", "Pick a show", "Who is Cosmo?"),
+                        ("Agent needs permission", "Pick a show", "Allow Bash?")]
+
+
+def test_notify_passes_text_as_arguments_and_does_not_wait(monkeypatch):
+    real = REAL_NOTIFY
+    started = []
+    monkeypatch.setattr(agent_mcp.sys, "platform", "darwin")
+    monkeypatch.delenv("NG_NOTIFY", raising=False)
+    monkeypatch.setattr(agent_mcp.subprocess, "Popen", lambda argv, **kw: started.append((argv, kw)))
+
+    real("Agent has a question", "", 'Say "hi" \\ bye')
+    argv, kw = started[0]
+    assert argv[0] == "osascript"
+    assert argv[-3:] == ["Agent has a question", "", 'Say "hi" \\ bye']
+    assert kw["stdout"] is agent_mcp.subprocess.DEVNULL, "stdout is the MCP protocol"
+
+    monkeypatch.setenv("NG_NOTIFY", "0")
+    real("t", "", "m")
+    monkeypatch.setattr(agent_mcp.sys, "platform", "linux")
+    monkeypatch.delenv("NG_NOTIFY")
+    real("t", "", "m")
+    assert len(started) == 1
+
+
 def test_an_allowed_permission_returns_claude_codes_allow_shape(inventory):
     inv = inventory(allowed=True)
     result = agent_mcp.call_tool(inv.questions(), "approve",
@@ -183,7 +225,8 @@ def test_the_server_answers_over_stdio(inventory, tmp_path):
 
     inv = inventory(answer="Cosmo is my son", answer_after=0.5)
     env = {**os.environ, "NG_URL": inv.url, "NG_WORKSPACE": "ws-1",
-           "NG_JOB": "job-1", "NG_TOKEN": "pat", "NG_JOB_DIR": str(tmp_path)}
+           "NG_JOB": "job-1", "NG_TOKEN": "pat", "NG_JOB_DIR": str(tmp_path),
+           "NG_NOTIFY": "0"}
     proc = subprocess.Popen([sys.executable, "-m", "workflow.deploy.agent_mcp"],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             text=True, env=env)
