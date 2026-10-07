@@ -82,9 +82,9 @@ class FakeInventory:
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def questions(self, job_dir=None):
+    def questions(self, job_dir=None, notify_after=0.0):
         return agent_mcp.Questions(self.url, "ws-1", "job-1", "pat", job_dir,
-                                   poll_seconds=0.05)
+                                   poll_seconds=0.05, notify_after=notify_after)
 
     def close(self):
         self.server.shutdown()
@@ -219,6 +219,22 @@ def test_a_permission_allowed_as_it_is_asked_shows_nothing(inventory, notified, 
     assert notified == []
     assert inv.polls == 0
     assert not list(tmp_path.glob("waiting-*"))
+
+
+def test_a_question_answered_quickly_shows_nothing(inventory, notified):
+    # Answered in an open NotesGraph tab, or swept up by "Allow all": a
+    # notification would flash and vanish.
+    inv = inventory(answer="yes", allowed=True, answer_after=0.1)
+    q = inv.questions(notify_after=0.5)
+    agent_mcp.call_tool(q, "ask_user", {"question": "Go on?"})
+    agent_mcp.call_tool(q, "approve", {"tool_name": "Bash", "input": {"command": "ls"}})
+    assert notified == []
+
+
+def test_a_question_still_open_after_the_wait_notifies(inventory, notified):
+    inv = inventory(answer="yes", answer_after=0.5)
+    agent_mcp.call_tool(inv.questions(notify_after=0.2), "ask_user", {"question": "Go on?"})
+    assert notified == [("Agent has a question", "", "Go on?")]
 
 
 def test_notify_passes_text_as_arguments_and_does_not_wait(monkeypatch):
