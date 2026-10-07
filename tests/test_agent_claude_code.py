@@ -779,3 +779,30 @@ def test_research_takes_the_whole_prompt_and_tools_from_the_profile(tmp_path, om
     assert next(a for a in argv if a.startswith("--allowedTools=")) == \
         "--allowedTools=mcp__notesgraph,mcp__omniseek"
     assert "omniseek" in json.loads((job_dir / "mcp.json").read_text())["mcpServers"]
+
+
+def test_prepare_task_hands_a_cloud_runner_the_task_its_agent_works_in(repo, wf, tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from workflow.cli_agent import agent_app
+
+    monkeypatch.setattr("workflow.deploy.jobs._job_context",
+                        lambda issue, job, workdir: f"wf ai context for {issue.key}")
+    monkeypatch.setattr("workflow.ai_providers.claude.skills_plugin_dir",
+                        lambda issue, key, task_dir, repo_path: tmp_path / "plugin")
+    job_dir = tmp_path / "jobs" / "job-1234"
+    job_dir.mkdir(parents=True)
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Find a show to watch with Cosmo\n\n--- context ---\nnote")
+    out = job_dir / "automation.json"
+
+    result = CliRunner().invoke(agent_app, [
+        "prepare-task", "--job-dir", str(job_dir), "--repo", str(repo),
+        "--prompt-file", str(prompt), "--out", str(out)])
+
+    assert result.exit_code == 0, result.output
+    handed = json.loads(out.read_text())
+    assert handed["key"] == "NG-1" and wf.in_progress == ["NG-1"]
+    assert git(handed["cwd"], "branch", "--show-current") == "ng-1-Find-a-show-to-watch-with-Cosmo"
+    assert handed["prompt"] == "wf ai context for NG-1"
+    assert handed["plugins"] == [str(tmp_path / "plugin")]

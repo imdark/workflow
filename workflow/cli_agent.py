@@ -1,5 +1,6 @@
 """`wf agent` -- run agent jobs dispatched from NotesGraph on this device."""
 
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -245,3 +246,40 @@ def agent_logs(
             raise typer.Exit(1)
     except KeyboardInterrupt:
         console.print("\n[dim]stopped following; the job keeps running[/dim]")
+
+
+@agent_app.command("prepare-task")
+def agent_prepare_task(
+    job_dir: Path = typer.Option(..., "--job-dir", help="The job's own directory"),
+    repo: Path = typer.Option(..., "--repo", help="Checkout of a configured repo to branch from"),
+    prompt_file: Path = typer.Option(..., "--prompt-file", help="What the job asks"),
+    out: Path = typer.Option(..., "--out", help="Where to write what the agent needs"),
+):
+    """Make a job a task, the way a workflow job starts on a Mac.
+
+    For a runner elsewhere (NotesGraph's cloud runner) to call as an
+    automation setup step: the job becomes a ticket in the configured
+    backend, moved to In Progress, with its branch in a worktree beside
+    `repo`. Writes {key, cwd, prompt, plugins} to `out` -- the worktree, the
+    prompt `wf ai` would build, the task's skills as a Claude plugin --
+    which the runner hands to the agent.
+    """
+    import json
+
+    from workflow.ai_providers.claude import skills_plugin_dir
+    from workflow.deploy.jobs import Job, _job_context, start_job_task
+
+    instructions = prompt_file.read_text(encoding="utf-8")
+    job = Job(id=job_dir.name, agent_id="", agent_name="agent",
+              instructions=instructions, context="")
+    issue, workdir, repo_path = start_job_task(job, job_dir, repo)
+    plugin_dir = skills_plugin_dir(issue, issue.key.lower(),
+                                   Path.home() / ".wf" / "tasks" / issue.key.lower(),
+                                   repo_path)
+    out.write_text(json.dumps({
+        "key": issue.key,
+        "cwd": str(workdir),
+        "prompt": _job_context(issue, job, workdir),
+        "plugins": [str(plugin_dir)] if plugin_dir else [],
+    }))
+    console.print(f"✓ {issue.key} in {workdir}")
