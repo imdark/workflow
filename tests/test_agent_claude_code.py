@@ -31,6 +31,7 @@ class FakeInventory:
         self.answer_after, self.job_status = answer_after, job_status
         self.asked = []
         self.titles = []
+        self.answers = []
         self.polls = 0
         inventory = self
 
@@ -52,6 +53,13 @@ class FakeInventory:
                 if self.path.endswith("/title"):
                     inventory.titles.append((self.path, body))
                     self._send({"job": {"id": "job-1", "title": body["title"]}})
+                    return
+                if self.path.endswith("/answer"):
+                    # Answered from the Mac's notification.
+                    inventory.answers.append((self.path, body))
+                    inventory.answer, inventory.allowed = body.get("answer"), body.get("allowed")
+                    inventory.answer_after = 0
+                    self._send({"question": {"id": "q1", "answeredAt": 1.0, **body}})
                     return
                 inventory.asked.append(body)
                 inventory.asked_at = time.monotonic()
@@ -90,6 +98,7 @@ def inventory():
 
 
 REAL_NOTIFY = agent_mcp.notify
+REAL_SHOW_QUESTION = agent_mcp.show_question
 
 
 @pytest.fixture(autouse=True)
@@ -97,7 +106,25 @@ def notified(monkeypatch):
     """Keep tests from popping real notifications; record what would show."""
     shown = []
     monkeypatch.setattr(agent_mcp, "notify", lambda *a: shown.append(a))
+    monkeypatch.setattr(agent_mcp, "show_question",
+                        lambda qid, kind, heading, title, text, *rest: shown.append((heading, title, text)))
     return shown
+
+
+class FakeNotifier:
+    """Stands in for MacQuestion: gives its reply, or waits to be taken away."""
+
+    def __init__(self, reply=None):
+        self.reply = reply
+        self.gone = threading.Event()
+
+    def answer(self):
+        if self.reply is None:
+            self.gone.wait()
+        return self.reply
+
+    def take_away(self):
+        self.gone.set()
 
 
 def result_text(result):
@@ -197,6 +224,118 @@ def test_notify_passes_text_as_arguments_and_does_not_wait(monkeypatch):
     monkeypatch.delenv("NG_NOTIFY")
     real("t", "", "m")
     assert len(started) == 1
+
+
+# --- answering from the Mac's notification ---------------------------------
+
+def test_an_answer_given_on_the_mac_is_sent_to_notesgraph(inventory, monkeypatch):
+    inv = inventory(answer_after=60)  # nobody answers in NotesGraph
+    monkeypatch.setattr(agent_mcp, "show_question",
+                        lambda *a: FakeNotifier({"answer": "Breaking Bad"}))
+    result = agent_mcp.call_tool(inv.questions(), "ask_user",
+                                 {"question": "Which show?", "options": ["Breaking Bad", "Bluey"]})
+    assert result_text(result) == "Breaking Bad"
+    assert inv.answers == [("/api/inventory/workspaces/ws-1/jobs/job-1/questions/q1/answer",
+                            {"answer": "Breaking Bad"})]
+
+
+def test_a_permission_allowed_on_the_mac_is_sent_as_allowed(inventory, monkeypatch):
+    inv = inventory(answer_after=60)
+    monkeypatch.setattr(agent_mcp, "show_question",
+                        lambda *a: FakeNotifier({"allowed": True}))
+    result = agent_mcp.call_tool(inv.questions(), "approve",
+                                 {"tool_name": "Bash", "input": {"command": "ls"}})
+    assert json.loads(result_text(result))["behavior"] == "allow"
+    assert inv.answers[0][1] == {"allowed": True}
+
+
+def test_answered_in_notesgraph_takes_the_mac_notification_away(inventory, monkeypatch):
+    inv = inventory(answer="yes", answer_after=0.1)
+    notifier = FakeNotifier()
+    monkeypatch.setattr(agent_mcp, "show_question", lambda *a: notifier)
+    result = agent_mcp.call_tool(inv.questions(), "ask_user", {"question": "Go on?"})
+    assert result_text(result) == "yes"
+    assert notifier.gone.is_set()
+    assert inv.answers == []
+
+
+def test_notifications_off_for_the_app_falls_back_to_a_plain_one(inventory, monkeypatch, notified):
+    inv = inventory(answer="yes", answer_after=0.3)
+    monkeypatch.setattr(agent_mcp, "show_question",
+                        lambda *a: FakeNotifier({"shown": False, "error": "denied"}))
+    agent_mcp.call_tool(inv.questions(), "ask_user", {"question": "Go on?"})
+    assert notified == [("Agent has a question", "", "Go on?")]
+    assert inv.answers == []
+
+
+class FakeOpen:
+    """`open -W` of the notifier app: writes what the app would say, on exit."""
+
+    def __init__(self, argv, **kw):
+        self.argv, self.kw = argv, kw
+        self.out = argv[argv.index("--stdout") + 1]
+        self.ask = json.loads(argv[-1])
+        self.code = None
+
+    def say(self, line):
+        with open(self.out, "w") as f:
+            f.write(line)
+        self.code = 0
+
+    def poll(self):
+        return self.code
+
+    def wait(self):
+        while self.code is None:
+            cancel = os.path.join(self.ask["dir"], self.ask["id"] + ".cancel")
+            if os.path.exists(cancel):
+                self.code = 0
+            time.sleep(0.01)
+        return self.code
+
+
+@pytest.fixture
+def mac(monkeypatch, tmp_path):
+    started = []
+    monkeypatch.setattr(agent_mcp.sys, "platform", "darwin")
+    monkeypatch.delenv("NG_NOTIFY", raising=False)
+    monkeypatch.setattr(agent_mcp, "NOTIFIER_HOME", tmp_path)
+    monkeypatch.setattr(agent_mcp, "notifier_app", lambda: tmp_path / "NotesGraph Agent.app")
+    monkeypatch.setattr(agent_mcp.subprocess, "Popen",
+                        lambda argv, **kw: started.append(FakeOpen(argv, **kw)) or started[-1])
+    return started
+
+
+def test_show_question_opens_the_app_with_the_whole_question(mac, tmp_path):
+    shown = REAL_SHOW_QUESTION("q/1", "permission", "Agent needs permission", "Pick a show",
+                               "Allow Bash?", '{"command":"ls"}', [])
+    proc = mac[0]
+    assert proc.argv[:3] == ["open", "-n", "-W"], "LaunchServices, or macOS won't let it notify"
+    assert proc.argv[-3:-1] == [str(tmp_path / "NotesGraph Agent.app"), "--args"]
+    assert proc.ask["id"] == "q_1", "the id names files"
+    assert proc.ask["kind"] == "permission" and proc.ask["title"] == "Pick a show"
+    assert proc.ask["detail"] == '{"command":"ls"}'
+    assert proc.ask["parentPid"] == os.getpid()
+    assert proc.kw["stdout"] is agent_mcp.subprocess.DEVNULL, "stdout is the MCP protocol"
+
+    proc.say('{"allowed": true}\n')
+    assert shown.answer() == {"allowed": True}
+    assert not os.path.exists(proc.out)
+
+
+def test_taking_a_mac_question_away_closes_the_app(mac):
+    shown = REAL_SHOW_QUESTION("q1", "question", "Agent has a question", "", "Hi?", None, [])
+    shown.take_away()
+    assert shown.answer() is None
+    assert not list((agent_mcp.NOTIFIER_HOME / "questions").iterdir()), "nothing left behind"
+
+
+def test_show_question_without_swiftc_shows_a_plain_notification(monkeypatch, notified):
+    monkeypatch.setattr(agent_mcp.sys, "platform", "darwin")
+    monkeypatch.delenv("NG_NOTIFY", raising=False)
+    monkeypatch.setattr(agent_mcp, "notifier_app", lambda: None)
+    assert REAL_SHOW_QUESTION("q1", "question", "Agent has a question", "", "Hi?", None, []) is None
+    assert notified == [("Agent has a question", "", "Hi?")]
 
 
 def test_an_allowed_permission_returns_claude_codes_allow_shape(inventory):

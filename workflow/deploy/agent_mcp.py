@@ -19,17 +19,22 @@ While a tool is blocked it keeps a `waiting-<question id>` file in the job
 directory, so the runner can stop counting that time against the job's
 time limit. On a Mac it also shows a desktop notification when it asks, so
 a run waiting on its person doesn't sit unnoticed; NG_NOTIFY=0 turns that
-off.
+off. Clicking it opens a dialog to answer right there, like the phone's
+notification pane (ask_notifier.swift, built on first use); without swiftc
+it falls back to a plain notification.
 
 Configured by environment, set by the runner: NG_URL, NG_WORKSPACE, NG_JOB,
 NG_TOKEN and NG_JOB_DIR. Speaks newline-delimited JSON-RPC on stdio; stdout
 is the protocol, so nothing else may be printed there.
 """
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -129,6 +134,125 @@ def notify(title: str, subtitle: str, message: str) -> None:
         pass  # no notification is no reason to fail the question
 
 
+NOTIFIER_SOURCE = Path(__file__).with_name("ask_notifier.swift")
+NOTIFIER_HOME = Path.home() / "Library" / "Caches" / "wf" / "ask-notifier"
+NOTIFIER_APP = "NotesGraph Agent.app"
+# A bundle id of its own is what lets macOS hand the click back to us;
+# LSUIElement keeps it out of the Dock.
+_NOTIFIER_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>com.notesgraph.agent-questions</string>
+  <key>CFBundleName</key><string>NotesGraph Agent</string>
+  <key>CFBundleExecutable</key><string>ask-notifier</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+"""
+_build_lock = threading.Lock()
+
+
+def notifier_app() -> Optional[Path]:
+    """The answerable-notification app, built from its source on first use
+    (and again whenever the source changes); None when it can't be."""
+    try:
+        source = NOTIFIER_SOURCE.read_bytes() + _NOTIFIER_PLIST.encode()
+        digest = hashlib.sha256(source).hexdigest()[:12]
+    except OSError:
+        return None
+    app = NOTIFIER_HOME / digest / NOTIFIER_APP
+    binary = app / "Contents" / "MacOS" / "ask-notifier"
+    with _build_lock:
+        if binary.exists():
+            return app
+        swiftc = shutil.which("swiftc")
+        if not swiftc:
+            return None
+        try:
+            NOTIFIER_HOME.mkdir(parents=True, exist_ok=True)
+            # Built aside and renamed in, as several runs may race to build it.
+            with tempfile.TemporaryDirectory(dir=NOTIFIER_HOME) as tmp:
+                built = Path(tmp) / NOTIFIER_APP
+                (built / "Contents" / "MacOS").mkdir(parents=True)
+                (built / "Contents" / "Info.plist").write_text(_NOTIFIER_PLIST)
+                subprocess.run([swiftc, "-O", "-o", str(built / "Contents" / "MacOS" / "ask-notifier"),
+                                str(NOTIFIER_SOURCE)],
+                               check=True, capture_output=True, timeout=600)
+                subprocess.run(["codesign", "--force", "--sign", "-", str(built)],
+                               check=True, capture_output=True, timeout=60)
+                app.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    built.rename(app)
+                except OSError:
+                    pass  # another run got there first
+        except (OSError, subprocess.SubprocessError):
+            return None
+    return app if binary.exists() else None
+
+
+class MacQuestion:
+    """One question showing in the notifier app.
+
+    Started through `open`, as macOS only lets an app LaunchServices started
+    post notifications -- so it is no child of ours, and the answer and the
+    take-it-away come and go through files."""
+
+    def __init__(self, app: Path, ask: dict):
+        self.dir = NOTIFIER_HOME / "questions"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        name = "".join(c if c.isalnum() or c in "-_" else "_" for c in ask["id"])
+        self.out, self.cancel = self.dir / f"{name}.out", self.dir / f"{name}.cancel"
+        self.out.unlink(missing_ok=True)
+        ask = {**ask, "id": name, "dir": str(self.dir), "parentPid": os.getpid()}
+        # -n: a process of its own, -W: so wait() lasts as long as it does.
+        self.proc = subprocess.Popen(
+            ["open", "-n", "-W", "--stdout", str(self.out), "--stderr", "/dev/null",
+             str(app), "--args", json.dumps(ask)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def answer(self) -> Optional[dict]:
+        """Wait for it to close; what it said, or None when taken away."""
+        self.proc.wait()
+        try:
+            line = self.out.read_text().strip().splitlines()[0]
+            return json.loads(line)
+        except (OSError, IndexError, ValueError):
+            return None
+        finally:
+            self.out.unlink(missing_ok=True)
+            self.cancel.unlink(missing_ok=True)
+
+    def take_away(self) -> None:
+        """Answered elsewhere: close it, notification and dialog both."""
+        if self.proc.poll() is None:
+            try:
+                self.cancel.touch()
+            except OSError:
+                pass
+
+
+def show_question(question_id: str, kind: str, heading: str, title: str, text: str,
+                  detail: Optional[str], options: list) -> Optional[MacQuestion]:
+    """Show a question as a notification that can be answered from the Mac;
+    None when it shows a plain notification instead."""
+    if sys.platform != "darwin" or os.environ.get("NG_NOTIFY") == "0":
+        return None
+    app = notifier_app()
+    if app:
+        try:
+            return MacQuestion(app, {"id": question_id, "kind": kind, "heading": heading,
+                                     "title": title, "text": text, "detail": detail,
+                                     "options": options})
+        except OSError:
+            pass
+    notify(heading, title, text)
+    return None
+
+
 class Questions:
     """Ask a job's questions over the inventory API and wait for answers."""
 
@@ -163,8 +287,12 @@ class Questions:
         marker = self.job_dir / f"waiting-{question['id']}" if self.job_dir else None
         if marker:
             marker.write_text(text)
-        notify("Agent needs permission" if kind == "permission" else "Agent has a question",
-               self.title, text)
+        heading = "Agent needs permission" if kind == "permission" else "Agent has a question"
+        notifier = show_question(question["id"], kind, heading, self.title, text,
+                                 detail, options or [])
+        if notifier:
+            threading.Thread(target=self._relay, args=(notifier, question["id"], heading, text),
+                             daemon=True).start()
         try:
             while True:
                 try:
@@ -182,6 +310,25 @@ class Questions:
         finally:
             if marker:
                 marker.unlink(missing_ok=True)
+            if notifier:
+                notifier.take_away()
+
+    def _relay(self, notifier: MacQuestion, question_id: str, heading: str, text: str) -> None:
+        """Send the answer given on the Mac; `ask`'s polling then sees it."""
+        reply = notifier.answer()
+        if reply is None:
+            return  # taken away, or it died
+        if reply.get("shown") is False:
+            notify(heading, self.title, text)  # notifications off for it; the plain kind may still show
+            return
+        try:
+            self._request("POST", f"{self.base}/{question_id}/answer", reply)
+        except urllib.error.HTTPError as e:
+            if e.code != 400:  # 400: answered in NotesGraph meanwhile
+                notify("Could not send your answer", self.title,
+                       f"Answer it in NotesGraph instead ({e.code}).")
+        except (urllib.error.URLError, OSError):
+            notify("Could not send your answer", self.title, "Answer it in NotesGraph instead.")
 
 
 def call_tool(questions: Questions, name: str, args: dict) -> dict:
