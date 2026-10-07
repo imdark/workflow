@@ -371,6 +371,37 @@ def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
     )
 
 
+def profile_skills_plugin(job: Job, job_dir: Path) -> Optional[Path]:
+    """The skills the server's profile names, as one Claude plugin.
+
+    Each is a SKILL.md fetched from its own repo (e.g. OmniSeek's
+    omniseek-investigate for a research run), as the cloud runner does. One
+    that can't be fetched is left out; the run goes on without it.
+    """
+    skills = (job.profile or {}).get("skills") or []
+    root = job_dir / "skills-plugin"
+    loaded = 0
+    for skill in skills:
+        name = "".join(c if c.isalnum() or c in "._-" else "-" for c in str(skill.get("name") or "skill"))
+        try:
+            with urllib.request.urlopen(str(skill["url"]), timeout=20) as response:
+                text = response.read(512 * 1024 + 1).decode("utf-8")
+            if len(text) > 512 * 1024:
+                continue
+        except (urllib.error.URLError, OSError, KeyError, ValueError, UnicodeDecodeError):
+            continue
+        (root / "skills" / name).mkdir(parents=True, exist_ok=True)
+        (root / "skills" / name / "SKILL.md").write_text(text)
+        loaded += 1
+    if not loaded:
+        return None
+    (root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps(
+        {"name": "notesgraph-skills", "version": "1.0.0",
+         "description": "Skills from the agent profile"}))
+    return root
+
+
 def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                      client: "JobClient", plugin_dir: Optional[Path] = None,
                      extra_mcp: Optional[dict] = None,
@@ -413,6 +444,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else ""))
     allowed = profile.get("allowedTools") or [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])]
     tool_timeout = int(profile.get("toolTimeoutMs") or ASK_TIMEOUT_MS)
+    skills_dir = profile_skills_plugin(job, job_dir)
     argv = [
         "claude", "--print", "--verbose", "--output-format", "stream-json",
         "--mcp-config", str(mcp_path), "--strict-mcp-config",
@@ -422,6 +454,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         f"--allowedTools={','.join(allowed)}",
         "--permission-prompt-tool", "mcp__run__approve",
         *(["--plugin-dir", str(plugin_dir)] if plugin_dir else []),
+        *(["--plugin-dir", str(skills_dir)] if skills_dir else []),
         # No --max-turns: Claude Code counts every tool call as a turn, so an
         # agent's step limit (sized for the in-tab loop) ended real work a
         # couple of dozen calls in. The run's time limit bounds it instead.
