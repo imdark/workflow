@@ -26,9 +26,11 @@ from workflow.session import task_branch_name
 class FakeInventory:
     """Just enough of the questions API: ask, poll, and an answer to give."""
 
-    def __init__(self, answer=None, allowed=None, answer_after=0.0, job_status="running"):
+    def __init__(self, answer=None, allowed=None, answer_after=0.0, job_status="running",
+                 allowed_on_ask=False):
         self.answer, self.allowed = answer, allowed
         self.answer_after, self.job_status = answer_after, job_status
+        self.allowed_on_ask = allowed_on_ask  # "Allow all", or one of the run's own tools
         self.asked = []
         self.titles = []
         self.answers = []
@@ -63,6 +65,9 @@ class FakeInventory:
                     return
                 inventory.asked.append(body)
                 inventory.asked_at = time.monotonic()
+                if inventory.allowed_on_ask and body["kind"] == "permission":
+                    self._send({"question": {"id": "q1", "answeredAt": 1.0, "allowed": True, **body}})
+                    return
                 self._send({"question": {"id": "q1", "answeredAt": None, **body}})
 
             def do_GET(self):
@@ -203,6 +208,17 @@ def test_asking_shows_a_notification_named_after_the_run(inventory, notified):
     agent_mcp.call_tool(q, "approve", {"tool_name": "Bash", "input": {"command": "ls"}})
     assert notified == [("Agent has a question", "Pick a show", "Who is Cosmo?"),
                         ("Agent needs permission", "Pick a show", "Allow Bash?")]
+
+
+def test_a_permission_allowed_as_it_is_asked_shows_nothing(inventory, notified, tmp_path):
+    # The server allows it on the spot; a notification would flash and vanish.
+    inv = inventory(allowed_on_ask=True)
+    result = agent_mcp.call_tool(inv.questions(tmp_path), "approve",
+                                 {"tool_name": "mcp__run__set_title", "input": {"title": "x"}})
+    assert json.loads(result_text(result))["behavior"] == "allow"
+    assert notified == []
+    assert inv.polls == 0
+    assert not list(tmp_path.glob("waiting-*"))
 
 
 def test_notify_passes_text_as_arguments_and_does_not_wait(monkeypatch):

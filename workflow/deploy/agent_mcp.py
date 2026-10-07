@@ -284,6 +284,10 @@ class Questions:
         question = self._request("POST", self.base,
                                  {"kind": kind, "text": text, "detail": detail,
                                   "options": options or []})["question"]
+        if question.get("answeredAt"):
+            # Allowed on the spot ("Allow all", or one of the run's own
+            # tools): a notification would only flash up and vanish.
+            return question
         marker = self.job_dir / f"waiting-{question['id']}" if self.job_dir else None
         if marker:
             marker.write_text(text)
