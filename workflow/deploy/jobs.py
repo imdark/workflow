@@ -62,6 +62,9 @@ class Job:
     model: Optional[str] = None
     tools: list = None
     max_steps: int = 8
+    # How to run it, as the server says (system prompt, allowed tools, tool
+    # timeout); the constants below stand in for an older server's jobs.
+    profile: Optional[dict] = None
 
     @classmethod
     def from_payload(cls, payload: dict) -> "Job":
@@ -74,6 +77,7 @@ class Job:
             model=payload.get("model"),
             tools=payload.get("tools") or [],
             max_steps=int(payload.get("maxSteps") or 8),
+            profile=payload.get("profile") or None,
         )
 
 
@@ -402,8 +406,13 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     with os.fdopen(fd, "w") as f:
         json.dump(mcp_config, f)
 
-    system_prompt = CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else "")
-    allowed = [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])]
+    # The server's profile for the job's model is the whole agent: its prompt
+    # already has the research part, its tools the research ones.
+    profile = job.profile or {}
+    system_prompt = profile.get("systemPrompt") or (
+        CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else ""))
+    allowed = profile.get("allowedTools") or [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])]
+    tool_timeout = int(profile.get("toolTimeoutMs") or ASK_TIMEOUT_MS)
     argv = [
         "claude", "--print", "--verbose", "--output-format", "stream-json",
         "--mcp-config", str(mcp_path), "--strict-mcp-config",
@@ -418,7 +427,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         # couple of dozen calls in. The run's time limit bounds it instead.
         prompt,
     ]
-    return argv, {"MCP_TOOL_TIMEOUT": str(ASK_TIMEOUT_MS)}
+    return argv, {"MCP_TOOL_TIMEOUT": str(tool_timeout)}
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
