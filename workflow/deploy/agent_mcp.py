@@ -17,8 +17,9 @@ and one returns at once:
 
 While a tool is blocked it keeps a `waiting-<question id>` file in the job
 directory, so the runner can stop counting that time against the job's
-time limit. On a Mac it also shows a desktop notification when it asks, so
-a run waiting on its person doesn't sit unnoticed; NG_NOTIFY=0 turns that
+time limit. On a Mac it also shows a desktop notification once a question
+has waited a few seconds unanswered, so a run waiting on its person doesn't
+sit unnoticed; NG_NOTIFY=0 turns that
 off. Clicking it opens a dialog to answer right there, like the phone's
 notification pane (ask_notifier.swift, built on first use); without swiftc
 it falls back to a plain notification.
@@ -44,6 +45,11 @@ from typing import Optional
 
 PROTOCOL_VERSION = "2025-06-18"
 POLL_SECONDS = 2.0
+# How long a question waits before the Mac notifies about it. Most quick
+# answers -- in an open NotesGraph tab, or an "Allow all" sweeping up the
+# run's other open permissions -- land well inside this, and a notification
+# for one would only flash up and vanish.
+NOTIFY_AFTER_SECONDS = 5.0
 # Matches the server's cap on a question's detail (inventory jobs.ts MAX_DETAIL).
 MAX_DETAIL = 200_000
 
@@ -257,10 +263,12 @@ class Questions:
     """Ask a job's questions over the inventory API and wait for answers."""
 
     def __init__(self, url: str, workspace: str, job: str, token: str,
-                 job_dir: Optional[Path] = None, poll_seconds: float = POLL_SECONDS):
+                 job_dir: Optional[Path] = None, poll_seconds: float = POLL_SECONDS,
+                 notify_after: float = NOTIFY_AFTER_SECONDS):
         self.job_url = f"{url.rstrip('/')}/api/inventory/workspaces/{workspace}/jobs/{job}"
         self.base = f"{self.job_url}/questions"
         self.token, self.job_dir, self.poll_seconds = token, job_dir, poll_seconds
+        self.notify_after = notify_after
         self.title = ""  # the run's name once set_title has given it one
 
     def _request(self, method: str, url: str, payload: Optional[dict] = None) -> dict:
@@ -292,13 +300,18 @@ class Questions:
         if marker:
             marker.write_text(text)
         heading = "Agent needs permission" if kind == "permission" else "Agent has a question"
-        notifier = show_question(question["id"], kind, heading, self.title, text,
-                                 detail, options or [])
-        if notifier:
-            threading.Thread(target=self._relay, args=(notifier, question["id"], heading, text),
-                             daemon=True).start()
+        notifier, shown = None, False
+        asked_at = time.monotonic()
         try:
             while True:
+                if not shown and time.monotonic() - asked_at >= self.notify_after:
+                    shown = True
+                    notifier = show_question(question["id"], kind, heading, self.title, text,
+                                             detail, options or [])
+                    if notifier:
+                        threading.Thread(target=self._relay,
+                                         args=(notifier, question["id"], heading, text),
+                                         daemon=True).start()
                 try:
                     data = self._request("GET", f"{self.base}/{question['id']}")
                 except (urllib.error.URLError, OSError):
