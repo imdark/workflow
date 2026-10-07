@@ -750,3 +750,32 @@ def test_a_workflow_job_asks_and_remembers_like_claude_code(tmp_path, monkeypatc
     allowed = next(a for a in argv if a.startswith("--allowedTools="))
     assert "mcp__run__ask_user" in allowed and "mcp__notesgraph" in allowed
     assert int(spec["env"]["MCP_TOOL_TIMEOUT"]) >= 60 * 60 * 1000
+
+
+def test_the_servers_profile_is_the_agent_when_it_sends_one(tmp_path):
+    profile = {"systemPrompt": "Be the agent the server says.",
+               "allowedTools": ["mcp__notesgraph", "mcp__run__ask_user", "WebSearch"],
+               "mcpServers": ["notesgraph", "run"], "workdir": "repo",
+               "toolTimeoutMs": 1234}
+    argv, env = claude_code_argv(job(profile=profile), "go", tmp_path, client())
+
+    assert argv[argv.index("--append-system-prompt") + 1] == "Be the agent the server says."
+    assert next(a for a in argv if a.startswith("--allowedTools=")) == \
+        "--allowedTools=mcp__notesgraph,mcp__run__ask_user,WebSearch"
+    assert env["MCP_TOOL_TIMEOUT"] == "1234"
+
+
+def test_research_takes_the_whole_prompt_and_tools_from_the_profile(tmp_path, omniseek_token):
+    profile = {"systemPrompt": "notes part\nresearch part",
+               "allowedTools": ["mcp__notesgraph", "mcp__omniseek"]}
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    with FakeOmniSeek() as seek:
+        argv, _ = research_argv(job(model="research", profile=profile), "Survey X", job_dir,
+                                client(), {"agent": {"omniseek": {"url": seek.url}}})
+
+    # Not the built-in research prompt added on top: the server's already has it.
+    assert argv[argv.index("--append-system-prompt") + 1] == "notes part\nresearch part"
+    assert next(a for a in argv if a.startswith("--allowedTools=")) == \
+        "--allowedTools=mcp__notesgraph,mcp__omniseek"
+    assert "omniseek" in json.loads((job_dir / "mcp.json").read_text())["mcpServers"]
