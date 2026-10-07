@@ -822,3 +822,32 @@ def test_prepare_task_hands_a_cloud_runner_the_task_its_agent_works_in(repo, wf,
     assert git(handed["cwd"], "branch", "--show-current") == "ng-1-Find-a-show-to-watch-with-Cosmo"
     assert handed["prompt"] == "wf ai context for NG-1"
     assert handed["plugins"] == [str(tmp_path / "plugin")]
+
+
+def test_the_profiles_skills_are_fetched_and_loaded_as_a_plugin(tmp_path):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            ok = self.path == "/investigate/SKILL.md"
+            self.send_response(200 if ok else 404)
+            self.end_headers()
+            if ok:
+                self.wfile.write(b"---\nname: investigate\n---\nSweep, zoom, structure.")
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        profile = {"skills": [{"name": "investigate", "url": f"{base}/investigate/SKILL.md"},
+                              {"name": "gone", "url": f"{base}/gone/SKILL.md"}]}
+        argv, _ = claude_code_argv(job(profile=profile), "go", tmp_path, client())
+    finally:
+        server.shutdown()
+
+    plugin = tmp_path / "skills-plugin"
+    assert argv[argv.index("--plugin-dir") + 1] == str(plugin)
+    assert (plugin / "skills" / "investigate" / "SKILL.md").read_text().endswith("structure.")
+    assert not (plugin / "skills" / "gone").exists()
+    assert json.loads((plugin / ".claude-plugin" / "plugin.json").read_text())["name"] == "notesgraph-skills"
