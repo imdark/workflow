@@ -12,7 +12,7 @@ agent_app = typer.Typer(help="Serve remote agent jobs on this machine", no_args_
 
 
 def _client_and_device(device: Optional[str]):
-    """Resolve the inventory client and which device key this machine is."""
+    """Resolve the registry client and which device key this machine is."""
     from workflow.config import load_effective_config
     from workflow.deploy.jobs import JobClient
     from workflow.deploy.registry import get_registry
@@ -60,7 +60,7 @@ def agent_serve(
 ):
     """Claim and run agent jobs queued for this device.
 
-    Polls the inventory; nothing connects inward, so this works from behind
+    Polls the registry; nothing connects inward, so this works from behind
     NAT. Up to --max-jobs run side by side. Ctrl-C to stop — a job already
     running is left to finish and its lease lapses if this process dies.
     """

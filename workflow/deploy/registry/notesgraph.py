@@ -1,9 +1,9 @@
 """NotesGraph implementation of the deployment registry.
 
-Publishes the fleet into a NotesGraph workspace's device inventory, so
+Publishes the fleet into a NotesGraph workspace's device registry, so
 registered machines and folders show up on your account rather than only in
-a local config file. Backed by the `inventory` plugin's REST API
-(`/api/inventory/...`), authenticated with a Personal Access Token the same
+a local config file. Backed by the `registry` plugin's REST API
+(`/api/registry/...`), authenticated with a Personal Access Token the same
 way NotesGraph's own notes CLI authenticates.
 
 Configuration:
@@ -70,7 +70,7 @@ class NotesGraphError(RuntimeError):
 
 
 class NotesGraphClient:
-    """Thin REST client for the NotesGraph inventory plugin."""
+    """Thin REST client for the NotesGraph registry plugin."""
 
     def __init__(self, url: str = DEFAULT_URL, token: Optional[str] = None,
                  timeout: float = 15.0):
@@ -116,30 +116,30 @@ class NotesGraphClient:
 
     def session(self) -> dict:
         """Validate the token; returns the user and their workspace ids."""
-        return self._request("GET", "/api/inventory/session")
+        return self._request("GET", "/api/registry/session")
 
     def list_devices(self, workspace: str) -> list:
-        return self._request("GET", f"/api/inventory/workspaces/{workspace}/devices").get("devices", [])
+        return self._request("GET", f"/api/registry/workspaces/{workspace}/devices").get("devices", [])
 
     def upsert_device(self, workspace: str, payload: dict) -> dict:
-        return self._request("POST", f"/api/inventory/workspaces/{workspace}/devices", payload).get("device", {})
+        return self._request("POST", f"/api/registry/workspaces/{workspace}/devices", payload).get("device", {})
 
     def delete_device(self, workspace: str, key: str) -> bool:
-        result = self._request("DELETE", f"/api/inventory/workspaces/{workspace}/devices/{key}")
+        result = self._request("DELETE", f"/api/registry/workspaces/{workspace}/devices/{key}")
         return bool(result.get("ok"))
 
     def push_status(self, workspace: str, key: str, payload: dict) -> dict:
         return self._request(
-            "POST", f"/api/inventory/workspaces/{workspace}/devices/{key}/status", payload
+            "POST", f"/api/registry/workspaces/{workspace}/devices/{key}/status", payload
         ).get("device", {})
 
 
 # ── wire format ──────────────────────────────────────────────────────────────
 
 def device_to_payload(device: Device) -> dict:
-    """wf Device -> inventory API body.
+    """wf Device -> registry API body.
 
-    `key` is the wf-side id and the upsert key; the inventory assigns its
+    `key` is the wf-side id and the upsert key; the registry assigns its
     own uuid, which comes back as `id` and is kept as `external_id`.
     """
     return {

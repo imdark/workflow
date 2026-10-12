@@ -271,11 +271,11 @@ deploy:
 | Implementation | Role |
 |---|---|
 | `local` | `~/.wf/config.yaml`. The source of truth, always available. |
-| `notesgraph` | Publishes into a NotesGraph device inventory on your account. |
+| `notesgraph` | Publishes into a NotesGraph device registry on your account. |
 
 The factory **refuses** to let `notesgraph` be primary: it is where the fleet is
 published, not where it is decided. A mirror that fails logs a warning and never
-costs you the primary write, so an inventory outage cannot block a deploy.
+costs you the primary write, so a registry outage cannot block a deploy.
 
 Two record kinds, because a target is not always a whole box:
 
@@ -357,7 +357,7 @@ failed a probe is not the same as one that never answered. Optional probes are
 reported but never degrade a device.
 
 Each run records a `DeviceStatus` into the registry, which fans out to mirrors —
-so a NotesGraph inventory shows live state, not just registrations.
+so a NotesGraph registry shows live state, not just registrations.
 
 ## OTA
 
@@ -390,18 +390,18 @@ conversation captured into your store, and is tagged with the task you have open
 `ExitOnForwardFailure` is set, so a remote port that is already bound is a loud
 error rather than a tunnel that silently forwards nothing.
 
-## The NotesGraph inventory plugin
+## The NotesGraph registry plugin
 
 The other half lives in the notes-graph repo, built to its plugin conventions:
 
 | Path | |
 |---|---|
-| `src/plugins/inventory/` | module, config, service, controller, tests |
-| `src/models/inventory-device.ts` | model layer, registered in `models/index.ts` |
-| `schema.prisma` + `migrations/20260915000000_inventory_devices/` | `InventoryDevice`, unique on `(workspace_id, key)` |
+| `src/plugins/registry/` | module, config, service, controller, tests |
+| `src/models/registry-device.ts` | model layer, registered in `models/index.ts` |
+| `schema.prisma` + `migrations/20260915000000_inventory_devices/` | `RegistryDevice`, unique on `(workspace_id, key)` |
 
-PAT-authenticated REST at `/api/inventory`, off by default behind
-`inventory.enabled`. Reads need `Workspace.Read`; writes need
+PAT-authenticated REST at `/api/registry`, off by default behind
+`registry.enabled`. Reads need `Workspace.Read`; writes need
 `Workspace.Settings.Update`, so a viewer cannot rewrite the fleet. Status is its
 own endpoint because health runs are frequent and should not resend the whole
 record.
@@ -424,7 +424,7 @@ behind NAT is no harder than one on the desk.
 ```
 Agent editor → harness "Remote device" + a device
      ↓
-POST /api/inventory/workspaces/:ws/devices/:key/jobs        queued
+POST /api/registry/workspaces/:ws/devices/:key/jobs        queued
      ↓  the device polls
 POST .../devices/:key/jobs/claim                            running (leased)
      ↓  wf agent serve → the configured AI provider

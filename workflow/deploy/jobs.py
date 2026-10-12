@@ -1,6 +1,6 @@
 """The device half of remote agent execution.
 
-A device polls the inventory for work rather than being called. That
+A device polls the registry for work rather than being called. That
 direction is the point: a machine in the field sits behind NAT, so having
 it initiate every connection means nothing has to route inward and no
 credential for it lives on the server.
@@ -82,7 +82,7 @@ class Job:
 
 
 class JobClient:
-    """Claim and report jobs against the inventory."""
+    """Claim and report jobs against the registry."""
 
     def __init__(self, url: str, workspace: str, token: Optional[str] = None,
                  timeout: float = 30.0):
@@ -127,10 +127,10 @@ class JobClient:
                 pass
             raise NotesGraphError(f"{method} {path} failed: {e.code} {detail}") from e
         except (urllib.error.URLError, OSError) as e:
-            raise NotesGraphError(f"inventory unreachable at {self.url}: {e}") from e
+            raise NotesGraphError(f"registry unreachable at {self.url}: {e}") from e
 
     def _base(self) -> str:
-        return f"/api/inventory/workspaces/{self.workspace}"
+        return f"/api/registry/workspaces/{self.workspace}"
 
     def claim(self, device_key: str, runner_id: str) -> Optional[Job]:
         payload = self._request(

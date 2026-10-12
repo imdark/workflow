@@ -4,7 +4,7 @@ A registry is wherever the fleet is written down: which machines exist, how
 to reach them, what is deployed on them, whether an agent may execute
 there. `LocalRegistry` keeps that in ~/.wf/config.yaml and is always
 present; other implementations publish the same records somewhere a team
-can see them -- `NotesGraphRegistry` into a NotesGraph inventory, and
+can see them -- `NotesGraphRegistry` into a NotesGraph registry, and
 whatever comes next behind the same interface.
 
 Two record types, because a deployment target is not always a whole box:
@@ -152,7 +152,7 @@ def slugify(text: str) -> str:
     real spelling; everything else -- dots in a hostname especially --
     collapses to a dash, turning `gem5.local` into the `gem5-local` you
     would actually want to type. The result stays inside the alphabet the
-    inventory API accepts for a device key.
+    registry API accepts for a device key.
     """
     slug = re.sub(r"[^a-zA-Z0-9_]+", "-", str(text).strip().lower()).strip("-_")
     return slug[:64] or "target"
