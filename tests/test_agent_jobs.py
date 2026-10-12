@@ -349,9 +349,9 @@ def test_client_builds_the_documented_routes(monkeypatch):
     client.report("j1", status="done", result="x")
 
     assert calls[0][0] == "POST"
-    assert calls[0][1] == "/api/inventory/workspaces/ws-1/devices/laptop/jobs/claim"
+    assert calls[0][1] == "/api/registry/workspaces/ws-1/devices/laptop/jobs/claim"
     assert calls[0][2]["runnerId"] == "runner-1"
-    assert calls[1][1] == "/api/inventory/workspaces/ws-1/jobs/j1/report"
+    assert calls[1][1] == "/api/registry/workspaces/ws-1/jobs/j1/report"
     # every report renews the lease, so a long run is not re-claimed
     assert calls[1][2]["leaseSeconds"] > 0
 

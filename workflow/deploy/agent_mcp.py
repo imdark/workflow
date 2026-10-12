@@ -50,7 +50,7 @@ POLL_SECONDS = 2.0
 # run's other open permissions -- land well inside this, and a notification
 # for one would only flash up and vanish.
 NOTIFY_AFTER_SECONDS = 5.0
-# Matches the server's cap on a question's detail (inventory jobs.ts MAX_DETAIL).
+# Matches the server's cap on a question's detail (registry jobs.ts MAX_DETAIL).
 MAX_DETAIL = 200_000
 
 TOOLS = [
@@ -260,12 +260,12 @@ def show_question(question_id: str, kind: str, heading: str, title: str, text: s
 
 
 class Questions:
-    """Ask a job's questions over the inventory API and wait for answers."""
+    """Ask a job's questions over the registry API and wait for answers."""
 
     def __init__(self, url: str, workspace: str, job: str, token: str,
                  job_dir: Optional[Path] = None, poll_seconds: float = POLL_SECONDS,
                  notify_after: float = NOTIFY_AFTER_SECONDS):
-        self.job_url = f"{url.rstrip('/')}/api/inventory/workspaces/{workspace}/jobs/{job}"
+        self.job_url = f"{url.rstrip('/')}/api/registry/workspaces/{workspace}/jobs/{job}"
         self.base = f"{self.job_url}/questions"
         self.token, self.job_dir, self.poll_seconds = token, job_dir, poll_seconds
         self.notify_after = notify_after

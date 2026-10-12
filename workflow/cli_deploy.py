@@ -1,7 +1,7 @@
 """`wf deploy` -- the deployment registry and the fleet it records.
 
 Registration and inspection live here. The registry is the concept; where
-it publishes to (local config, a NotesGraph device inventory) is
+it publishes to (local config, a NotesGraph device registry) is
 configuration, not a different command.
 """
 

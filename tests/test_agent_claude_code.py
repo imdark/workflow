@@ -157,7 +157,7 @@ def test_set_title_renames_the_job_without_waiting(inventory):
                                  {"title": "  Pick a show\nto watch with Cosmo "})
     assert result["isError"] is False
     assert result_text(result) == "Run renamed to: Pick a show to watch with Cosmo"
-    assert inv.titles == [("/api/inventory/workspaces/ws-1/jobs/job-1/title",
+    assert inv.titles == [("/api/registry/workspaces/ws-1/jobs/job-1/title",
                            {"title": "Pick a show to watch with Cosmo"})]
     assert inv.asked == [], "naming the run is not a question"
 
@@ -267,7 +267,7 @@ def test_an_answer_given_on_the_mac_is_sent_to_notesgraph(inventory, monkeypatch
     result = agent_mcp.call_tool(inv.questions(), "ask_user",
                                  {"question": "Which show?", "options": ["Breaking Bad", "Bluey"]})
     assert result_text(result) == "Breaking Bad"
-    assert inv.answers == [("/api/inventory/workspaces/ws-1/jobs/job-1/questions/q1/answer",
+    assert inv.answers == [("/api/registry/workspaces/ws-1/jobs/job-1/questions/q1/answer",
                             {"answer": "Breaking Bad"})]
 
 

@@ -270,7 +270,7 @@ def test_notesgraph_register_posts_and_keeps_the_assigned_id(monkeypatch):
 
     method, path, payload = calls[0]
     assert method == "POST"
-    assert path == "/api/inventory/workspaces/ws-1/devices"
+    assert path == "/api/registry/workspaces/ws-1/devices"
     assert payload["key"] == "gem5"
     assert device.external_id == "uuid-9"
 
@@ -288,7 +288,7 @@ def test_notesgraph_status_posts_to_the_status_endpoint(monkeypatch):
 
     method, path, payload = calls[0]
     assert method == "POST"
-    assert path == "/api/inventory/workspaces/ws-1/devices/gem5/status"
+    assert path == "/api/registry/workspaces/ws-1/devices/gem5/status"
     assert payload["state"] == STATE_ONLINE
     assert payload["version"] == "abc"
 
