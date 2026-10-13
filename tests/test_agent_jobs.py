@@ -427,3 +427,44 @@ def test_commands_need_the_device_owners_opt_in(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="allow_commands"):
         run_job(Job.from_payload(payload(model="command", instructions="echo hi")),
                 config={}, use_tmux=False, tick_seconds=0.05)
+
+
+# --- what a job is asked: the note item is the task, not the instructions ---
+
+from workflow.deploy.jobs import Job as _Job, _prompt, _task_title  # noqa: E402
+
+LOOP = "work on task list or list of checkboxes, operate on a loop on them until all done"
+
+
+def _job(**over):
+    base = dict(id="job-1", agent_id="a1", agent_name="Board", instructions=LOOP,
+                context="Note: 2026-10-08\n\nthe app scrolls up when I tap an empty line")
+    base.update(over)
+    return _Job(**base)
+
+
+def test_the_note_item_leads_the_prompt_as_the_task():
+    prompt = _prompt(_job())
+    assert prompt.startswith("THE TASK - the note item this run was started on:\n")
+    assert prompt.index("the app scrolls up") < prompt.index(LOOP)
+    assert 'standing instructions from the agent "Board"' in prompt
+    assert "not a separate feature or change to make" in prompt
+
+
+def test_a_job_with_only_instructions_is_asked_them_plainly():
+    assert _prompt(_job(context="  ")) == LOOP
+
+
+def test_the_ticket_is_named_after_the_note_item_not_the_instructions():
+    assert _task_title(_job(title="the app scrolls up when I tap an empty line")) == \
+        "the app scrolls up when I tap an empty line"
+
+
+def test_without_a_title_the_ticket_falls_back_to_the_instructions():
+    assert _task_title(_job()) == LOOP[:71] + "…"
+
+
+def test_a_job_payload_keeps_its_title():
+    job = _Job.from_payload({"id": "j", "instructions": LOOP, "title": "Fix the toolbar"})
+    assert job.title == "Fix the toolbar"
+    assert _Job.from_payload({"id": "j"}).title == ""

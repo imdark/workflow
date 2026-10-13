@@ -825,7 +825,10 @@ def test_prepare_task_hands_a_cloud_runner_the_task_its_agent_works_in(repo, wf,
     job_dir = tmp_path / "jobs" / "job-1234"
     job_dir.mkdir(parents=True)
     prompt = tmp_path / "prompt.md"
-    prompt.write_text("Find a show to watch with Cosmo\n\n--- context ---\nnote")
+    prompt.write_text("THE TASK - the note item this run was started on:\nnote\n\n"
+                      "HOW TO WORK ON IT - ...:\nwork through the list")
+    # The runner leaves the job's title beside it; the ticket takes that.
+    (job_dir / "title.txt").write_text("Find a show to watch with Cosmo\n")
     out = job_dir / "automation.json"
 
     result = CliRunner().invoke(agent_app, [
