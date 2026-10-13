@@ -270,8 +270,13 @@ def agent_prepare_task(
     from workflow.deploy.jobs import Job, _job_context, start_job_task
 
     instructions = prompt_file.read_text(encoding="utf-8")
+    # The runner leaves the job's title (the note item it is about) beside
+    # the prompt, to name the ticket by; the prompt's first line is the
+    # agent's standing instructions or a heading, not the task.
+    title_file = job_dir / "title.txt"
+    title = title_file.read_text(encoding="utf-8").strip() if title_file.exists() else ""
     job = Job(id=job_dir.name, agent_id="", agent_name="agent",
-              instructions=instructions, context="")
+              instructions=instructions, context="", title=title)
     issue, workdir, repo_path = start_job_task(job, job_dir, repo)
     plugin_dir = skills_plugin_dir(issue, issue.key.lower(),
                                    Path.home() / ".wf" / "tasks" / issue.key.lower(),

@@ -60,6 +60,9 @@ class Job:
     instructions: str
     context: str
     model: Optional[str] = None
+    # What the run is about, as the server names it: the note item it was
+    # started on. Older servers don't send it.
+    title: str = ""
     tools: list = None
     max_steps: int = 8
     # How to run it, as the server says (system prompt, allowed tools, tool
@@ -75,6 +78,7 @@ class Job:
             instructions=payload.get("instructions", ""),
             context=payload.get("context", ""),
             model=payload.get("model"),
+            title=payload.get("title") or "",
             tools=payload.get("tools") or [],
             max_steps=int(payload.get("maxSteps") or 8),
             profile=payload.get("profile") or None,
@@ -190,10 +194,26 @@ def tmux_session_name(job_id: str) -> str:
 
 
 def _prompt(job: Job) -> str:
-    prompt = job.instructions
-    if job.context.strip():
-        prompt += f"\n\n--- context ---\n{job.context}"
-    return prompt
+    """What the run is asked to do.
+
+    A NotesGraph agent's instructions are standing ones ("work through the
+    checkboxes until all are done"), and the note item it was started on is
+    the actual work. Led by the instructions with the item below as "context",
+    runs kept taking the instructions for a feature to build. So the item
+    leads as the task, and the instructions follow as how to work on it.
+    """
+    if not job.context.strip():
+        return job.instructions
+    if not job.instructions.strip():
+        return job.context
+    return (
+        "THE TASK - the note item this run was started on:\n"
+        f"{job.context.strip()}\n\n"
+        f'HOW TO WORK ON IT - standing instructions from the agent "{job.agent_name}". '
+        "They say how to approach the task above; they are not a separate "
+        "feature or change to make:\n"
+        f"{job.instructions.strip()}"
+    )
 
 
 def _provider_argv(job: Job, config: dict) -> tuple:
@@ -510,8 +530,13 @@ def _drop_worktree_if_empty(job_dir: Path) -> None:
 
 
 def _task_title(job: Job) -> str:
-    """A ticket title for a job: the first line of what it was asked to do."""
-    for line in (job.instructions or "").splitlines():
+    """A ticket title for a job: the note item it is about, as the server
+    names it, else the first line of its instructions.
+
+    Not the instructions first: they are the agent's standing ones, the same
+    for every run, and a ticket titled with them read as the task itself.
+    """
+    for line in (job.title or job.instructions or "").splitlines():
         if line.strip():
             line = " ".join(line.split())
             return line if len(line) <= 72 else line[:71] + "…"
