@@ -468,12 +468,20 @@ watching is the one failure that costs hardware you don't own.
 # Publishing conversations to NotesGraph
 
 When a session goes quiet and the ladder summarizes it, the finished
-conversation is published as a document:
+conversation is published as a document, filed in real folders in the app's
+tree (made as needed):
 
 ```
-<project> / ai / conversations              ← index, links every conversation
-<project> / ai / conversations / <chat id>  ← one per session
+<project>/
+  ai/
+    conversations/
+      All conversations               ← index, links every conversation
+      2026-10-12 PAN-484 · 65c43237   ← one per session: date, task, chat id
 ```
+
+Conversations published before folders existed are filed and renamed the next
+time they are published; against a server without the folder API they stay
+where they are and it is tried again later.
 
 Each document leads with **Ending** (the session summary), then **Durable
 facts**, then the transcript — the outcome first, because that is what someone

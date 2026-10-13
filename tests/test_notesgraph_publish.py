@@ -16,18 +16,32 @@ from workflow.conversation_store.base import SessionMeta, Summary, Turn
 class FakeClient:
     """Records documents instead of sending them."""
 
-    def __init__(self, workspace="ws-1", fail_update=False):
+    def __init__(self, workspace="ws-1", fail_update=False, old_server=False):
         self.workspace = workspace
         self.docs = {}
         self.creates = 0
         self.updates = 0
         self.fail_update = fail_update
+        self.old_server = old_server
 
-    def create_doc(self, title, markdown):
+    def create_doc(self, title, markdown, folder=None):
         self.creates += 1
         doc_id = f"doc-{self.creates}"
-        self.docs[doc_id] = {"title": title, "markdown": markdown}
+        self.docs[doc_id] = {"title": title, "markdown": markdown,
+                             "folder": None if self.old_server else folder}
         return doc_id
+
+    def file_doc(self, doc_id, folder):
+        if self.old_server:
+            raise ng.NotesGraphError("404 Not Found")
+        self.docs[doc_id]["folder"] = folder
+        return True
+
+    def rename_doc(self, doc_id, title):
+        if self.old_server:
+            raise ng.NotesGraphError("400 markdown is required")
+        self.docs[doc_id]["title"] = title
+        return True
 
     def update_doc(self, doc_id, markdown):
         if self.fail_update:
@@ -79,12 +93,50 @@ def turns():
 # document shape
 # ---------------------------------------------------------------------------
 
-def test_the_title_is_the_breadcrumb_path():
-    assert ng.doc_title("work", "65c43237-b873-4e45") == \
-        "work / ai / conversations / 65c43237"
-    assert ng.index_title("work") == "work / ai / conversations"
+def test_conversations_are_filed_in_real_folders_not_titled_with_the_path():
+    assert ng.folder_path("work") == ["work", "ai", "conversations"]
     # a session captured outside any project still has somewhere to go
-    assert ng.doc_title(None, "abc123") == "unscoped / ai / conversations / abc123"
+    assert ng.folder_path(None) == ["unscoped", "ai", "conversations"]
+    meta = session(started_at=0)
+    title = ng.doc_title(meta)
+    assert " / " not in title
+    assert title.endswith("PAN-484 · 65c43237")
+
+
+def test_a_conversation_is_created_in_its_folder(ledger):
+    store = FakeStore(session(), turns())
+    client = FakeClient()
+    doc_id = ng.publish_session(store.meta.session_id, store, cfg={}, client=client)
+    assert client.docs[doc_id]["folder"] == ["work", "ai", "conversations"]
+    assert " / " not in client.docs[doc_id]["title"]
+
+
+def test_one_published_before_folders_is_filed_and_renamed(ledger):
+    store = FakeStore(session(), turns())
+    sid = store.meta.session_id
+    client = FakeClient()
+    client.docs["old-doc"] = {"title": "work / ai / conversations / 65c43237",
+                              "markdown": "", "folder": None}
+    ledger.write_text(json.dumps({"sessions": {sid: {"doc_id": "old-doc"}},
+                                  "indexes": {}}))
+
+    assert ng.publish_session(sid, store, cfg={}, client=client) == "old-doc"
+    assert client.docs["old-doc"]["folder"] == ["work", "ai", "conversations"]
+    assert client.docs["old-doc"]["title"] == ng.doc_title(store.meta)
+    assert json.loads(ledger.read_text())["sessions"][sid]["filed"] is True
+
+
+def test_an_older_server_leaves_it_unfiled_and_it_is_tried_again(ledger):
+    store = FakeStore(session(), turns())
+    sid = store.meta.session_id
+    client = FakeClient(old_server=True)
+    client.docs["old-doc"] = {"title": "work / ai / conversations / 65c43237",
+                              "markdown": "", "folder": None}
+    ledger.write_text(json.dumps({"sessions": {sid: {"doc_id": "old-doc"}},
+                                  "indexes": {}}))
+
+    assert ng.publish_session(sid, store, cfg={}, client=client) == "old-doc"
+    assert json.loads(ledger.read_text())["sessions"][sid]["filed"] is False
 
 
 def test_the_document_leads_with_the_ending(ledger):
@@ -177,7 +229,8 @@ def test_the_index_links_every_conversation_in_the_project(ledger):
                            cfg={}, client=client)
 
     index = next(d for d in client.docs.values()
-                 if d["title"] == "work / ai / conversations")
+                 if d["title"] == "All conversations")
+    assert index["folder"] == ["work", "ai", "conversations"]
     assert "aaaa1" in index["markdown"] and "aaaa2" in index["markdown"]
     assert index["markdown"].count("/workspace/ws-1/") == 2
 
