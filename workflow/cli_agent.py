@@ -1,5 +1,6 @@
 """`wf agent` -- run agent jobs dispatched from NotesGraph on this device."""
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +58,10 @@ def agent_serve(
     once: bool = typer.Option(False, "--once", help="Run at most one job, then exit"),
     max_jobs: int = typer.Option(4, "--max-jobs", "-j", min=1,
                                  help="Jobs to run at once, each in its own worktree"),
+    exit_on_update: bool = typer.Option(
+        False, "--exit-on-update",
+        help="When wf's code changes, finish running jobs and exit (for a "
+             "supervisor to restart it on the new code; see `wf agent install`)"),
 ):
     """Claim and run agent jobs queued for this device.
 
@@ -93,15 +98,84 @@ def agent_serve(
             console.print(f"   [red]✗[/red] {job.agent_name}: {detail}")
         elif kind == "error":
             console.print(f"   [yellow]![/yellow] {job or detail}")
+        elif kind == "stopping":
+            console.print(f"♻️  wf was updated: taking no new jobs ({detail}), "
+                          "then exiting to restart on the new code")
+
+    stop_when = None
+    if exit_on_update:
+        from workflow.deploy.updates import UpdateWatch
+        stop_when = UpdateWatch()
 
     try:
         ran = serve_jobs(client, target.id, poll_seconds=interval, once=once,
-                         on_event=on_event, max_jobs=max_jobs)
+                         on_event=on_event, max_jobs=max_jobs,
+                         stop_when=stop_when)
     except KeyboardInterrupt:
         console.print("\n🛑 Stopped")
         return
+    if stop_when is not None and stop_when():
+        console.print("♻️  Exiting for the update")
+        return
     if once:
         console.print(f"Ran {ran} job(s)")
+
+
+def _other_runners() -> list:
+    """`wf agent serve` processes not run by the installed service."""
+    import subprocess
+
+    found = subprocess.run(["pgrep", "-fl", "agent serve"],
+                           capture_output=True, text=True).stdout.splitlines()
+    mine = str(os.getpid())
+    return [line for line in found
+            if line.split(" ", 1)[0] != mine and "--exit-on-update" not in line]
+
+
+@agent_app.command("install")
+def agent_install(
+    device: Optional[str] = typer.Option(None, "--device", "-d", help="Target id (default: this machine)"),
+    cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Folder the runner works from"),
+    max_jobs: int = typer.Option(4, "--max-jobs", "-j", min=1, help="Jobs to run at once"),
+):
+    """Run `wf agent serve` as a service that restarts itself on wf updates.
+
+    Sets up a per-user supervisord (pip-installed into wf's environment,
+    started at login by launchd or systemd --user) running the runner with
+    --exit-on-update: after a `git pull` in wf's checkout it finishes its jobs
+    and comes back on the new code. Run again to change the device, folder or
+    job count. Logs: ~/.wf/logs/wf-agent.log.
+    """
+    from workflow.deploy import supervisor
+
+    _client_and_device(device)  # fail now, not in the background, if unconfigured
+    others = _other_runners()
+    if others:
+        console.print("⚠️  Another `wf agent serve` is running; stop it (Ctrl-C in its "
+                      "terminal) so two runners don't share this device:")
+        for line in others:
+            console.print(f"   [dim]{line}[/dim]")
+    how = supervisor.install(device, cwd.resolve(), max_jobs)
+    console.print(f"✓ Installed {supervisor.PROGRAM}, started by {how}")
+    console.print(f"   {supervisor.status()}")
+    console.print(f"   [dim]logs: {supervisor.default_paths().logs / (supervisor.PROGRAM + '.log')}[/dim]")
+
+
+@agent_app.command("uninstall")
+def agent_uninstall():
+    """Stop the runner service and remove it (and its supervisord)."""
+    from workflow.deploy import supervisor
+
+    supervisor.uninstall()
+    console.print(f"✓ Removed {supervisor.PROGRAM}")
+
+
+@agent_app.command("status")
+def agent_status():
+    """Whether the runner service is installed and running."""
+    from workflow.deploy import supervisor
+
+    console.print(supervisor.status())
 
 
 @agent_app.command("jobs")

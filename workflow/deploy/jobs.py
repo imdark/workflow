@@ -870,7 +870,8 @@ def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
 
 def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
           poll_seconds: int = DEFAULT_POLL_SECONDS, once: bool = False,
-          on_event=None, config=None, max_jobs: int = DEFAULT_MAX_JOBS) -> int:
+          on_event=None, config=None, max_jobs: int = DEFAULT_MAX_JOBS,
+          stop_when=None) -> int:
     """Claim and run jobs until interrupted. Returns how many ran.
 
     Up to `max_jobs` run at once, each on its own thread; with every slot
@@ -882,23 +883,39 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
     The threads are daemons: Ctrl-C ends the runner without waiting for
     them, as it always ended mid-job. Their leases lapse and the jobs are
     claimed again.
+
+    `stop_when`, asked before each claim, ends the runner gracefully: once it
+    says so nothing more is claimed, the running jobs finish, and serve
+    returns. `--exit-on-update` passes a watch on wf's own code, so a runner
+    under a supervisor comes back on new code without dropping a job.
     """
     runner_id = runner_id or f"{socket.gethostname()}-{int(time.time())}"
     emit = on_event or (lambda *a, **k: None)
     completed = 0
+    running = 0
     counted = threading.Lock()
     slots = threading.BoundedSemaphore(max(1, max_jobs))
 
     def work(job: Job) -> None:
-        nonlocal completed
+        nonlocal completed, running
         try:
             if _run_claimed(client, job, config, emit):
                 with counted:
                     completed += 1
         finally:
+            with counted:
+                running -= 1
             slots.release()
 
     while True:
+        if stop_when is not None and stop_when():
+            emit("stopping", detail=f"{running} job(s) still running")
+            while True:
+                with counted:
+                    if running == 0:
+                        break
+                time.sleep(1)
+            return completed
         slots.acquire()
         try:
             job = client.claim(device_key, runner_id)
@@ -917,6 +934,8 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
             time.sleep(poll_seconds)
             continue
 
+        with counted:
+            running += 1
         if once:
             work(job)
             return completed
