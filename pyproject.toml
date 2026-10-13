@@ -26,6 +26,8 @@ dependencies = [
     "aiohttp>=3.9",
     # Imported by the CLI at startup (notifications); pure Python.
     "desktop-notifier>=5.0",
+    # `wf agent install` runs the agent runner under it; pure Python.
+    "supervisor>=4.2",
 ]
 
 [project.optional-dependencies]
