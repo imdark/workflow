@@ -2,16 +2,12 @@
 
 `wf ai` sessions land in the primary store turn by turn while they run.
 This publishes the finished article: one document per conversation, written
-once the session has gone quiet, under a breadcrumb path
+once the session has gone quiet, filed in the folder
 
-    <project> / ai / conversations / <chat id>
+    <project> / ai / conversations
 
-plus an index document at `<project> / ai / conversations` linking to them.
-
-The notes API creates flat documents with a title -- there is no folder
-model server-side, and NotesGraph's own hierarchy lives in the frontend's
-CRDT rather than anywhere this can reach. Breadcrumb titles and a linked
-index are the navigable structure the available API supports.
+(real folders in the app's tree, made by the notes API as needed) with an
+"All conversations" index beside them linking to each.
 """
 
 import json
@@ -85,12 +81,32 @@ class NotesGraphDocClient:
         except (urllib.error.URLError, OSError) as e:
             raise NotesGraphError(f"NotesGraph unreachable at {self.url}: {e}") from e
 
-    def create_doc(self, title: str, markdown: str) -> str:
+    def create_doc(self, title: str, markdown: str,
+                   folder: Optional[list] = None) -> str:
+        payload = {"title": title, "markdown": markdown}
+        if folder:
+            # Folder names, outermost first; an older server ignores it and
+            # the doc lands unfiled.
+            payload["folder"] = list(folder)
         result = self._request(
-            "POST", f"/api/notes/workspaces/{self.workspace}/docs",
-            {"title": title, "markdown": markdown},
+            "POST", f"/api/notes/workspaces/{self.workspace}/docs", payload,
         )
         return result.get("docId", "")
+
+    def file_doc(self, doc_id: str, folder: list) -> bool:
+        """File an existing doc in `folder`, making the folders as needed."""
+        result = self._request(
+            "PUT", f"/api/notes/workspaces/{self.workspace}/docs/{doc_id}/folder",
+            {"folder": list(folder)},
+        )
+        return bool(result.get("ok"))
+
+    def rename_doc(self, doc_id: str, title: str) -> bool:
+        result = self._request(
+            "PUT", f"/api/notes/workspaces/{self.workspace}/docs/{doc_id}",
+            {"title": title},
+        )
+        return bool(result.get("ok"))
 
     def update_doc(self, doc_id: str, markdown: str) -> bool:
         result = self._request(
@@ -111,13 +127,27 @@ ROLE_HEADING = {
 }
 
 
-def doc_title(project: Optional[str], session_id: str) -> str:
-    """Breadcrumb title: `<project> / ai / conversations / <chat id>`."""
-    return f"{project or 'unscoped'} / ai / conversations / {short_id(session_id)}"
+def folder_path(project: Optional[str]) -> list:
+    """Where a project's conversations are filed: `<project> / ai / conversations`."""
+    return [project or "unscoped", "ai", "conversations"]
+
+
+def doc_title(meta) -> str:
+    """A conversation's title within its folder: when, what, which chat.
+
+    The folder says whose and what kind; the title only has to tell the
+    conversations in it apart.
+    """
+    started = time.strftime("%Y-%m-%d", time.localtime(meta.started_at))
+    task = f" {meta.task_key}" if meta.task_key else ""
+    return f"{started}{task} · {short_id(meta.session_id)}"
+
+
+INDEX_TITLE = "All conversations"
 
 
 def index_title(project: Optional[str]) -> str:
-    return f"{project or 'unscoped'} / ai / conversations"
+    return INDEX_TITLE
 
 
 def short_id(session_id: str) -> str:
@@ -254,7 +284,7 @@ def _body(turn) -> str:
 
 def render_index(project: Optional[str], entries: list) -> str:
     """The index document, newest conversation first."""
-    lines = [f"# {project or 'unscoped'} / ai / conversations", ""]
+    lines = [f"# {INDEX_TITLE} — {project or 'unscoped'}", ""]
     if not entries:
         lines.append("_No conversations published yet._")
         return "\n".join(lines)
@@ -349,24 +379,31 @@ def publish_session(session_id: str, store, cfg=None,
         meta, turns, summaries,
         max_bytes=int(publish_cfg.get("max_doc_bytes", DEFAULT_MAX_DOC_BYTES)),
     )
-    title = doc_title(meta.project, session_id)
+    title = doc_title(meta)
+    folder = folder_path(meta.project)
 
     ledger = _load_ledger()
     record = ledger["sessions"].get(session_id)
 
+    filed = False
     if record and record.get("doc_id"):
         try:
             client.update_doc(record["doc_id"], markdown)
             doc_id = record["doc_id"]
+            filed = bool(record.get("filed"))
         except NotesGraphError:
             # The document was deleted in the app; publish a fresh one rather
             # than losing the conversation.
-            doc_id = client.create_doc(title, markdown)
+            doc_id, filed = client.create_doc(title, markdown, folder), True
     else:
-        doc_id = client.create_doc(title, markdown)
+        doc_id, filed = client.create_doc(title, markdown, folder), True
+    if not filed:
+        # Published before conversations had folders: file and rename it.
+        filed = _move_into_folder(client, doc_id, folder, title)
 
     ledger["sessions"][session_id] = {
         "doc_id": doc_id,
+        "filed": filed,
         "title": title,
         "short": short_id(session_id),
         "project": meta.project,
@@ -389,11 +426,16 @@ def _publish_index(client: NotesGraphDocClient, project: Optional[str],
     markdown = render_index(project, entries)
     title = index_title(project)
 
+    folder = folder_path(project)
     key = project or "unscoped"
     doc_id = ledger["indexes"].get(key)
+    filed_indexes = ledger.setdefault("filed_indexes", [])
     if doc_id:
         try:
             client.update_doc(doc_id, markdown)
+            if doc_id not in filed_indexes and _move_into_folder(client, doc_id, folder, title):
+                filed_indexes.append(doc_id)
+                _save_ledger(ledger)
             return
         except NotesGraphError:
             doc_id = None   # deleted in the app; fall through and recreate
@@ -401,7 +443,23 @@ def _publish_index(client: NotesGraphDocClient, project: Optional[str],
     # An index that cannot be written is not worth failing a publish over:
     # the conversation document itself is the artifact.
     try:
-        ledger["indexes"][key] = client.create_doc(title, markdown)
+        ledger["indexes"][key] = client.create_doc(title, markdown, folder)
+        filed_indexes.append(ledger["indexes"][key])
         _save_ledger(ledger)
     except NotesGraphError as e:
         print(f"⚠️  Could not update the conversation index: {e}")
+
+
+def _move_into_folder(client: NotesGraphDocClient, doc_id: str, folder: list,
+                      title: str) -> bool:
+    """File a doc published before folders and give it its in-folder title.
+
+    False when the server can't (an older one without the folder API): the
+    doc keeps working where it is, and the next publish tries again.
+    """
+    try:
+        client.file_doc(doc_id, folder)
+        client.rename_doc(doc_id, title)
+        return True
+    except NotesGraphError:
+        return False
