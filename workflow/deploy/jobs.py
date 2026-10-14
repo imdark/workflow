@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from workflow.deploy.notes import NotesReader
 from workflow.deploy.registry.notesgraph import NotesGraphError, load_token
 
 # How long a claim is held before another runner may take the job. Renewed
@@ -315,6 +316,50 @@ CLAUDE_CODE_ALLOWED_TOOLS = [
 # question waits for a person, who may be at dinner.
 ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
+# The conventions above (where facts go, how they are dated, the task status
+# workflow) are fixed in code. A note of this title in the workspace is the
+# user's own rulebook on top: where research notes go, naming, tags. Every
+# Claude run reads it at start, so a convention changes with an edit to the
+# note rather than a deploy.
+AGENT_RULES_TITLE = "Agent rules"
+# A rulebook that long is a mistake, not rules; the rest is cut rather than
+# crowding out the task.
+AGENT_RULES_MAX_CHARS = 20_000
+AGENT_RULES_PROMPT = """\
+The user keeps their own rules for agent runs in a note titled "{title}" in
+NotesGraph. Follow them. Where they disagree with the conventions above, the
+note wins. The note, as it is now:
+
+{rules}
+"""
+
+
+def load_agent_rules(client: "JobClient") -> str:
+    """The user's "Agent rules" note, or "" when there is none.
+
+    Never fails the run: a server without the MCP endpoint, a bad token or
+    an outage just means the run goes without the note, as runs did before.
+    """
+    try:
+        reader = NotesReader(url=client.url, workspace=client.workspace, token=client.token)
+        note = reader.find(AGENT_RULES_TITLE)
+        if not note:
+            return ""
+        rules = reader.read(note["docId"]).strip()
+    except (NotesGraphError, ValueError, KeyError, TypeError):
+        return ""
+    if len(rules) > AGENT_RULES_MAX_CHARS:
+        rules = rules[:AGENT_RULES_MAX_CHARS].rstrip() + "\n[cut: the note goes on]"
+    return rules
+
+
+def with_agent_rules(system_prompt: str, rules: str) -> str:
+    """The system prompt with the user's rules appended, when there are any."""
+    if not rules.strip():
+        return system_prompt
+    return (system_prompt.rstrip("\n") + "\n\n"
+            + AGENT_RULES_PROMPT.format(title=AGENT_RULES_TITLE, rules=rules.strip()))
+
 # Added to CLAUDE_CODE_SYSTEM_PROMPT for a research job. The method follows
 # OmniSeek's own investigate skill: sweep wide, zoom in, then structure.
 RESEARCH_SYSTEM_PROMPT = """\
@@ -376,7 +421,7 @@ def omniseek_endpoint(config: dict) -> tuple:
 
 
 def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
-                  config: dict) -> tuple:
+                  config: dict, rules: str = "") -> tuple:
     """Claude Code as for a claude-code job, with OmniSeek's tools added."""
     url, token = omniseek_endpoint(config)
     return claude_code_argv(
@@ -388,6 +433,7 @@ def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
         }},
         extra_allowed=RESEARCH_ALLOWED_TOOLS,
         extra_prompt=RESEARCH_SYSTEM_PROMPT,
+        rules=rules,
     )
 
 
@@ -426,7 +472,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                      client: "JobClient", plugin_dir: Optional[Path] = None,
                      extra_mcp: Optional[dict] = None,
                      extra_allowed: Optional[list] = None,
-                     extra_prompt: str = "") -> tuple:
+                     extra_prompt: str = "", rules: str = "") -> tuple:
     """Claude Code with NotesGraph's tools and a way to ask the user.
 
     Returns (argv, env). The MCP config carries the NotesGraph token, so it
@@ -434,6 +480,8 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     `plugin_dir` carries the task's wf skills, as `wf ai` passes them.
     `extra_mcp`, `extra_allowed` and `extra_prompt` add MCP servers,
     pre-approved tools and system prompt for a variant (see research_argv).
+    `rules` is the user's "Agent rules" note (see load_agent_rules); it goes
+    on the end of the system prompt, the server's or the built-in one alike.
     """
     mcp_path = job_dir / "mcp.json"
     mcp_config = {"mcpServers": {
@@ -460,8 +508,8 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     # The server's profile for the job's model is the whole agent: its prompt
     # already has the research part, its tools the research ones.
     profile = job.profile or {}
-    system_prompt = profile.get("systemPrompt") or (
-        CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else ""))
+    system_prompt = with_agent_rules(profile.get("systemPrompt") or (
+        CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else "")), rules)
     allowed = profile.get("allowedTools") or [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])]
     tool_timeout = int(profile.get("toolTimeoutMs") or ASK_TIMEOUT_MS)
     skills_dir = profile_skills_plugin(job, job_dir)
@@ -699,16 +747,18 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     env: dict = {}
     workdir: Optional[Path] = None
     issue = repo_path = None
+    rules = ""
     with _SETUP_LOCK:
         if job.model in CLAUDE_MODELS:
             if client is None:
                 raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
             provider = job.model
+            rules = load_agent_rules(client)
         if job.model == CLAUDE_CODE_MODEL:
-            argv, env = claude_code_argv(job, _prompt(job), job_dir, client)
+            argv, env = claude_code_argv(job, _prompt(job), job_dir, client, rules=rules)
             workdir = job_workdir(job_dir, cwd or Path.cwd())
         elif job.model == RESEARCH_MODEL:
-            argv, env = research_argv(job, _prompt(job), job_dir, client, config)
+            argv, env = research_argv(job, _prompt(job), job_dir, client, config, rules=rules)
             # Research reads the world, not a repo: the job directory, no worktree.
             workdir = job_dir
         elif job.model == COMMAND_MODEL:
@@ -724,7 +774,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
                                            Path.home() / ".wf" / "tasks" / issue.key.lower(),
                                            repo_path)
             argv, env = claude_code_argv(job, _job_context(issue, job, workdir),
-                                         job_dir, client, plugin_dir)
+                                         job_dir, client, plugin_dir, rules=rules)
             # Same Claude account and capture proxy as `wf ai`.
             env.update(apply_claude_env(dict(os.environ)))
         else:

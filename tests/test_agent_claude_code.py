@@ -107,6 +107,13 @@ REAL_SHOW_QUESTION = agent_mcp.show_question
 
 
 @pytest.fixture(autouse=True)
+def no_agent_rules(monkeypatch):
+    """run_job reads the "Agent rules" note from NotesGraph; these tests have
+    no server for it. Its own tests are in test_notes_reader.py."""
+    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client: "")
+
+
+@pytest.fixture(autouse=True)
 def notified(monkeypatch):
     """Keep tests from popping real notifications; record what would show."""
     shown = []
@@ -571,7 +578,7 @@ def test_a_claude_code_job_needs_a_connection(tmp_path, monkeypatch):
 
 
 def test_the_token_file_is_removed_after_the_run(tmp_path, monkeypatch, started):
-    def fake_argv(j, prompt, job_dir, c, plugin_dir=None):
+    def fake_argv(j, prompt, job_dir, c, plugin_dir=None, **kw):
         (job_dir / "mcp.json").write_text("{}")
         return [sys.executable, "-c", "print('done')"], {}
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv", fake_argv)
@@ -588,7 +595,7 @@ def test_time_spent_waiting_for_the_user_does_not_count(tmp_path, monkeypatch, s
     script = (f"import pathlib, time; m = pathlib.Path({str(marker)!r}); "
               "m.write_text('q'); time.sleep(2); m.unlink(); print('answered')")
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
-                        lambda *a: ([sys.executable, "-c", script], {}))
+                        lambda *a, **kw: ([sys.executable, "-c", script], {}))
 
     out = run_job(job(model="workflow"), config={}, timeout=1, use_tmux=False, client=client(),
                   tick_seconds=0.1)
@@ -597,7 +604,7 @@ def test_time_spent_waiting_for_the_user_does_not_count(tmp_path, monkeypatch, s
 
 def test_without_a_question_the_limit_still_applies(tmp_path, monkeypatch, started):
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
-                        lambda *a: ([sys.executable, "-c", "import time; time.sleep(5)"], {}))
+                        lambda *a, **kw: ([sys.executable, "-c", "import time; time.sleep(5)"], {}))
     with pytest.raises(RuntimeError, match="exceeded 1s"):
         run_job(job(model="workflow"), config={}, timeout=1, use_tmux=False, client=client(),
                 tick_seconds=0.1)
@@ -716,7 +723,7 @@ def run_claude_code_in(repo, tmp_path, monkeypatch, script):
     """A plain claude-code job: its own worktree under the job directory."""
     monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
     monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
-                        lambda *a: ([sys.executable, "-c", script], {}))
+                        lambda *a, **kw: ([sys.executable, "-c", script], {}))
     return run_job(job(), config={}, use_tmux=False, client=client(),
                    tick_seconds=0.05, cwd=repo)
 
