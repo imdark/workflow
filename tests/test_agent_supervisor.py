@@ -112,3 +112,13 @@ def test_the_socket_stays_short_enough_for_a_unix_socket():
     deep = supervisor.Paths(Path("/x/" + "very-long-folder-name/" * 6))
     assert len(str(deep.socket)) <= supervisor.MAX_SOCKET_PATH
     assert deep.socket.name.startswith("wf-supervisor-")
+
+
+def test_jobs_run_claude_as_the_account_wf_was_installed_from(monkeypatch):
+    """A login item gets no shell env; without CLAUDE_CONFIG_DIR claude reads
+    ~/.claude, whose OAuth login may be expired ("Failed to authenticate")."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/Users/me/.claude-personal")
+    assert supervisor.service_env()["CLAUDE_CONFIG_DIR"] == "/Users/me/.claude-personal"
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert "CLAUDE_CONFIG_DIR" not in supervisor.service_env()

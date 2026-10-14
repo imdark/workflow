@@ -192,12 +192,18 @@ WantedBy=default.target
 """
 
 
+# Which Claude account jobs run as. Without it `claude` falls back to
+# ~/.claude, whose login may be a different account or long expired.
+CLAUDE_ENV = ("CLAUDE_CONFIG_DIR",)
+
+
 def service_env() -> dict:
     """What the runner needs from this shell: its PATH (tmux, claude, gh,
-    git), home and locale. Captured at install, as a login item gets none."""
+    git), home, locale and Claude config dir. Captured at install, as a login
+    item gets none."""
     env = {"PATH": os.environ.get("PATH", ""), "HOME": str(Path.home()),
            "PYTHONUNBUFFERED": "1"}
-    for key in ("LANG", "LC_ALL", "USER"):
+    for key in ("LANG", "LC_ALL", "USER", *CLAUDE_ENV):
         if os.environ.get(key):
             env[key] = os.environ[key]
     return env

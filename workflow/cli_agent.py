@@ -158,6 +158,9 @@ def agent_install(
     how = supervisor.install(device, cwd.resolve(), max_jobs)
     console.print(f"✓ Installed {supervisor.PROGRAM}, started by {how}")
     console.print(f"   {supervisor.status()}")
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    console.print(f"   [dim]jobs run claude logged in from {claude_dir} "
+                  "(reinstall from another shell to change it)[/dim]")
     console.print(f"   [dim]logs: {supervisor.default_paths().logs / (supervisor.PROGRAM + '.log')}[/dim]")
 
 
