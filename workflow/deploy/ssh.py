@@ -193,25 +193,67 @@ def _default_public_key() -> Optional[Path]:
 _LOOPBACK = {"localhost", "127.0.0.1", "::1", "", "-"}
 
 
+def _mac_hostnames() -> set:
+    """macOS's own names for this machine, which outlive the network.
+
+    `hostname` on a Mac is whatever the current network's DHCP handed out --
+    `Mac.attlocal.net` on one router, `Michaels-MacBook-Pro.local` on another
+    -- so a target registered on one network stops matching on the next.
+    LocalHostName (the Bonjour name) is set once and stays put.
+    """
+    import sys
+
+    if sys.platform != "darwin":
+        return set()
+    names = set()
+    for key in ("LocalHostName", "HostName"):
+        try:
+            out = subprocess.run(["scutil", "--get", key], capture_output=True,
+                                 text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode == 0 and out.stdout.strip():
+            names.add(out.stdout.strip())
+    return names
+
+
+def local_hostnames() -> set:
+    """Every name this machine answers to, lowercased, with and without domain."""
+    import socket
+
+    names = {socket.gethostname()}
+    try:
+        names.add(socket.getfqdn())
+    except OSError:
+        pass
+    names |= _mac_hostnames()
+    names = {n.lower() for n in names if n}
+    # `Mac.attlocal.net` is registered as `mac`, `Foo.local` as `foo`.
+    return names | {n.split(".", 1)[0] for n in names}
+
+
+def preferred_local_hostname() -> str:
+    """The name to register this machine under: the stable one if there is one."""
+    import socket
+
+    stable = sorted(n for n in _mac_hostnames() if "." not in n)
+    return stable[0] if stable else socket.gethostname().split(".", 1)[0]
+
+
 def is_local_host(host: str) -> bool:
     """Whether `host` refers to this machine.
 
-    Matches the loopback names and this machine's own hostname, with or
+    Matches the loopback names and this machine's own hostnames, with or
     without a trailing `.local` -- `hostname` reports
-    `Michaels-MacBook-Pro.local` while a user would register `michaels-macbook-pro`.
+    `Michaels-MacBook-Pro.local` while a user would register
+    `michaels-macbook-pro`. On a Mac the Bonjour name counts too, since
+    `hostname` changes with the network the machine is on.
     """
-    import socket
-
     candidate = (host or "").strip().lower()
     if candidate in _LOOPBACK:
         return True
 
-    names = {socket.gethostname().lower()}
-    try:
-        names.add(socket.getfqdn().lower())
-    except OSError:
-        pass
-    names |= {n[: -len(".local")] for n in list(names) if n.endswith(".local")}
+    names = local_hostnames()
     return candidate in names or candidate.removesuffix(".local") in names
 
 
