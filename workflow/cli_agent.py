@@ -17,7 +17,7 @@ def _client_and_device(device: Optional[str]):
     from workflow.config import load_effective_config
     from workflow.deploy.jobs import JobClient
     from workflow.deploy.registry import get_registry
-    from workflow.deploy.ssh import is_local_host
+    from workflow.deploy.ssh import is_local_host, preferred_local_hostname
 
     cfg = load_effective_config()
     ng = (cfg.get("deploy") or {}).get("notesgraph") or {}
@@ -38,7 +38,7 @@ def _client_and_device(device: Optional[str]):
                       if is_local_host(d.host) and d.kind == "machine"]
         if not candidates:
             console.print("❌ This machine is not registered as an agent target.")
-            console.print("💡 Register it: wf deploy add <user>@$(hostname -s) --agent")
+            console.print(f"💡 Register it: wf deploy add <user>@{preferred_local_hostname()} --agent")
             raise typer.Exit(1)
         if len(candidates) > 1:
             console.print(f"❌ Several local agent targets: "

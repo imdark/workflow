@@ -257,6 +257,24 @@ def test_this_machine_is_recognized_by_its_own_names():
     assert not is_local_host("gem5.local")
 
 
+def test_mac_is_recognized_whatever_network_it_is_on(monkeypatch):
+    """A Mac registered as Michaels-MacBook-Pro stays local on a network
+    whose DHCP renames `hostname` to Mac.attlocal.net."""
+    import socket
+    from workflow.deploy import ssh
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "Mac.attlocal.net")
+    monkeypatch.setattr(socket, "getfqdn", lambda: "Mac.attlocal.net")
+    monkeypatch.setattr(ssh, "_mac_hostnames", lambda: {"Michaels-MacBook-Pro"})
+
+    assert ssh.is_local_host("Michaels-MacBook-Pro")
+    assert ssh.is_local_host("michaels-macbook-pro.local")
+    assert ssh.is_local_host("Mac")
+    assert ssh.is_local_host("mac.attlocal.net")
+    assert not ssh.is_local_host("gem5.local")
+    assert ssh.preferred_local_hostname() == "Michaels-MacBook-Pro"
+
+
 def test_runner_for_picks_the_transport():
     from workflow.deploy.ssh import LocalRunner, SshRunner, runner_for
 
