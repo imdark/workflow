@@ -65,6 +65,8 @@ class Job:
     title: str = ""
     tools: list = None
     max_steps: int = 8
+    # Stop the run once it has spent this much (USD); None for no cap.
+    max_cost_usd: Optional[float] = None
     # How to run it, as the server says (system prompt, allowed tools, tool
     # timeout); the constants below stand in for an older server's jobs.
     profile: Optional[dict] = None
@@ -81,6 +83,7 @@ class Job:
             title=payload.get("title") or "",
             tools=payload.get("tools") or [],
             max_steps=int(payload.get("maxSteps") or 8),
+            max_cost_usd=float(payload["maxCostUsd"]) if payload.get("maxCostUsd") else None,
             profile=payload.get("profile") or None,
         )
 
@@ -475,6 +478,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         "--permission-prompt-tool", "mcp__run__approve",
         *(["--plugin-dir", str(plugin_dir)] if plugin_dir else []),
         *(["--plugin-dir", str(skills_dir)] if skills_dir else []),
+        *(["--max-budget-usd", f"{job.max_cost_usd:g}"] if job.max_cost_usd else []),
         # No --max-turns: Claude Code counts every tool call as a turn, so an
         # agent's step limit (sized for the in-tab loop) ended real work a
         # couple of dozen calls in. The run's time limit bounds it instead.
@@ -803,10 +807,29 @@ def _watch(job: Job, job_dir: Path, timeout: Optional[int],
     except (OSError, json.JSONDecodeError):
         outcome = {"result": None, "steps": 1,
                    "error": "the run ended without writing a result"}
+    usage = _usage(outcome)
     if outcome.get("error") or outcome.get("result") is None:
-        raise RuntimeError(outcome.get("error") or "the run produced no result")
+        raise RunFailed(outcome.get("error") or "the run produced no result", usage)
     return {"result": outcome["result"], "steps": int(outcome.get("steps") or 1),
-            "session": session}
+            "session": session, "usage": usage}
+
+
+class RunFailed(RuntimeError):
+    """A run that ended in an error, with what it spent getting there."""
+
+    def __init__(self, message: str, usage: dict):
+        super().__init__(message)
+        self.usage = usage
+
+
+def _usage(outcome: dict) -> dict:
+    """What a run cost, as report fields; empty when the provider didn't say."""
+    usage = {}
+    if isinstance(outcome.get("costUsd"), (int, float)):
+        usage["costUsd"] = outcome["costUsd"]
+    if isinstance(outcome.get("tokens"), int):
+        usage["tokens"] = outcome["tokens"]
+    return usage
 
 
 class _Reporter:
@@ -852,7 +875,7 @@ def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
         outcome = run_job(job, config, on_tick=reporter,
                           use_tmux=session is not None, client=client)
         client.report(job.id, status="done", result=outcome["result"],
-                      steps=outcome["steps"],
+                      steps=outcome["steps"], **outcome.get("usage", {}),
                       **({"logAppend": reporter.pending} if reporter.pending else {}))
         emit("done", job)
         return True
@@ -861,6 +884,7 @@ def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
     except Exception as e:
         try:
             client.report(job.id, status="error", error=str(e)[:2000],
+                          **(e.usage if isinstance(e, RunFailed) else {}),
                           **({"logAppend": reporter.pending} if reporter.pending else {}))
         except NotesGraphError:
             pass
