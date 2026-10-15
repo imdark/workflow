@@ -425,6 +425,16 @@ def profile_skills_plugin(job: Job, job_dir: Path) -> Optional[Path]:
     return root
 
 
+def steer_settings(mcp_path: Path) -> str:
+    """Claude Code settings (for --settings) whose hooks hand the agent what
+    the person sends the run from NotesGraph while it works: after each tool
+    call, and when it is about to stop. See steer_hook.py."""
+    command = " ".join(shlex.quote(part) for part in
+                       (sys.executable, "-m", "workflow.deploy.steer_hook", str(mcp_path)))
+    hook = [{"hooks": [{"type": "command", "command": command, "timeout": 30}]}]
+    return json.dumps({"hooks": {"PostToolUse": hook, "Stop": hook}})
+
+
 def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                      client: "JobClient", plugin_dir: Optional[Path] = None,
                      extra_mcp: Optional[dict] = None,
@@ -476,6 +486,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         # the prompt that follows it.
         f"--allowedTools={','.join(allowed)}",
         "--permission-prompt-tool", "mcp__run__approve",
+        "--settings", steer_settings(mcp_path),
         *(["--plugin-dir", str(plugin_dir)] if plugin_dir else []),
         *(["--plugin-dir", str(skills_dir)] if skills_dir else []),
         *(["--max-budget-usd", f"{job.max_cost_usd:g}"] if job.max_cost_usd else []),
