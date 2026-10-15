@@ -34,6 +34,7 @@ class FakeInventory:
         self.asked = []
         self.titles = []
         self.answers = []
+        self.steers = []  # instructions sent to the run, not yet taken
         self.polls = 0
         inventory = self
 
@@ -52,6 +53,10 @@ class FakeInventory:
             def do_POST(self):
                 assert self.headers["Authorization"] == "Bearer pat"
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path.endswith("/steer/take"):
+                    taken, inventory.steers = inventory.steers, []
+                    self._send({"steers": taken, "jobStatus": inventory.job_status})
+                    return
                 if self.path.endswith("/title"):
                     inventory.titles.append((self.path, body))
                     self._send({"job": {"id": "job-1", "title": body["title"]}})
@@ -160,6 +165,59 @@ def test_set_title_renames_the_job_without_waiting(inventory):
     assert inv.titles == [("/api/registry/workspaces/ws-1/jobs/job-1/title",
                            {"title": "Pick a show to watch with Cosmo"})]
     assert inv.asked == [], "naming the run is not a question"
+
+
+def test_the_runs_tools_hand_over_instructions_sent_meanwhile(inventory):
+    inv = inventory(answer="My son, 7")
+    inv.steers = [{"id": "s1", "text": "Use the staging DB", "createdAt": 1}]
+    result = agent_mcp.call_tool(inv.questions(), "ask_user", {"question": "Who is Cosmo?"})
+    assert result_text(result) == (
+        "My son, 7\n\nThe user sent a new instruction while you were working: "
+        "Use the staging DB\nTake it into account from here on.")
+    # Each goes once.
+    result = agent_mcp.call_tool(inv.questions(), "set_title", {"title": "Shows"})
+    assert result_text(result) == "Run renamed to: Shows"
+
+
+def test_steer_hook_puts_instructions_to_the_model(inventory, tmp_path):
+    from io import StringIO
+
+    from workflow.deploy import steer_hook
+
+    inv = inventory()
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text(json.dumps({"mcpServers": {"run": {"env": {
+        "NG_URL": inv.url, "NG_WORKSPACE": "ws-1", "NG_JOB": "job-1", "NG_TOKEN": "pat"}}}}))
+
+    def run(event, steers):
+        inv.steers = steers
+        out = StringIO()
+        assert steer_hook.main([str(mcp)], StringIO(json.dumps({"hook_event_name": event})), out) == 0
+        return json.loads(out.getvalue()) if out.getvalue() else None
+
+    assert run("PostToolUse", []) is None
+    after_tool = run("PostToolUse", [{"text": "Skip tests"}, {"text": "Open a draft PR"}])
+    context = after_tool["hookSpecificOutput"]
+    assert context["hookEventName"] == "PostToolUse"
+    assert "- Skip tests\n- Open a draft PR" in context["additionalContext"]
+    # Sent as it wraps up: back to work rather than stopping.
+    assert run("Stop", [{"text": "Also update the README"}])["decision"] == "block"
+    assert run("Stop", []) is None
+
+
+def test_steer_hook_never_fails_the_run(tmp_path):
+    from io import StringIO
+
+    from workflow.deploy import steer_hook
+
+    out = StringIO()
+    # No config, then one pointing at nothing listening.
+    assert steer_hook.main([str(tmp_path / "missing.json")], StringIO(""), out) == 0
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text(json.dumps({"mcpServers": {"run": {"env": {
+        "NG_URL": "http://127.0.0.1:1", "NG_WORKSPACE": "w", "NG_JOB": "j", "NG_TOKEN": "t"}}}}))
+    assert steer_hook.main([str(mcp)], StringIO("not json"), out) == 0
+    assert out.getvalue() == ""
 
 
 def test_set_title_needs_a_title(inventory):
@@ -454,6 +512,14 @@ def test_claude_code_gets_notesgraph_and_a_way_to_ask(tmp_path):
     assert config["run"]["env"]["NG_JOB"] == "job-1234abcd"
     # It holds the token: owner-only.
     assert stat.S_IMODE((tmp_path / "mcp.json").stat().st_mode) == 0o600
+
+    # Steering: hooks that read the run's connection from that file, so the
+    # token stays off the command line.
+    hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
+    assert set(hooks) == {"PostToolUse", "Stop"}
+    command = hooks["PostToolUse"][0]["hooks"][0]["command"]
+    assert "workflow.deploy.steer_hook" in command and str(tmp_path / "mcp.json") in command
+    assert "Bearer" not in argv[argv.index("--settings") + 1]
 
 
 class FakeOmniSeek:
