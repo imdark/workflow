@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from workflow.deploy.notes import NotesReader
 from workflow.deploy.registry.notesgraph import NotesGraphError, load_token
 
 # How long a claim is held before another runner may take the job. Renewed
@@ -65,6 +66,8 @@ class Job:
     title: str = ""
     tools: list = None
     max_steps: int = 8
+    # Stop the run once it has spent this much (USD); None for no cap.
+    max_cost_usd: Optional[float] = None
     # How to run it, as the server says (system prompt, allowed tools, tool
     # timeout); the constants below stand in for an older server's jobs.
     profile: Optional[dict] = None
@@ -81,6 +84,7 @@ class Job:
             title=payload.get("title") or "",
             tools=payload.get("tools") or [],
             max_steps=int(payload.get("maxSteps") or 8),
+            max_cost_usd=float(payload["maxCostUsd"]) if payload.get("maxCostUsd") else None,
             profile=payload.get("profile") or None,
         )
 
@@ -315,6 +319,50 @@ CLAUDE_CODE_ALLOWED_TOOLS = [
 # question waits for a person, who may be at dinner.
 ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
+# The conventions above (where facts go, how they are dated, the task status
+# workflow) are fixed in code. A note of this title in the workspace is the
+# user's own rulebook on top: where research notes go, naming, tags. Every
+# Claude run reads it at start, so a convention changes with an edit to the
+# note rather than a deploy.
+AGENT_RULES_TITLE = "Agent rules"
+# A rulebook that long is a mistake, not rules; the rest is cut rather than
+# crowding out the task.
+AGENT_RULES_MAX_CHARS = 20_000
+AGENT_RULES_PROMPT = """\
+The user keeps their own rules for agent runs in a note titled "{title}" in
+NotesGraph. Follow them. Where they disagree with the conventions above, the
+note wins. The note, as it is now:
+
+{rules}
+"""
+
+
+def load_agent_rules(client: "JobClient") -> str:
+    """The user's "Agent rules" note, or "" when there is none.
+
+    Never fails the run: a server without the MCP endpoint, a bad token or
+    an outage just means the run goes without the note, as runs did before.
+    """
+    try:
+        reader = NotesReader(url=client.url, workspace=client.workspace, token=client.token)
+        note = reader.find(AGENT_RULES_TITLE)
+        if not note:
+            return ""
+        rules = reader.read(note["docId"]).strip()
+    except (NotesGraphError, ValueError, KeyError, TypeError):
+        return ""
+    if len(rules) > AGENT_RULES_MAX_CHARS:
+        rules = rules[:AGENT_RULES_MAX_CHARS].rstrip() + "\n[cut: the note goes on]"
+    return rules
+
+
+def with_agent_rules(system_prompt: str, rules: str) -> str:
+    """The system prompt with the user's rules appended, when there are any."""
+    if not rules.strip():
+        return system_prompt
+    return (system_prompt.rstrip("\n") + "\n\n"
+            + AGENT_RULES_PROMPT.format(title=AGENT_RULES_TITLE, rules=rules.strip()))
+
 # Added to CLAUDE_CODE_SYSTEM_PROMPT for a research job. The method follows
 # OmniSeek's own investigate skill: sweep wide, zoom in, then structure.
 RESEARCH_SYSTEM_PROMPT = """\
@@ -376,7 +424,7 @@ def omniseek_endpoint(config: dict) -> tuple:
 
 
 def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
-                  config: dict) -> tuple:
+                  config: dict, rules: str = "") -> tuple:
     """Claude Code as for a claude-code job, with OmniSeek's tools added."""
     url, token = omniseek_endpoint(config)
     return claude_code_argv(
@@ -388,6 +436,7 @@ def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
         }},
         extra_allowed=RESEARCH_ALLOWED_TOOLS,
         extra_prompt=RESEARCH_SYSTEM_PROMPT,
+        rules=rules,
     )
 
 
@@ -422,11 +471,21 @@ def profile_skills_plugin(job: Job, job_dir: Path) -> Optional[Path]:
     return root
 
 
+def steer_settings(mcp_path: Path) -> str:
+    """Claude Code settings (for --settings) whose hooks hand the agent what
+    the person sends the run from NotesGraph while it works: after each tool
+    call, and when it is about to stop. See steer_hook.py."""
+    command = " ".join(shlex.quote(part) for part in
+                       (sys.executable, "-m", "workflow.deploy.steer_hook", str(mcp_path)))
+    hook = [{"hooks": [{"type": "command", "command": command, "timeout": 30}]}]
+    return json.dumps({"hooks": {"PostToolUse": hook, "Stop": hook}})
+
+
 def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                      client: "JobClient", plugin_dir: Optional[Path] = None,
                      extra_mcp: Optional[dict] = None,
                      extra_allowed: Optional[list] = None,
-                     extra_prompt: str = "") -> tuple:
+                     extra_prompt: str = "", rules: str = "") -> tuple:
     """Claude Code with NotesGraph's tools and a way to ask the user.
 
     Returns (argv, env). The MCP config carries the NotesGraph token, so it
@@ -434,6 +493,8 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     `plugin_dir` carries the task's wf skills, as `wf ai` passes them.
     `extra_mcp`, `extra_allowed` and `extra_prompt` add MCP servers,
     pre-approved tools and system prompt for a variant (see research_argv).
+    `rules` is the user's "Agent rules" note (see load_agent_rules); it goes
+    on the end of the system prompt, the server's or the built-in one alike.
     """
     mcp_path = job_dir / "mcp.json"
     mcp_config = {"mcpServers": {
@@ -460,8 +521,8 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     # The server's profile for the job's model is the whole agent: its prompt
     # already has the research part, its tools the research ones.
     profile = job.profile or {}
-    system_prompt = profile.get("systemPrompt") or (
-        CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else ""))
+    system_prompt = with_agent_rules(profile.get("systemPrompt") or (
+        CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else "")), rules)
     allowed = profile.get("allowedTools") or [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])]
     tool_timeout = int(profile.get("toolTimeoutMs") or ASK_TIMEOUT_MS)
     skills_dir = profile_skills_plugin(job, job_dir)
@@ -473,8 +534,10 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         # the prompt that follows it.
         f"--allowedTools={','.join(allowed)}",
         "--permission-prompt-tool", "mcp__run__approve",
+        "--settings", steer_settings(mcp_path),
         *(["--plugin-dir", str(plugin_dir)] if plugin_dir else []),
         *(["--plugin-dir", str(skills_dir)] if skills_dir else []),
+        *(["--max-budget-usd", f"{job.max_cost_usd:g}"] if job.max_cost_usd else []),
         # No --max-turns: Claude Code counts every tool call as a turn, so an
         # agent's step limit (sized for the in-tab loop) ended real work a
         # couple of dozen calls in. The run's time limit bounds it instead.
@@ -699,16 +762,18 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     env: dict = {}
     workdir: Optional[Path] = None
     issue = repo_path = None
+    rules = ""
     with _SETUP_LOCK:
         if job.model in CLAUDE_MODELS:
             if client is None:
                 raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
             provider = job.model
+            rules = load_agent_rules(client)
         if job.model == CLAUDE_CODE_MODEL:
-            argv, env = claude_code_argv(job, _prompt(job), job_dir, client)
+            argv, env = claude_code_argv(job, _prompt(job), job_dir, client, rules=rules)
             workdir = job_workdir(job_dir, cwd or Path.cwd())
         elif job.model == RESEARCH_MODEL:
-            argv, env = research_argv(job, _prompt(job), job_dir, client, config)
+            argv, env = research_argv(job, _prompt(job), job_dir, client, config, rules=rules)
             # Research reads the world, not a repo: the job directory, no worktree.
             workdir = job_dir
         elif job.model == COMMAND_MODEL:
@@ -724,7 +789,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
                                            Path.home() / ".wf" / "tasks" / issue.key.lower(),
                                            repo_path)
             argv, env = claude_code_argv(job, _job_context(issue, job, workdir),
-                                         job_dir, client, plugin_dir)
+                                         job_dir, client, plugin_dir, rules=rules)
             # Same Claude account and capture proxy as `wf ai`.
             env.update(apply_claude_env(dict(os.environ)))
         else:
@@ -803,10 +868,29 @@ def _watch(job: Job, job_dir: Path, timeout: Optional[int],
     except (OSError, json.JSONDecodeError):
         outcome = {"result": None, "steps": 1,
                    "error": "the run ended without writing a result"}
+    usage = _usage(outcome)
     if outcome.get("error") or outcome.get("result") is None:
-        raise RuntimeError(outcome.get("error") or "the run produced no result")
+        raise RunFailed(outcome.get("error") or "the run produced no result", usage)
     return {"result": outcome["result"], "steps": int(outcome.get("steps") or 1),
-            "session": session}
+            "session": session, "usage": usage}
+
+
+class RunFailed(RuntimeError):
+    """A run that ended in an error, with what it spent getting there."""
+
+    def __init__(self, message: str, usage: dict):
+        super().__init__(message)
+        self.usage = usage
+
+
+def _usage(outcome: dict) -> dict:
+    """What a run cost, as report fields; empty when the provider didn't say."""
+    usage = {}
+    if isinstance(outcome.get("costUsd"), (int, float)):
+        usage["costUsd"] = outcome["costUsd"]
+    if isinstance(outcome.get("tokens"), int):
+        usage["tokens"] = outcome["tokens"]
+    return usage
 
 
 class _Reporter:
@@ -852,7 +936,7 @@ def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
         outcome = run_job(job, config, on_tick=reporter,
                           use_tmux=session is not None, client=client)
         client.report(job.id, status="done", result=outcome["result"],
-                      steps=outcome["steps"],
+                      steps=outcome["steps"], **outcome.get("usage", {}),
                       **({"logAppend": reporter.pending} if reporter.pending else {}))
         emit("done", job)
         return True
@@ -861,6 +945,7 @@ def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
     except Exception as e:
         try:
             client.report(job.id, status="error", error=str(e)[:2000],
+                          **(e.usage if isinstance(e, RunFailed) else {}),
                           **({"logAppend": reporter.pending} if reporter.pending else {}))
         except NotesGraphError:
             pass

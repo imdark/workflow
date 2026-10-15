@@ -281,6 +281,16 @@ class Questions:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
 
+    def take_steers(self) -> list:
+        """The instructions sent to the run since the last take, each once.
+
+        Empty when the server can't be reached: they wait there for the
+        next step, and a failed read is no reason to stop the run."""
+        try:
+            return self._request("POST", f"{self.job_url}/steer/take", {}).get("steers") or []
+        except (urllib.error.URLError, OSError, ValueError):
+            return []
+
     def set_title(self, title: str) -> str:
         """Rename the job; returns the title the server kept."""
         self.title = self._request("POST", f"{self.job_url}/title", {"title": title})["job"]["title"]
@@ -348,10 +358,31 @@ class Questions:
             notify("Could not send your answer", self.title, "Answer it in NotesGraph instead.")
 
 
+def steer_note(steers: list) -> str:
+    """How instructions sent mid-run are put to the model (the cloud runner's
+    run-tools.ts steerNote words them alike)."""
+    texts = [str(s.get("text") or "").strip() for s in steers]
+    texts = [t for t in texts if t]
+    if not texts:
+        return ""
+    if len(texts) == 1:
+        return (f"The user sent a new instruction while you were working: {texts[0]}\n"
+                "Take it into account from here on.")
+    return ("The user sent new instructions while you were working:\n"
+            + "\n".join(f"- {t}" for t in texts)
+            + "\nTake them into account from here on.")
+
+
 def call_tool(questions: Questions, name: str, args: dict) -> dict:
     """Run one tool; returns an MCP tools/call result."""
     def text(value: str, error: bool = False) -> dict:
         return {"content": [{"type": "text", "text": value}], "isError": error}
+
+    def with_steers(value: str) -> dict:
+        # The PostToolUse hook (steer_hook.py) delivers these too; whichever
+        # takes them first does, as the server hands each out once.
+        note = steer_note(questions.take_steers())
+        return text(f"{value}\n\n{note}" if note else value)
 
     try:
         if name == "ask_user":
@@ -361,7 +392,7 @@ def call_tool(questions: Questions, name: str, args: dict) -> dict:
             options = args.get("options")
             options = [str(o).strip() for o in options if str(o).strip()] if isinstance(options, list) else []
             answer = questions.ask("question", asked, options=options)
-            return text(answer.get("answer") or "")
+            return with_steers(answer.get("answer") or "")
 
         if name == "set_title":
             title = " ".join(str(args.get("title") or "").split())
@@ -373,7 +404,7 @@ def call_tool(questions: Questions, name: str, args: dict) -> dict:
                 # A server from before run titles: the run keeps its block's
                 # text, which is no reason to stop the task.
                 return text(f"Could not rename the run ({e.code}); carry on.", error=True)
-            return text(f"Run renamed to: {kept}")
+            return with_steers(f"Run renamed to: {kept}")
 
         if name == "approve":
             tool = str(args.get("tool_name") or "a tool")

@@ -444,6 +444,43 @@ wf agent jobs               # recent jobs and their outcomes
 usually needs no arguments. Ctrl-C stops it; a job already running is left to
 finish, and its lease lapses if the process dies.
 
+## The "Agent rules" note
+
+The conventions a Claude run follows (facts go under "Agent memory", every
+fact is dated, the task status workflow) are fixed in the system prompt. A
+note titled **Agent rules** in the workspace is the user's own rulebook on
+top of them: where research notes go, how notes are named, which tags to
+use, folders to leave alone. The runner reads it over the workspace's MCP
+endpoint when a job starts and appends it to the system prompt, after
+whatever the server's profile sent, so a convention changes with an edit to
+the note and no deploy. No note, or a server without the endpoint, means the
+run goes without it. A note past 20,000 characters is cut there.
+
+## Skills written as notes
+
+```bash
+wf skill from-notes              # every "Skill: <name>" note → .claude/skills/<name>/SKILL.md
+wf skill from-notes deploy-to-prod
+wf skill from-notes --list       # which skill notes exist, without writing
+wf skill from-notes --dir claude/skills
+```
+
+A runbook kept in NotesGraph as a note titled `Skill: Deploy to prod` becomes
+the Claude Code skill `deploy-to-prod`, with the frontmatter Claude Code
+wants and the note's first paragraph as its description. The note is the
+source: the file says so in a comment, and running the command again
+rewrites a file whose note changed and leaves the rest alone.
+
+Two skills for NotesGraph agents live in this repo under `claude/skills/`,
+for the agent profile catalog to point at by URL:
+
+- `compile-into-notes`: fold a clipped or imported source into the graph (a
+  summary note, facts appended to the concept notes it touches, missing ones
+  created and linked).
+- `notes-health-check`: a lint of the workspace (orphans, dangling links,
+  near-duplicates, stale facts, contradictions) written as a report note of
+  to-dos; it changes nothing itself.
+
 ## Rules worth knowing
 
 **Registering a device is not consent to run code on it.** Enqueue checks

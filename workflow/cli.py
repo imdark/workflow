@@ -2498,6 +2498,21 @@ def skill_usage_cmd():
         typer.echo(f"   {n:>5}  {name}" + ("  (never loaded)" if not n else ""))
 
 
+@skill_app.command("from-notes")
+def skill_from_notes(
+    names: List[str] = typer.Argument(None, help="Only these skills (by name or note title); default: all"),
+    dest: Path = typer.Option(None, "--dir", help="Where to write <name>/SKILL.md (default: the repo's .claude/skills)"),
+    list_only: bool = typer.Option(False, "--list", help="Show the skill notes and write nothing"),
+):
+    """Write NotesGraph notes titled "Skill: <name>" as Claude Code SKILL.md files.
+
+    The note stays the source: edit it and run this again, and the file
+    follows. Needs deploy.notesgraph.workspace and 'wf deploy notes-login'.
+    """
+    from workflow.notes_skills import run_from_notes
+    raise typer.Exit(run_from_notes(names or [], dest, list_only, echo=typer.echo))
+
+
 @app.command()
 def start(
     task: str = typer.Argument(

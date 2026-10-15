@@ -218,7 +218,8 @@ def test_a_run_narrates_its_transcript_and_returns_the_result(fake_provider):
                       on_tick=lambda text: ticks.append(text) or False,
                       tick_seconds=0.05)
 
-    assert outcome == {"result": "It is a notes app.", "steps": 2, "session": None}
+    assert outcome == {"result": "It is a notes app.", "steps": 2, "session": None,
+                       "usage": {"costUsd": 0.0123}}
     transcript = "".join(ticks)
     assert "▶ started · model fake-1" in transcript
     assert '→ Read  {"file_path": "README.md"}' in transcript
@@ -468,3 +469,57 @@ def test_a_job_payload_keeps_its_title():
     job = _Job.from_payload({"id": "j", "instructions": LOOP, "title": "Fix the toolbar"})
     assert job.title == "Fix the toolbar"
     assert _Job.from_payload({"id": "j"}).title == ""
+
+
+def test_a_run_reports_what_it_cost_and_its_cap_reaches_claude(tmp_path):
+    from workflow.deploy.jobs import JobClient, _run_claimed, claude_code_argv
+
+    job = Job.from_payload({**payload(), "maxCostUsd": 2.5})
+    client = JobClient("http://ng", "ws-1", token="t")
+    argv, _ = claude_code_argv(job, "go", tmp_path, client)
+    assert argv[argv.index("--max-budget-usd") + 1] == "2.5"
+    plain, _ = claude_code_argv(Job.from_payload(payload()), "go", tmp_path, client)
+    assert "--max-budget-usd" not in plain
+
+    reports = []
+
+    class Client:
+        def report(self, job_id, **fields):
+            reports.append(fields)
+            return {}
+
+    import workflow.deploy.jobs as jobs
+    original = jobs.run_job
+    try:
+        jobs.run_job = lambda *a, **k: {"result": "ok", "steps": 3, "session": None,
+                                        "usage": {"costUsd": 0.42, "tokens": 1200}}
+        assert _run_claimed(Client(), job, {}, lambda *a: None)
+
+        def capped(*a, **k):
+            raise jobs.RunFailed("stopped at its cost cap ($2.51 spent)", {"costUsd": 2.51})
+        jobs.run_job = capped
+        assert not _run_claimed(Client(), job, {}, lambda *a: None)
+    finally:
+        jobs.run_job = original
+    assert reports[0] == {"status": "done", "result": "ok", "steps": 3,
+                          "costUsd": 0.42, "tokens": 1200}
+    assert reports[1]["status"] == "error"
+    assert reports[1]["costUsd"] == 2.51
+
+
+def test_the_narrator_counts_tokens_and_names_the_cost_cap():
+    import io
+    from workflow.deploy.job_exec import Narrator
+
+    out = io.StringIO()
+    narrator = Narrator(out, io.StringIO())
+    narrator.feed(json.dumps({
+        "type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+        "num_turns": 9, "total_cost_usd": 2.013,
+        "modelUsage": {"m": {"inputTokens": 10, "outputTokens": 5,
+                             "cacheReadInputTokens": 100, "cacheCreationInputTokens": 1}},
+    }))
+    narrator.finish()
+    assert narrator.tokens == 116
+    assert narrator.error == "stopped at its cost cap ($2.01 spent)"
+    assert "✗ failed after 9 turns · $2.0130: stopped at its cost cap" in out.getvalue()

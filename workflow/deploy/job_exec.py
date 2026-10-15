@@ -12,7 +12,8 @@ Files in <job-dir>:
     cmd.json     written by the runner: {"argv": [...], "provider": "...",
                  "env": {...extra environment}, "cwd": "where to run" | null}
     log.txt      the transcript, appended as the run goes
-    result.json  {"result": str, "steps": int, "error": str|null}
+    result.json  {"result": str, "steps": int, "error": str|null,
+                  "costUsd": float|null, "tokens": int|null}
     exit_code    written last; its presence means the run is over
 """
 
@@ -62,6 +63,7 @@ class Narrator:
         self.error: Optional[str] = None
         self.steps = 0
         self.cost: Optional[float] = None
+        self.tokens: Optional[int] = None
         self.started = False
         self.plain: list = []
 
@@ -123,9 +125,20 @@ class Narrator:
             self.steps = int(event.get("num_turns") or self.steps)
             cost = event.get("total_cost_usd")
             self.cost = cost if isinstance(cost, (int, float)) else self.cost
+            # modelUsage covers subagents too; `usage` is the main loop only.
+            usage = [u for u in (event.get("modelUsage") or {}).values() if isinstance(u, dict)]
+            if usage:
+                self.tokens = sum(
+                    int(u.get(key) or 0) for u in usage
+                    for key in ("inputTokens", "outputTokens",
+                                "cacheReadInputTokens", "cacheCreationInputTokens"))
             if event.get("is_error") or event.get("subtype") != "success":
                 self.result = None
-                self.error = str(event.get("result") or event.get("subtype") or "failed")
+                if event.get("subtype") == "error_max_budget_usd":
+                    spent = f"${self.cost:.2f}" if self.cost is not None else "$?"
+                    self.error = f"stopped at its cost cap ({spent} spent)"
+                else:
+                    self.error = str(event.get("result") or event.get("subtype") or "failed")
             else:
                 self.result, self.error = str(event.get("result") or ""), None
 
@@ -177,7 +190,8 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
                      or f"{argv[0]} exited {code}")
 
     (job_dir / "result.json").write_text(json.dumps(
-        {"result": result, "steps": max(1, narrator.steps), "error": error}))
+        {"result": result, "steps": max(1, narrator.steps), "error": error,
+         "costUsd": narrator.cost, "tokens": narrator.tokens}))
     # Written last, and by rename, so the runner never sees a partial file.
     tmp = job_dir / "exit_code.tmp"
     tmp.write_text(str(code))
