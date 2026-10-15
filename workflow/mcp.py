@@ -26,6 +26,47 @@ def get_current_task_info() -> str:
     return "No current task set"
 
 
+def _task_key_or_current(task_key):
+    if task_key:
+        return task_key
+    task = get_current_task()
+    return getattr(task, "key", None)
+
+
+@mcp.tool()
+def search_task_facts(
+    query: Annotated[str, "Words the fact must contain; empty lists every fact"] = "",
+    task_key: Annotated[str, "Task key (optional, defaults to the current task)"] = None,
+    limit: Annotated[int, "Maximum facts to return"] = 20,
+) -> str:
+    """Search durable facts (decisions, constraints, preferences) recorded for a task"""
+    from workflow.recall import search_facts
+    try:
+        hits = search_facts(query, _task_key_or_current(task_key), limit=limit)
+    except Exception as e:
+        return f"Error: {str(e)}"
+    if not hits:
+        return "No matching facts"
+    return json.dumps(hits, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def search_past_conversations(
+    query: Annotated[str, "Text to search for"],
+    task_key: Annotated[str, "Restrict to one task (optional; omit to search every task)"] = None,
+    limit: Annotated[int, "Maximum hits to return"] = 10,
+) -> str:
+    """Full-text search over earlier captured agent sessions"""
+    from workflow.recall import search_conversations
+    try:
+        hits = search_conversations(query, task_key, limit=limit)
+    except Exception as e:
+        return f"Error: {str(e)}"
+    if not hits:
+        return f"No matches for '{query}'"
+    return json.dumps(hits, indent=2, ensure_ascii=False)
+
+
 @mcp.tool()
 def list_configured_projects() -> str:
     """List all configured projects"""
