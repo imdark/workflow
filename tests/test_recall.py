@@ -21,6 +21,7 @@ def store(tmp_path):
 @pytest.fixture(autouse=True)
 def no_legacy_memory(tmp_path, monkeypatch):
     monkeypatch.setattr("workflow.memory.ROOT", tmp_path / "memory")
+    monkeypatch.setattr(recall, "USAGE_FILE", tmp_path / "usage.json")
 
 
 def _facts(store, task, *contents):
@@ -127,7 +128,7 @@ def test_search_conversations_returns_snippets(store):
 def test_build_context_uses_memory_block_not_dead_rag_text(monkeypatch):
     from workflow import ai_context
 
-    monkeypatch.setattr(ai_context, "memory_block", lambda key: f'<wf-memory task="{key}">x</wf-memory>')
+    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None: f'<wf-memory task="{key}">x</wf-memory>')
     monkeypatch.setattr(ai_context, "get_rag", lambda: None)
     monkeypatch.setattr(ai_context, "get_ai_instructions", lambda issue, repo: [])
     issue = SimpleNamespace(key="T-1", title="t", description="d")
@@ -137,3 +138,36 @@ def test_build_context_uses_memory_block_not_dead_rag_text(monkeypatch):
     assert '<wf-memory task="T-1">x</wf-memory>' in context
     assert "RAG system" not in context
     assert "search_past_conversations" in context
+
+
+def test_injected_and_searched_facts_are_counted(store):
+    _facts(store, "T-1", "Deploy runs on the Mac agent", "Tests use a fake upstream")
+
+    recall.memory_block("T-1", store=store)
+    recall.search_facts("mac", "T-1", store=store)
+
+    counts = recall.load_usage()["fact"]
+    assert counts[recall.fact_id("Deploy runs on the Mac agent")]["count"] == 2
+    assert counts[recall.fact_id("Tests use a fake upstream")]["count"] == 1
+
+
+def test_most_read_facts_rank_first(store):
+    _facts(store, "T-1", "rarely read", "often read")
+    recall.record_usage("fact", [recall.fact_id("often read")])
+
+    hits = recall.search_facts("", "T-1", store=store)
+
+    assert [f["content"] for f in hits] == ["often read", "rarely read"]
+
+
+def test_block_carries_project_decisions_from_other_tasks(store):
+    for sid, task, project in (("a", "T-2", "web"), ("b", "T-3", "other")):
+        store.ensure_session(SessionMeta(session_id=sid, task_key=task, project=project))
+    _facts(store, "T-1", "mine")
+    _facts(store, "T-2", "Use sqlite, not redis")
+    _facts(store, "T-3", "unrelated project decision")
+
+    block = recall.memory_block("T-1", store=store, project="web")
+
+    assert "FROM OTHER TASKS IN web:\n- (decision, T-2) Use sqlite, not redis" in block
+    assert "unrelated project decision" not in block

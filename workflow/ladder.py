@@ -278,8 +278,8 @@ def _known_facts(store, task_key: Optional[str]) -> list:
     return out
 
 
-def _parse_facts(raw: str) -> list:
-    """Parse a fact array, tolerating fenced or prose-wrapped model output."""
+def _parse_json_array(raw: str) -> list:
+    """Parse a JSON array, tolerating fenced or prose-wrapped model output."""
     text = raw.strip()
     fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
     if fence:
@@ -294,11 +294,12 @@ def _parse_facts(raw: str) -> list:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         return []
-    if not isinstance(parsed, list):
-        return []
+    return parsed if isinstance(parsed, list) else []
 
+
+def _parse_facts(raw: str) -> list:
     facts = []
-    for item in parsed:
+    for item in _parse_json_array(raw):
         if not isinstance(item, dict):
             continue
         content = str(item.get("content") or "").strip()
