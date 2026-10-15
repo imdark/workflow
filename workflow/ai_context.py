@@ -1,4 +1,4 @@
-from workflow.memory import load_memory
+from workflow.recall import memory_block
 from workflow.git_utils import get_repo
 from workflow.rag import get_rag
 from workflow.config import load_config
@@ -114,21 +114,14 @@ DESCRIPTION:
 RELEVANT PROJECT CONTEXT:
 {format_retrieved_context(relevant_chunks)}
 """)
-    else:
-        # Get a minimal initial context
-        context_parts.append("""
-PROJECT CONTEXT:
-You have access to a RAG system with project information. Ask for specific details about:
-- project structure, files, dependencies, commands, testing, patterns, etc.
-The system will retrieve relevant context based on your questions.
-""")
-    
-    # Add memory summary (not full session - use summary only)
-    mem = load_memory(issue)
-    if mem['summary']:
+
+    # Small, stable memory goes in the prompt; transcripts and the full fact
+    # set stay behind the search_* MCP tools listed below.
+    memory = memory_block(issue.key)
+    if memory:
         context_parts.append(f"""
-MEMORY:
-{mem['summary']}
+MEMORY (from earlier sessions on this task):
+{memory}
 """)
     
     # Agents used to stop once the code worked, leaving the branch unshipped.
@@ -143,6 +136,8 @@ branch, opens a PR and moves the task to Committed. Don't stop before this.
     context_parts.append("""
 AVAILABLE MCP TOOLS:
 You have access to wf-tools MCP server. If Claude Desktop is configured with the wf-tools MCP server, you can use these tools:
+- search_task_facts: Search durable facts (decisions, constraints, preferences) recorded for this task
+- search_past_conversations: Full-text search over earlier captured agent sessions
 - get_current_task_info: Get the current active task
 - list_configured_projects: List all configured projects
 - get_current_project: Get the current active project
@@ -160,7 +155,8 @@ You have access to wf-tools MCP server. If Claude Desktop is configured with the
 - get_config_value: Get a configuration value
 - set_config_value: Set a configuration value
 
-Example usage: Use add_hook to create automation hooks for commands.
+Before redoing an investigation, search past conversations: an earlier
+session may already have the answer.
 """)
     
     return "\n".join(context_parts)
