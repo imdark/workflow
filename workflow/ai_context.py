@@ -117,7 +117,8 @@ RELEVANT PROJECT CONTEXT:
 
     # Small, stable memory goes in the prompt; transcripts and the full fact
     # set stay behind the search_* MCP tools listed below.
-    memory = memory_block(issue.key)
+    from workflow.projects import get_current_project
+    memory = memory_block(issue.key, project=get_current_project())
     if memory:
         context_parts.append(f"""
 MEMORY (from earlier sessions on this task):

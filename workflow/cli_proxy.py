@@ -260,6 +260,66 @@ def mem_rollup(
         console.print(f"No rollup for {task_key} yet. Build one with '--rebuild'.")
 
 
+@mem_app.command("import")
+def mem_import(
+    task: Optional[str] = typer.Option(None, "--task", "-t", help="Only sessions on this task's branch"),
+    root: Optional[str] = typer.Option(None, "--root", help="A projects dir (default: ~/.claude*/projects)"),
+    summarize: bool = typer.Option(False, "--summarize",
+                                   help="Run the ladder over imported sessions (calls the provider)"),
+):
+    """Backfill the store from Claude Code transcripts captured before the proxy.
+
+    Safe to re-run: sessions already in the store only gain turns they lack.
+    """
+    from workflow.mem_import import import_transcripts, transcript_files
+
+    store = _store()
+    files = list(transcript_files([root] if root else None))
+    console.print(f"Reading {len(files)} transcript(s)…")
+    imported = import_transcripts(store, files, task_key=task)
+    if not imported:
+        console.print("✅ Nothing new to import.")
+        return
+
+    for sid, task_key, written in imported:
+        console.print(f"  {sid[:20]:<22} {task_key or '-':<14} +{written} turns")
+    console.print(f"\n📥 Imported {sum(n for *_, n in imported):,} turn(s) "
+                  f"across {len(imported)} session(s)")
+
+    if not summarize:
+        console.print("💡 Re-run with --summarize to extract facts and rollups from them.")
+        return
+    from workflow.ladder import summarize_session
+    config = _config()
+    for sid, _, _ in imported:
+        if summarize_session(sid, store, config):
+            console.print(f"  [green]✓[/green] summarized {sid[:16]}")
+
+
+@mem_app.command("usage")
+def mem_usage(
+    task: Optional[str] = typer.Option(None, "--task", "-t", help="Task key"),
+    unused: bool = typer.Option(False, "--unused", help="Only facts no session has read"),
+):
+    """How often each fact was injected into a prompt or returned by a search."""
+    from workflow.recall import _facts, load_usage
+
+    task_key = task or _current_task_key()
+    if not task_key:
+        console.print("❌ No task specified and no current task set.")
+        raise typer.Exit(1)
+
+    counts = load_usage().get("fact") or {}
+    facts = _facts(_store(), task_key)
+    rows = [((counts.get(f["id"]) or {}).get("count", 0), f) for f in facts
+            if not unused or not counts.get(f["id"])]
+    if not rows:
+        console.print(f"No {'unused ' if unused else ''}facts for {task_key}.")
+        return
+    for n, fact in sorted(rows, key=lambda r: -r[0]):
+        console.print(f"  {n:>4}  [dim]({fact['type']})[/dim] {fact['content']}")
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _current_task_key() -> Optional[str]:

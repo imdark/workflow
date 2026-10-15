@@ -2413,6 +2413,91 @@ def skill_list():
                 typer.echo(f"       {content[:80]}{'...' if len(content) > 80 else ''}")
 
 
+@skill_app.command("propose")
+def skill_propose(
+    task: str = typer.Option(None, "--task", "-t", help="Only look at this task's sessions"),
+    limit: int = typer.Option(5, "--limit", "-l", help="Max drafts to propose"),
+):
+    """Propose skill drafts from procedures repeated across captured sessions"""
+    from workflow.conversation_store import get_store
+    from workflow.projects import get_current_project
+    from workflow.skill_drafts import propose_skills, publish_draft
+
+    cfg = load_effective_config()
+    drafts = propose_skills(get_store(), cfg, task_key=task, limit=limit)
+    if not drafts:
+        typer.echo("ℹ️  No new procedures found (needs 2+ summarized sessions and a provider)")
+        return
+    for draft in drafts:
+        doc_id = publish_draft(draft, get_current_project(), cfg)
+        typer.echo(f"📝 {draft['name']}  {draft['path']}" + (f"  (note {doc_id})" if doc_id else ""))
+    typer.echo("\n💡 Review, then 'wf skill promote <name>' to turn one on.")
+
+
+@skill_app.command("drafts")
+def skill_drafts_list():
+    """List proposed skill drafts and whether they were promoted"""
+    from workflow.skill_drafts import list_drafts
+
+    drafts = list_drafts()
+    if not drafts:
+        typer.echo("No skill drafts. Run 'wf skill propose' to look for some.")
+        return
+    for d in drafts:
+        typer.echo(f"   • {d['name']} [{d.get('status', 'draft')} v{d.get('version', '1')}]"
+                   f"  {d.get('description', '')}")
+
+
+@skill_app.command("promote")
+def skill_promote(
+    name: str = typer.Argument(..., help="Draft name"),
+    project: bool = typer.Option(False, "--project", help="Scope to the current project instead of global"),
+):
+    """Turn a skill draft on, globally or for the current project"""
+    from workflow.projects import get_current_project
+    from workflow.skill_drafts import promote
+
+    scope = get_current_project() if project else None
+    try:
+        promote(name, project=scope)
+    except FileNotFoundError as e:
+        typer.echo(f"❌ {e}")
+        raise typer.Exit(1)
+    typer.echo(f"✅ Promoted '{name}' ({f'project {scope}' if scope else 'global'})")
+
+
+@skill_app.command("export")
+def skill_export(
+    name: str = typer.Argument(..., help="Draft name"),
+    dest: str = typer.Option(".claude/skills", "--dest", help="Skills directory to write into"),
+):
+    """Write a skill draft out as <dest>/<name>/SKILL.md"""
+    from workflow.skill_drafts import export_skill_md
+
+    try:
+        out = export_skill_md(name, Path(dest))
+    except FileNotFoundError:
+        typer.echo(f"❌ No draft named '{name}'")
+        raise typer.Exit(1)
+    typer.echo(f"✅ Wrote {out}")
+
+
+@skill_app.command("usage")
+def skill_usage_cmd():
+    """How often each skill was loaded in captured sessions; unused ones last"""
+    from workflow.conversation_store import get_store
+    from workflow.skill_drafts import _promoted_names, skill_usage
+
+    counts = skill_usage(get_store())
+    for name in _promoted_names(load_config()):
+        counts.setdefault(name, 0)
+    if not counts:
+        typer.echo("No skills configured or loaded yet.")
+        return
+    for name, n in counts.most_common():
+        typer.echo(f"   {n:>5}  {name}" + ("  (never loaded)" if not n else ""))
+
+
 @app.command()
 def start(
     task: str = typer.Argument(
