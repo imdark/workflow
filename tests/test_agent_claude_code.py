@@ -6,6 +6,7 @@ the waiting marker and cancellation are exercised over actual requests.
 """
 
 import json
+import subprocess
 import os
 import stat
 import sys
@@ -527,6 +528,24 @@ def test_claude_code_gets_notesgraph_and_a_way_to_ask(tmp_path):
     command = hooks["PostToolUse"][0]["hooks"][0]["command"]
     assert "workflow.deploy.steer_hook" in command and str(tmp_path / "mcp.json") in command
     assert "Bearer" not in argv[argv.index("--settings") + 1]
+
+
+def test_rules_reach_subagents_and_the_code_map_reaches_the_session(tmp_path):
+    argv, _ = claude_code_argv(job(), "Do it", tmp_path, client(),
+                               rules="Tag tasks #work.", session_context="workflow/x.py: f")
+
+    hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
+    assert set(hooks) == {"PostToolUse", "Stop", "SubagentStart", "SessionStart"}
+    for event, text in (("SubagentStart", "Tag tasks #work."), ("SessionStart", "workflow/x.py: f")):
+        command = hooks[event][0]["hooks"][0]["command"]
+        out = json.loads(subprocess.run(command, shell=True, capture_output=True, text=True).stdout)
+        assert out["hookSpecificOutput"]["hookEventName"] == event
+        assert text in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_no_rules_no_subagent_hook(tmp_path):
+    argv, _ = claude_code_argv(job(), "Do it", tmp_path, client())
+    assert "SubagentStart" not in json.loads(argv[argv.index("--settings") + 1])["hooks"]
 
 
 class FakeOmniSeek:
