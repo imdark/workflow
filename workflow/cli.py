@@ -2514,6 +2514,43 @@ def skill_from_notes(
 
 
 @app.command()
+def bench(
+    tasks: Path = typer.Argument(..., help="Directory of tasks (prompt.md, check.sh, optional files/)"),
+    arm: List[str] = typer.Option(None, "--arm", help="NAME=FILE: a system prompt to compare; repeatable"),
+    agent_rules: bool = typer.Option(False, "--agent-rules", help="Add an arm with the Agent rules note"),
+    runs: int = typer.Option(3, "--runs", help="Runs of each task per arm"),
+    model: str = typer.Option("sonnet", "--model", help="Claude model to run"),
+    out: Path = typer.Option(None, "--out", help="Append each run's result here as JSON lines"),
+):
+    """Run coding tasks headless with and without a prompt (the Agent rules,
+    a skill, an edit to either) and compare checks passed, cost, time and
+    lines written. Every run costs real money: start with --runs 1."""
+    from workflow.rules_bench import run_bench
+    arms = {}
+    for spec in arm or []:
+        name, sep, file = spec.partition("=")
+        if not sep:
+            typer.echo(f"❌ --arm wants NAME=FILE, got {spec!r}")
+            raise typer.Exit(1)
+        arms[name] = Path(file).read_text()
+    if agent_rules or not arms:
+        from workflow.config import load_effective_config
+        from workflow.deploy.jobs import AGENT_RULES_PROMPT, AGENT_RULES_TITLE, load_agent_rules
+        from workflow.deploy.notes import reader_from_config
+        # load_agent_rules wants a JobClient; a reader has the same url/workspace/token.
+        rules = load_agent_rules(reader_from_config(load_effective_config()))
+        if not rules:
+            typer.echo(f"❌ no \"{AGENT_RULES_TITLE}\" note to compare")
+            raise typer.Exit(1)
+        arms["agent-rules"] = AGENT_RULES_PROMPT.format(title=AGENT_RULES_TITLE, rules=rules)
+    try:
+        run_bench(tasks, arms, runs, model, out, echo=typer.echo)
+    except LookupError as e:
+        typer.echo(f"❌ {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
 def debt(
     path: Path = typer.Argument(None, help="Repo to scan (default: the current one)"),
     tag: str = typer.Option("work", "--tag", help="Tag for the tasks: work or personal"),
