@@ -5,7 +5,8 @@
 // Built and started by agent_mcp.py (see `MacQuestion`); it has to go
 // through `open`, as macOS only lets an app LaunchServices started post
 // notifications. Shows the question as a notification; a click opens a
-// dialog with the whole question -- the tool input for a permission, the
+// dialog with the whole question -- the tool input for a permission (a Bash
+// call as its description and its command, see `ToolInput`), the
 // choices for a question, a box to type in -- like the phone's notification
 // pane. The notification itself has quick Allow / Deny or Reply buttons.
 //
@@ -116,7 +117,14 @@ final class Notifier: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     let content = UNMutableNotificationContent()
     content.title = ask.heading
     content.subtitle = ask.title
-    content.body = String(ask.text.prefix(300))
+    var body = ask.text
+    // "Allow Bash?" alone says little: add what it is doing, or the command.
+    if ask.kind == "permission", let input = ask.detail.flatMap(ToolInput.init),
+      let doing = input.description ?? input.command
+    {
+      body += "\n" + doing
+    }
+    content.body = String(body.prefix(300))
     content.categoryIdentifier = ask.kind == "permission" ? "permission" : "question"
     if sound {
       content.sound = UNNotificationSound(named: UNNotificationSoundName("Glass"))
@@ -194,17 +202,12 @@ final class Notifier: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     stack.spacing = 8
 
     if let detail = ask.detail, !detail.isEmpty {
-      let scroll = NSTextView.scrollableTextView()
-      scroll.frame = NSRect(x: 0, y: 0, width: width, height: 180)
-      scroll.borderType = .bezelBorder
-      let textView = scroll.documentView as! NSTextView
-      textView.isEditable = false
-      textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-      textView.string = prettyDetail(detail)
-      scroll.translatesAutoresizingMaskIntoConstraints = false
-      scroll.widthAnchor.constraint(equalToConstant: width).isActive = true
-      scroll.heightAnchor.constraint(equalToConstant: 180).isActive = true
-      stack.addArrangedSubview(scroll)
+      if permission, let input = ToolInput(detail) {
+        input.views(width: width).forEach(stack.addArrangedSubview)
+      } else {
+        stack.addArrangedSubview(
+          textBox(prettyDetail(detail), monospaced: true, width: width, maxHeight: 180))
+      }
     }
 
     let field = NSTextField()
@@ -289,6 +292,132 @@ final class Notifier: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     Thread.sleep(forTimeInterval: 0.3)
     exit(0)
   }
+}
+
+/// The tool input a permission asks about, laid out to read: the tool's own
+/// account of what it is doing, the command it wants to run (Bash above all)
+/// and the rest of its input as labelled fields -- the Mac's copy of
+/// NotesGraph's tool-input.ts, rather than one block of JSON. nil when the
+/// detail is no JSON object (clipped by the server's cap, say), which then
+/// shows as it came.
+struct ToolInput {
+  struct Field {
+    let label: String
+    let value: String
+    /// Gets its own box, rather than sitting beside its label.
+    let block: Bool
+  }
+
+  let description: String?
+  let command: String?
+  let fields: [Field]
+
+  // Longer one-line values read better in a box than squeezed beside a label.
+  static let inlineMax = 60
+
+  init?(_ detail: String) {
+    guard let data = detail.data(using: .utf8),
+      let record = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    else { return nil }
+    let said = (record["description"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    description = said?.isEmpty == false ? said : nil
+    command = record["command"] as? String
+    var fields: [Field] = []
+    // JSONSerialization keeps no key order: the path and an edit's before
+    // and after in the order they read, then the rest sorted.
+    let leading = ["file_path", "notebook_path", "old_string", "new_string"]
+    let keys = leading.filter { record[$0] != nil }
+      + record.keys.filter { !leading.contains($0) }.sorted()
+    for key in keys {
+      if key == "description" && description != nil { continue }
+      if key == "command" && command != nil { continue }
+      if let field = ToolInput.field(key, record[key]!) { fields.append(field) }
+    }
+    self.fields = fields
+  }
+
+  static func field(_ key: String, _ raw: Any) -> Field? {
+    if raw is NSNull { return nil }
+    if let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() {
+      return Field(label: humanize(key), value: number.boolValue ? "yes" : "no", block: false)
+    }
+    if raw is [Any] || raw is [String: Any] {
+      let pretty = (try? JSONSerialization.data(
+        withJSONObject: raw, options: [.prettyPrinted, .withoutEscapingSlashes]))
+        .flatMap { String(data: $0, encoding: .utf8) } ?? "\(raw)"
+      return Field(label: humanize(key), value: pretty, block: true)
+    }
+    let value = "\(raw)"
+    if value.isEmpty { return nil }
+    return Field(
+      label: humanize(key), value: value,
+      block: value.contains("\n") || value.count > inlineMax)
+  }
+
+  /// `run_in_background` / `runInBackground` -> "Run in background".
+  static func humanize(_ key: String) -> String {
+    let words = key
+      .replacingOccurrences(of: "([a-z0-9])([A-Z])", with: "$1 $2", options: .regularExpression)
+      .replacingOccurrences(of: "[_-]+", with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespaces)
+      .lowercased()
+    return words.prefix(1).uppercased() + words.dropFirst()
+  }
+
+  /// What it says it is doing in one box, the command in another, then the rest.
+  func views(width: CGFloat) -> [NSView] {
+    var views: [NSView] = []
+    if let description = description {
+      views.append(textBox(description, monospaced: false, width: width, maxHeight: 80))
+    }
+    if let command = command {
+      views.append(textBox(command, monospaced: true, width: width, maxHeight: 160))
+    }
+    for field in fields {
+      if field.block {
+        views.append(label(field.label))
+        views.append(textBox(field.value, monospaced: true, width: width, maxHeight: 120))
+      } else {
+        let line = label("\(field.label): \(field.value)")
+        line.preferredMaxLayoutWidth = width
+        views.append(line)
+      }
+    }
+    return views
+  }
+
+  func label(_ text: String) -> NSTextField {
+    let label = NSTextField(wrappingLabelWithString: text)
+    label.font = .systemFont(ofSize: 11)
+    label.textColor = .secondaryLabelColor
+    return label
+  }
+}
+
+/// Read-only text in a bordered box, as tall as the text up to maxHeight,
+/// scrolling past that.
+func textBox(_ text: String, monospaced: Bool, width: CGFloat, maxHeight: CGFloat) -> NSView {
+  let scroll = NSTextView.scrollableTextView()
+  scroll.frame = NSRect(x: 0, y: 0, width: width, height: maxHeight)
+  scroll.borderType = .bezelBorder
+  let textView = scroll.documentView as! NSTextView
+  textView.isEditable = false
+  textView.font = monospaced ? .monospacedSystemFont(ofSize: 11, weight: .regular) : .systemFont(ofSize: 12)
+  textView.textContainerInset = NSSize(width: 2, height: 4)
+  textView.string = text
+  let container = textView.textContainer!
+  let layout = textView.layoutManager!
+  // Laid out at the width it will have, leaving room for a scroller.
+  container.containerSize = NSSize(
+    width: scroll.contentSize.width - NSScroller.scrollerWidth(for: .regular, scrollerStyle: .overlay)
+      - 2 * textView.textContainerInset.width,
+    height: .greatestFiniteMagnitude)
+  layout.ensureLayout(for: container)
+  let needed = layout.usedRect(for: container).height + 2 * textView.textContainerInset.height + 4
+  scroll.translatesAutoresizingMaskIntoConstraints = false
+  scroll.widthAnchor.constraint(equalToConstant: width).isActive = true
+  scroll.heightAnchor.constraint(equalToConstant: min(max(needed, 24), maxHeight)).isActive = true
+  return scroll
 }
 
 /// A tool's input arrives as compact JSON; indent it to read.
