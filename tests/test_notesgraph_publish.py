@@ -19,6 +19,7 @@ class FakeClient:
     def __init__(self, workspace="ws-1", fail_update=False, old_server=False):
         self.workspace = workspace
         self.docs = {}
+        self.links = []
         self.creates = 0
         self.updates = 0
         self.fail_update = fail_update
@@ -49,6 +50,18 @@ class FakeClient:
         self.updates += 1
         self.docs[doc_id]["markdown"] = markdown
         return True
+
+    def link_doc(self, parent_id, child_id):
+        if self.old_server:
+            raise ng.NotesGraphError("404 Not Found")
+        self.links.append((parent_id, child_id))
+        return True
+
+    def doc_titled(self, title):
+        return next(i for i, d in self.docs.items() if d["title"] == title)
+
+    def parent_of(self, doc_id):
+        return [p for p, c in self.links if c == doc_id]
 
 
 class FakeStore:
@@ -204,9 +217,9 @@ def test_republishing_updates_rather_than_duplicating(ledger):
     second = ng.publish_session(sid, store, cfg={}, client=client)
 
     assert first == second
-    # one conversation doc + one index doc, created once each
-    assert client.creates == 2
-    assert client.updates >= 2
+    # one conversation doc + the work / ai / conversations notes, once each
+    assert client.creates == 4
+    assert client.updates >= 1
 
 
 def test_a_deleted_document_is_recreated(ledger):
@@ -221,18 +234,78 @@ def test_a_deleted_document_is_recreated(ledger):
     assert doc_id in recreating.docs
 
 
-def test_the_index_links_every_conversation_in_the_project(ledger):
+def test_conversations_nest_under_the_project_not_the_inbox(ledger):
+    """The note tree follows links, not folders: an unlinked doc is an orphan."""
     client = FakeClient()
-    for n in (1, 2):
-        sid = f"aaaa{n}-b873-4e45-bbbb-111111111111"
-        ng.publish_session(sid, FakeStore(session(session_id=sid), turns()),
-                           cfg={}, client=client)
+    sids = [f"aaaa{n}-b873-4e45-bbbb-111111111111" for n in (1, 2)]
+    docs = [ng.publish_session(sid, FakeStore(session(session_id=sid), turns()),
+                               cfg={}, client=client) for sid in sids]
 
-    index = next(d for d in client.docs.values()
-                 if d["title"] == "All conversations")
-    assert index["folder"] == ["work", "ai", "conversations"]
-    assert "aaaa1" in index["markdown"] and "aaaa2" in index["markdown"]
-    assert index["markdown"].count("/workspace/ws-1/") == 2
+    root, ai, index = (client.doc_titled(t) for t in ("work", "ai", "conversations"))
+    assert client.parent_of(ai) == [root]
+    assert client.parent_of(index) == [ai]
+    assert all(client.parent_of(doc) == [index] for doc in docs)
+    # only the project note is left without a parent
+    assert client.parent_of(root) == []
+    assert client.docs[index]["folder"] == ["work", "ai", "conversations"]
+
+
+def test_republishing_does_not_link_twice(ledger):
+    """Each link call appends another reference to the parent."""
+    store = FakeStore(session(), turns())
+    client = FakeClient()
+    for _ in range(3):
+        ng.publish_session(store.meta.session_id, store, cfg={}, client=client)
+
+    assert len(client.links) == len(set(client.links)) == 3
+
+
+def test_a_recreated_conversation_is_linked_again(ledger):
+    store = FakeStore(session(), turns())
+    sid = store.meta.session_id
+    client = FakeClient()
+    ng.publish_session(sid, store, cfg={}, client=client)
+
+    client.fail_update = True
+    new_doc = ng.publish_session(sid, store, cfg={}, client=client)
+    assert client.parent_of(new_doc) == [client.doc_titled("conversations")]
+
+
+def test_the_old_markdown_index_becomes_the_conversations_note(ledger):
+    sid = session().session_id
+    client = FakeClient()
+    client.docs["old-index"] = {"title": "All conversations",
+                                "markdown": "| When | Task |", "folder": None}
+    client.docs["old-doc"] = {"title": "t", "markdown": "", "folder": None}
+    ledger.write_text(json.dumps({
+        "sessions": {
+            sid: {"doc_id": "old-doc", "filed": True, "project": "work"},
+            "other": {"doc_id": "older-doc", "filed": True, "project": "work"},
+        },
+        "indexes": {"work": "old-index"},
+    }))
+
+    ng.publish_session(sid, FakeStore(session(), turns()), cfg={}, client=client)
+
+    assert client.docs["old-index"]["title"] == "conversations"
+    assert "| When" not in client.docs["old-index"]["markdown"]
+    # conversations published before the tree get linked too
+    assert client.parent_of("older-doc") == ["old-index"]
+    assert client.parent_of("old-doc") == ["old-index"]
+    assert "work" not in json.loads(ledger.read_text())["indexes"]
+
+
+def test_an_older_server_without_links_still_publishes_and_retries(ledger):
+    store = FakeStore(session(), turns())
+    sid = store.meta.session_id
+    old = FakeClient(old_server=True)
+    assert ng.publish_session(sid, store, cfg={}, client=old)
+    assert json.loads(ledger.read_text())["sessions"][sid]["linked"] is False
+
+    new = FakeClient()
+    new.docs = old.docs
+    ng.publish_session(sid, store, cfg={}, client=new)
+    assert json.loads(ledger.read_text())["sessions"][sid]["linked"] is True
 
 
 def test_an_empty_session_is_not_published(ledger):

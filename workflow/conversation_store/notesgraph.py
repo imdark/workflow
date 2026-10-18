@@ -6,8 +6,11 @@ once the session has gone quiet, filed in the folder
 
     <project> / ai / conversations
 
-(real folders in the app's tree, made by the notes API as needed) with an
-"All conversations" index beside them linking to each.
+(real folders in the app's tree, made by the notes API as needed). The
+sidebar's note tree is built from links, not folders, so the same path is
+also a chain of linked notes: a `<project>` note links `ai`, which links
+`conversations`, which links each conversation. Without those links every
+conversation is parentless and lands in the Inbox.
 """
 
 import json
@@ -115,6 +118,17 @@ class NotesGraphDocClient:
         )
         return bool(result.get("ok"))
 
+    def link_doc(self, parent_id: str, child_id: str) -> bool:
+        """Link `child_id` under `parent_id` as a real reference.
+
+        Not idempotent: every call appends another link to the parent.
+        """
+        result = self._request(
+            "POST", f"/api/notes/workspaces/{self.workspace}/docs/{parent_id}/links",
+            {"childDocId": child_id},
+        )
+        return bool(result.get("ok"))
+
 
 # ── rendering ────────────────────────────────────────────────────────────────
 
@@ -141,13 +155,6 @@ def doc_title(meta) -> str:
     started = time.strftime("%Y-%m-%d", time.localtime(meta.started_at))
     task = f" {meta.task_key}" if meta.task_key else ""
     return f"{started}{task} · {short_id(meta.session_id)}"
-
-
-INDEX_TITLE = "All conversations"
-
-
-def index_title(project: Optional[str]) -> str:
-    return INDEX_TITLE
 
 
 def short_id(session_id: str) -> str:
@@ -282,20 +289,9 @@ def _body(turn) -> str:
     return escape_taglike(content)
 
 
-def render_index(project: Optional[str], entries: list) -> str:
-    """The index document, newest conversation first."""
-    lines = [f"# {INDEX_TITLE} — {project or 'unscoped'}", ""]
-    if not entries:
-        lines.append("_No conversations published yet._")
-        return "\n".join(lines)
-
-    lines += ["| When | Task | Turns | Conversation |", "| --- | --- | --- | --- |"]
-    for entry in sorted(entries, key=lambda e: e.get("updated", 0), reverse=True):
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.get("updated", 0)))
-        link = f"[{entry['short']}](/workspace/{entry['workspace']}/{entry['doc_id']})"
-        lines.append(f"| {when} | {entry.get('task') or '—'} | "
-                     f"{entry.get('turns', 0)} | {link} |")
-    return "\n".join(lines)
+def render_hub(path: list) -> str:
+    """The body of a note standing for a folder; its links follow it."""
+    return f"Published by `wf`: {' / '.join(path)}. Notes in it are linked below."
 
 
 # ── published-document bookkeeping ───────────────────────────────────────────
@@ -411,43 +407,74 @@ def publish_session(session_id: str, store, cfg=None,
         "turns": len(turns),
         "updated": time.time(),
         "workspace": client.workspace,
+        # A recreated document needs linking again; the same one does not.
+        "linked": bool(record and record.get("doc_id") == doc_id
+                       and record.get("linked")),
     }
     _save_ledger(ledger)
 
-    _publish_index(client, meta.project, ledger)
+    # A conversation that cannot be linked yet is not worth failing a publish
+    # over: the document itself is the artifact, and the next publish retries.
+    try:
+        _link_conversations(client, meta.project, ledger)
+    except NotesGraphError as e:
+        print(f"⚠️  Could not link the conversation into the note tree: {e}")
     return doc_id
 
 
-def _publish_index(client: NotesGraphDocClient, project: Optional[str],
-                   ledger: dict) -> None:
-    """Rewrite the project's conversation index."""
-    entries = [record for record in ledger["sessions"].values()
-               if record.get("project") == project]
-    markdown = render_index(project, entries)
-    title = index_title(project)
+def ensure_path(client: NotesGraphDocClient, path: list, ledger: dict) -> str:
+    """The note standing for the last folder on `path`, linked under the rest.
 
-    folder = folder_path(project)
-    key = project or "unscoped"
-    doc_id = ledger["indexes"].get(key)
-    filed_indexes = ledger.setdefault("filed_indexes", [])
-    if doc_id:
+    Makes each missing note, filed in its own folder, and links it under the
+    one before, so `personal / ai / conversations` hangs off a `personal`
+    note instead of sitting parentless in the Inbox. The ledger remembers
+    which links exist because linking twice adds a second link.
+    """
+    hubs = ledger.setdefault("hubs", {})
+    linked = ledger.setdefault("linked_hubs", [])
+    parent = None
+    for depth in range(1, len(path) + 1):
+        key = "/".join(path[:depth])
+        doc_id = hubs.get(key)
+        if not doc_id:
+            doc_id = client.create_doc(path[depth - 1], render_hub(path[:depth]),
+                                       path[:depth])
+            hubs[key] = doc_id
+            _save_ledger(ledger)
+        if parent and key not in linked:
+            client.link_doc(parent, doc_id)
+            linked.append(key)
+            _save_ledger(ledger)
+        parent = doc_id
+    return parent
+
+
+def _link_conversations(client: NotesGraphDocClient, project: Optional[str],
+                        ledger: dict) -> None:
+    """Link the project's conversations under its `conversations` note."""
+    path = folder_path(project)
+    key = "/".join(path)
+    hubs = ledger.setdefault("hubs", {})
+    old_index = ledger["indexes"].pop(project or "unscoped", None)
+    if old_index and key not in hubs:
+        # The markdown index from before the tree: keep the doc, but drop its
+        # table of plain links -- the real links replace it.
         try:
-            client.update_doc(doc_id, markdown)
-            if doc_id not in filed_indexes and _move_into_folder(client, doc_id, folder, title):
-                filed_indexes.append(doc_id)
-                _save_ledger(ledger)
-            return
+            client.update_doc(old_index, render_hub(path))
+            client.rename_doc(old_index, path[-1])
+            hubs[key] = old_index
         except NotesGraphError:
-            doc_id = None   # deleted in the app; fall through and recreate
-
-    # An index that cannot be written is not worth failing a publish over:
-    # the conversation document itself is the artifact.
-    try:
-        ledger["indexes"][key] = client.create_doc(title, markdown, folder)
-        filed_indexes.append(ledger["indexes"][key])
+            pass   # deleted in the app; ensure_path makes a new one
+    if old_index:
         _save_ledger(ledger)
-    except NotesGraphError as e:
-        print(f"⚠️  Could not update the conversation index: {e}")
+
+    index = ensure_path(client, path, ledger)
+    for record in ledger["sessions"].values():
+        if record.get("project") != project or record.get("linked"):
+            continue
+        client.link_doc(index, record["doc_id"])
+        record["linked"] = True
+        _save_ledger(ledger)
 
 
 def _move_into_folder(client: NotesGraphDocClient, doc_id: str, folder: list,

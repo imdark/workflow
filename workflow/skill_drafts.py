@@ -224,17 +224,24 @@ def skill_usage(store) -> Counter:
 def publish_draft(draft: dict, project: Optional[str], config: dict) -> Optional[str]:
     """Mirror a draft into NotesGraph under `<project> / ai / skills`. Never raises."""
     try:
-        from workflow.conversation_store.notesgraph import client_from_config, is_enabled
-        if not is_enabled(config):
+        from workflow.conversation_store import notesgraph as ng
+        if not ng.is_enabled(config):
             return None
         # Frontmatter would render as a stray heading; show it as a list.
         fields, body = parse_frontmatter(draft["markdown"])
         header = "\n".join(f"* **{k}:** {v}" for k, v in fields.items())
-        client = client_from_config(config)
-        return client.create_doc(
-            f"Skill draft: {draft['name']}", f"{header}\n{body}",
-            folder=[project or "unscoped", "ai", "skills"],
+        client = ng.client_from_config(config)
+        folder = [project or "unscoped", "ai", "skills"]
+        doc_id = client.create_doc(
+            f"Skill draft: {draft['name']}", f"{header}\n{body}", folder=folder,
         )
+        # Linked so the note tree nests it instead of leaving it in the Inbox.
+        try:
+            ledger = ng._load_ledger()
+            client.link_doc(ng.ensure_path(client, folder, ledger), doc_id)
+        except ng.NotesGraphError as e:
+            print(f"⚠️  Published the skill draft but could not link it: {e}")
+        return doc_id
     except Exception as e:
         print(f"⚠️  Could not publish skill draft to NotesGraph: {e}")
         return None
