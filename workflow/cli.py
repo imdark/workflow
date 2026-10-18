@@ -2514,6 +2514,20 @@ def skill_from_notes(
 
 
 @app.command()
+def debt(
+    path: Path = typer.Argument(None, help="Repo to scan (default: the current one)"),
+    tag: str = typer.Option("work", "--tag", help="Tag for the tasks: work or personal"),
+    under: str = typer.Option(None, "--under", help="File a new ledger note under the note of this title"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the ledger and write nothing"),
+):
+    """Keep a NotesGraph note "<repo> shortcut ledger" with one task per
+    shortcut:/TODO/FIXME/HACK marker in the code; #no-trigger marks one that
+    says nothing about when to come back to it."""
+    from workflow.debt_ledger import run_debt
+    raise typer.Exit(run_debt(path or Path.cwd(), tag, under, dry_run, echo=typer.echo))
+
+
+@app.command()
 def start(
     task: str = typer.Argument(
         None, 
