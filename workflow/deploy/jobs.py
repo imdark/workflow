@@ -471,21 +471,61 @@ def profile_skills_plugin(job: Job, job_dir: Path) -> Optional[Path]:
     return root
 
 
-def steer_settings(mcp_path: Path) -> str:
-    """Claude Code settings (for --settings) whose hooks hand the agent what
-    the person sends the run from NotesGraph while it works: after each tool
-    call, and when it is about to stop. See steer_hook.py."""
+# What a subagent the run spawns (Agent tool) is handed at its start. The
+# rules reach the main thread through --append-system-prompt, which
+# subagents don't inherit; without this hook a delegated subagent ran
+# without them (as Ponytail found, its issue #252).
+SUBAGENT_RULES_PROMPT = """\
+You are a subagent of an agent run started from NotesGraph. The user keeps
+their own rules for agent runs in a note titled "{title}". Follow them as
+they apply to your part of the work. The note, as it is now:
+
+{rules}
+"""
+
+
+def _context_hook(job_dir: Path, event: str, context: str) -> list:
+    """A hook for `event` that hands the model `context`.
+
+    The hook's whole output is written to a file in the job directory and the
+    hook just prints it: nothing to compute at hook time, and nothing long or
+    private on the command line.
+    """
+    path = job_dir / f"{event}.json"
+    path.write_text(json.dumps(
+        {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}))
+    command = f"cat {shlex.quote(str(path))}"
+    return [{"hooks": [{"type": "command", "command": command, "timeout": 10}]}]
+
+
+def run_settings(mcp_path: Path, rules: str = "", session_context: str = "") -> str:
+    """Claude Code settings (for --settings) for a run's hooks.
+
+    Steering, always: hooks that hand the agent what the person sends the run
+    from NotesGraph while it works, after each tool call and when it is about
+    to stop (see steer_hook.py). With `rules`, a SubagentStart hook gives
+    them to every subagent. With `session_context` (a task run's code map),
+    a SessionStart hook adds it to the conversation.
+    """
     command = " ".join(shlex.quote(part) for part in
                        (sys.executable, "-m", "workflow.deploy.steer_hook", str(mcp_path)))
     hook = [{"hooks": [{"type": "command", "command": command, "timeout": 30}]}]
-    return json.dumps({"hooks": {"PostToolUse": hook, "Stop": hook}})
+    hooks = {"PostToolUse": hook, "Stop": hook}
+    job_dir = mcp_path.parent
+    if rules.strip():
+        hooks["SubagentStart"] = _context_hook(job_dir, "SubagentStart", SUBAGENT_RULES_PROMPT.format(
+            title=AGENT_RULES_TITLE, rules=rules.strip()))
+    if session_context.strip():
+        hooks["SessionStart"] = _context_hook(job_dir, "SessionStart", session_context)
+    return json.dumps({"hooks": hooks})
 
 
 def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                      client: "JobClient", plugin_dir: Optional[Path] = None,
                      extra_mcp: Optional[dict] = None,
                      extra_allowed: Optional[list] = None,
-                     extra_prompt: str = "", rules: str = "") -> tuple:
+                     extra_prompt: str = "", rules: str = "",
+                     session_context: str = "") -> tuple:
     """Claude Code with NotesGraph's tools and a way to ask the user.
 
     Returns (argv, env). The MCP config carries the NotesGraph token, so it
@@ -494,7 +534,9 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     `extra_mcp`, `extra_allowed` and `extra_prompt` add MCP servers,
     pre-approved tools and system prompt for a variant (see research_argv).
     `rules` is the user's "Agent rules" note (see load_agent_rules); it goes
-    on the end of the system prompt, the server's or the built-in one alike.
+    on the end of the system prompt, the server's or the built-in one alike,
+    and to each subagent through a hook. `session_context` is added at
+    session start (see run_settings).
     """
     mcp_path = job_dir / "mcp.json"
     mcp_config = {"mcpServers": {
@@ -534,7 +576,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         # the prompt that follows it.
         f"--allowedTools={','.join(allowed)}",
         "--permission-prompt-tool", "mcp__run__approve",
-        "--settings", steer_settings(mcp_path),
+        "--settings", run_settings(mcp_path, rules, session_context),
         *(["--plugin-dir", str(plugin_dir)] if plugin_dir else []),
         *(["--plugin-dir", str(skills_dir)] if skills_dir else []),
         *(["--max-budget-usd", f"{job.max_cost_usd:g}"] if job.max_cost_usd else []),
@@ -788,8 +830,10 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             plugin_dir = skills_plugin_dir(issue, issue.key.lower(),
                                            Path.home() / ".wf" / "tasks" / issue.key.lower(),
                                            repo_path)
+            from workflow.code_map import map_context
             argv, env = claude_code_argv(job, _job_context(issue, job, workdir),
-                                         job_dir, client, plugin_dir, rules=rules)
+                                         job_dir, client, plugin_dir, rules=rules,
+                                         session_context=map_context(workdir))
             # Same Claude account and capture proxy as `wf ai`.
             env.update(apply_claude_env(dict(os.environ)))
         else:
