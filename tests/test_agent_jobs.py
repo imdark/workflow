@@ -523,3 +523,61 @@ def test_the_narrator_counts_tokens_and_names_the_cost_cap():
     assert narrator.tokens == 116
     assert narrator.error == "stopped at its cost cap ($2.01 spent)"
     assert "✗ failed after 9 turns · $2.0130: stopped at its cost cap" in out.getvalue()
+
+
+# --- what a run changed reaches the report --------------------------------
+
+CHANGES = {"notes": {"created": [{"docId": "d1", "title": "Plan"}], "edited": [],
+                     "linked": []}, "files": []}
+
+
+def test_a_runs_changes_are_reported_with_done(monkeypatch):
+    monkeypatch.setattr("workflow.deploy.jobs.run_job",
+                        lambda job, cfg=None, **kw: {"result": "ok", "steps": 1,
+                                                     "session": None, "changes": CHANGES})
+    client = FakeClient([payload()])
+    serve(client, "laptop", once=True)
+    assert client.reports == [{"job": "j1", "status": "done", "result": "ok",
+                               "steps": 1, "changes": CHANGES}]
+
+
+def test_a_failed_runs_changes_are_reported_with_the_error(monkeypatch):
+    from workflow.deploy.jobs import RunFailed
+
+    def fail(job, cfg=None, **kw):
+        raise RunFailed("boom", {"costUsd": 0.5}, CHANGES)
+
+    monkeypatch.setattr("workflow.deploy.jobs.run_job", fail)
+    client = FakeClient([payload()])
+    serve(client, "laptop", once=True)
+    assert client.reports == [{"job": "j1", "status": "error", "error": "boom",
+                               "costUsd": 0.5, "changes": CHANGES}]
+
+
+def test_watch_reads_changes_from_result_json(tmp_path, monkeypatch):
+    from workflow.deploy.jobs import RunFailed, _watch
+
+    # The run is already over: exit_code exists, so nothing is launched.
+    monkeypatch.setattr("workflow.deploy.jobs._launch", lambda job_dir, session: None)
+    job = Job.from_payload(payload())
+    job_dir = tmp_path / "w"
+    job_dir.mkdir()
+    (job_dir / "exit_code").write_text("0")
+
+    def outcome(**result):
+        (job_dir / "result.json").write_text(json.dumps(result))
+        return _watch(job, job_dir, None, None, False, 0.01)
+
+    assert outcome(result="ok", steps=1, changes=CHANGES)["changes"] == CHANGES
+    assert "changes" not in outcome(result="ok", steps=1)
+    with pytest.raises(RunFailed) as failed:
+        outcome(result=None, error="bad", changes=CHANGES)
+    assert failed.value.changes == CHANGES
+
+
+def test_an_unchanged_run_reports_no_changes_key(fake_provider):
+    from workflow.deploy.jobs import run_job
+
+    outcome = run_job(Job.from_payload(payload()), config={}, use_tmux=False,
+                      tick_seconds=0.05)
+    assert "changes" not in outcome

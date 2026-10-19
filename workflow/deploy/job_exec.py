@@ -13,7 +13,8 @@ Files in <job-dir>:
                  "env": {...extra environment}, "cwd": "where to run" | null}
     log.txt      the transcript, appended as the run goes
     result.json  {"result": str, "steps": int, "error": str|null,
-                  "costUsd": float|null, "tokens": int|null}
+                  "costUsd": float|null, "tokens": int|null,
+                  "changes"?: what the run changed (see run_changes)}
     exit_code    written last; its presence means the run is over
 """
 
@@ -24,6 +25,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional, TextIO
+
+from workflow.deploy.run_changes import ChangeRecorder, git_base, git_changes
 
 # How long a finished session stays open for someone to read. The runner
 # does not wait for this; it reads exit_code.
@@ -57,8 +60,9 @@ class Narrator:
     it carries on -- so the outcome is the last one, said once by `finish`.
     """
 
-    def __init__(self, out: TextIO, log: TextIO):
+    def __init__(self, out: TextIO, log: TextIO, cwd: Optional[str] = None):
         self.out, self.log = out, log
+        self.recorder = ChangeRecorder(cwd)
         self.result: Optional[str] = None
         self.error: Optional[str] = None
         self.steps = 0
@@ -108,6 +112,7 @@ class Narrator:
                 if part.get("type") == "text" and part.get("text", "").strip():
                     self.say(part["text"].rstrip(), sub)
                 elif part.get("type") == "tool_use":
+                    self.recorder.tool_use(part)
                     name = part.get("name", "tool")
                     if name.endswith("__ask_user"):
                         # The question is the event worth seeing, not the call.
@@ -118,6 +123,7 @@ class Narrator:
         elif kind == "user":
             for part in (event.get("message") or {}).get("content") or []:
                 if isinstance(part, dict) and part.get("type") == "tool_result":
+                    self.recorder.tool_result(part)
                     text = _tool_result_text(part.get("content"))
                     mark = "✗" if part.get("is_error") else "←"
                     self.say(f"  {mark} {_short(text, TOOL_RESULT_CHARS)}", sub)
@@ -154,9 +160,10 @@ class Narrator:
 def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
     spec = json.loads((job_dir / "cmd.json").read_text())
     argv = spec["argv"]
+    cwd = spec.get("cwd") or None
 
     with open(job_dir / "log.txt", "a", encoding="utf-8") as log:
-        narrator = Narrator(out, log)
+        narrator = Narrator(out, log, cwd or os.getcwd())
         narrator.say(f"$ {argv[0]} … ({spec.get('provider', argv[0])}, job {job_dir.name})")
         if spec.get("provider") in ("claude-code", "workflow", "research"):
             narrator.say("  Claude can read and write your notes, and will ask you in "
@@ -165,11 +172,12 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
             narrator.say("  Researching with OmniSeek: cross-lingual search, papers, "
                          "PDFs and media.")
         code = 1
+        start = git_base(cwd)  # no cwd: the runner's own checkout, not the job's
         try:
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, env={**os.environ, **(spec.get("env") or {})},
-                cwd=spec.get("cwd") or None,
+                cwd=cwd,
             )
             for line in proc.stdout:
                 narrator.feed(line)
@@ -189,9 +197,15 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
             error = ("\n".join(narrator.plain[-20:]).strip()[:500]
                      or f"{argv[0]} exited {code}")
 
-    (job_dir / "result.json").write_text(json.dumps(
-        {"result": result, "steps": max(1, narrator.steps), "error": error,
-         "costUsd": narrator.cost, "tokens": narrator.tokens}))
+    outcome = {"result": result, "steps": max(1, narrator.steps), "error": error,
+               "costUsd": narrator.cost, "tokens": narrator.tokens}
+    try:
+        changes = narrator.recorder.changes(git_changes(cwd, start))
+    except Exception:
+        changes = None
+    if changes:
+        outcome["changes"] = changes
+    (job_dir / "result.json").write_text(json.dumps(outcome))
     # Written last, and by rename, so the runner never sees a partial file.
     tmp = job_dir / "exit_code.tmp"
     tmp.write_text(str(code))
