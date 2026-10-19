@@ -913,18 +913,24 @@ def _watch(job: Job, job_dir: Path, timeout: Optional[int],
         outcome = {"result": None, "steps": 1,
                    "error": "the run ended without writing a result"}
     usage = _usage(outcome)
+    changes = outcome.get("changes") if isinstance(outcome.get("changes"), dict) else None
     if outcome.get("error") or outcome.get("result") is None:
-        raise RunFailed(outcome.get("error") or "the run produced no result", usage)
-    return {"result": outcome["result"], "steps": int(outcome.get("steps") or 1),
+        raise RunFailed(outcome.get("error") or "the run produced no result", usage,
+                        changes)
+    done = {"result": outcome["result"], "steps": int(outcome.get("steps") or 1),
             "session": session, "usage": usage}
+    if changes:
+        done["changes"] = changes
+    return done
 
 
 class RunFailed(RuntimeError):
-    """A run that ended in an error, with what it spent getting there."""
+    """A run that ended in an error, with what it spent and changed getting there."""
 
-    def __init__(self, message: str, usage: dict):
+    def __init__(self, message: str, usage: dict, changes: Optional[dict] = None):
         super().__init__(message)
         self.usage = usage
+        self.changes = changes
 
 
 def _usage(outcome: dict) -> dict:
@@ -981,6 +987,7 @@ def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
                           use_tmux=session is not None, client=client)
         client.report(job.id, status="done", result=outcome["result"],
                       steps=outcome["steps"], **outcome.get("usage", {}),
+                      **({"changes": outcome["changes"]} if outcome.get("changes") else {}),
                       **({"logAppend": reporter.pending} if reporter.pending else {}))
         emit("done", job)
         return True
@@ -990,6 +997,8 @@ def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
         try:
             client.report(job.id, status="error", error=str(e)[:2000],
                           **(e.usage if isinstance(e, RunFailed) else {}),
+                          **({"changes": e.changes}
+                             if isinstance(e, RunFailed) and e.changes else {}),
                           **({"logAppend": reporter.pending} if reporter.pending else {}))
         except NotesGraphError:
             pass
