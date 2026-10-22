@@ -24,17 +24,26 @@ def payload(job_id="j1", **overrides):
 class FakeClient(JobClient):
     """A JobClient with the HTTP layer replaced."""
 
-    def __init__(self, queue=None, claim_error=None):
+    def __init__(self, queue=None, claim_error=None, max_jobs_set=None):
         self.queue = list(queue or [])
         self.claim_error = claim_error
         self.reports = []
         self.claims = 0
+        # What the app has the device set to; the runner hears it on a claim.
+        self.in_app = max_jobs_set
+        self.refreshes = 0
 
     def claim(self, device_key, runner_id):
         self.claims += 1
         if self.claim_error:
             raise NotesGraphError(self.claim_error)
+        self.max_jobs_set = self.in_app
         return Job.from_payload(self.queue.pop(0)) if self.queue else None
+
+    def refresh_max_jobs(self, device_key):
+        self.refreshes += 1
+        self.max_jobs_set = self.in_app
+        return self.max_jobs_set
 
     def report(self, job_id, **fields):
         self.reports.append({"job": job_id, **fields})
@@ -161,6 +170,56 @@ def test_no_more_than_max_jobs_run_at_once(monkeypatch):
     serve_until(client, done, max_jobs=2)
     assert peak[0] == 2
     assert len([r for r in client.reports if r["status"] == "done"]) == 3
+
+
+def _peak_running(monkeypatch, client, jobs, done_after, hold=0.05, on_start=None, **kw):
+    """Serve `client` until `done_after` jobs end; how many ran at once at most."""
+    import threading
+    import time
+
+    lock, running, peak = threading.Lock(), [0], [0]
+    finished, done = [], threading.Event()
+
+    def run(job, cfg=None, **_):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        if on_start:
+            on_start(job)
+        time.sleep(hold)
+        with lock:
+            running[0] -= 1
+            finished.append(job.id)
+            if len(finished) == done_after:
+                done.set()
+        return {"result": job.id, "steps": 1, "session": None}
+
+    monkeypatch.setattr("workflow.deploy.jobs.run_job", run)
+    client.queue = [payload(j) for j in jobs]
+    serve_until(client, done, **kw)
+    return peak[0]
+
+
+def test_jobs_at_once_set_in_the_app_overrides_max_jobs(monkeypatch):
+    client = FakeClient(max_jobs_set=1)
+    assert _peak_running(monkeypatch, client, ["j1", "j2", "j3"], 3, max_jobs=4) == 1
+
+    client = FakeClient(max_jobs_set=3)
+    assert _peak_running(monkeypatch, client, ["j1", "j2", "j3"], 3, max_jobs=1) == 3
+
+
+def test_a_full_runner_notices_it_was_given_more(monkeypatch):
+    """Two runs waiting on their starter hold both slots; raising it frees one."""
+    client = FakeClient(max_jobs_set=1)
+
+    def raise_on_first(job):
+        if job.id == "j1":
+            client.in_app = 2
+
+    peak = _peak_running(monkeypatch, client, ["j1", "j2"], 2, hold=0.3,
+                         on_start=raise_on_first, max_jobs=4)
+    assert peak == 2
+    assert client.refreshes >= 1
 
 
 def test_the_prompt_carries_instructions_and_context():

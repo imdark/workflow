@@ -140,13 +140,30 @@ class JobClient:
     def _base(self) -> str:
         return f"/api/registry/workspaces/{self.workspace}"
 
+    # What the device is set to run at once in the app ("jobs at once"), as
+    # the last claim or refresh heard it; None leaves it to --max-jobs. The
+    # server also refuses a claim past it.
+    max_jobs_set: Optional[int] = None
+
+    def _note_max_jobs(self, value) -> None:
+        self.max_jobs_set = (value if isinstance(value, int) and not isinstance(value, bool)
+                             and value >= 1 else None)
+
     def claim(self, device_key: str, runner_id: str) -> Optional[Job]:
         payload = self._request(
             "POST", f"{self._base()}/devices/{device_key}/jobs/claim",
             {"runnerId": runner_id, "leaseSeconds": LEASE_SECONDS},
         )
+        # Absent from an older server: the runner's own setting holds.
+        self._note_max_jobs(payload.get("maxJobs"))
         job = payload.get("job")
         return Job.from_payload(job) if job else None
+
+    def refresh_max_jobs(self, device_key: str) -> Optional[int]:
+        """Read the device's jobs at once without claiming (see serve)."""
+        device = self._request("GET", f"{self._base()}/devices/{device_key}").get("device") or {}
+        self._note_max_jobs(device.get("maxJobs"))
+        return self.max_jobs_set
 
     def report(self, job_id: str, **fields) -> Optional[dict]:
         """Report on a job; returns the job as the server now has it."""
@@ -1012,11 +1029,13 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
           stop_when=None) -> int:
     """Claim and run jobs until interrupted. Returns how many ran.
 
-    Up to `max_jobs` run at once, each on its own thread; with every slot
-    taken nothing more is claimed, so the rest stay queued on the server
-    for another runner. A slot that frees up is filled straight away, and
-    jobs queued together start together rather than one per poll. `once`
-    runs at most one job, here, and returns.
+    Up to `max_jobs` run at once, each on its own thread -- or what the
+    device is set to run at once in the app ("jobs at once"), when it is;
+    see JobClient.max_jobs_set. With every slot taken nothing more is
+    claimed, so the rest stay queued on the server for another runner. A
+    slot that frees up is filled straight away, and jobs queued together
+    start together rather than one per poll. `once` runs at most one job,
+    here, and returns.
 
     The threads are daemons: Ctrl-C ends the runner without waiting for
     them, as it always ended mid-job. Their leases lapse and the jobs are
@@ -1030,35 +1049,56 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
     runner_id = runner_id or f"{socket.gethostname()}-{int(time.time())}"
     emit = on_event or (lambda *a, **k: None)
     completed = 0
+    # Slots taken: jobs running, and a claim in flight.
     running = 0
-    counted = threading.Lock()
-    slots = threading.BoundedSemaphore(max(1, max_jobs))
+    slots = threading.Condition()
+
+    def limit() -> int:
+        return client.max_jobs_set or max(1, max_jobs)
+
+    def release() -> None:
+        nonlocal running
+        with slots:
+            running -= 1
+            slots.notify_all()
 
     def work(job: Job) -> None:
-        nonlocal completed, running
+        nonlocal completed
         try:
             if _run_claimed(client, job, config, emit):
-                with counted:
+                with slots:
                     completed += 1
         finally:
-            with counted:
-                running -= 1
-            slots.release()
+            release()
 
     while True:
         if stop_when is not None and stop_when():
             emit("stopping", detail=f"{running} job(s) still running")
-            while True:
-                with counted:
-                    if running == 0:
-                        break
-                time.sleep(1)
+            with slots:
+                while running:
+                    slots.wait(1)
             return completed
-        slots.acquire()
+        with slots:
+            full = running >= limit()
+            if full:
+                slots.wait(poll_seconds)
+            else:
+                running += 1
+        if full:
+            # While full, the app may give the device more; notice without
+            # claiming, since a claim would take a job.
+            with slots:
+                still_full = running >= limit()
+            if still_full:
+                try:
+                    client.refresh_max_jobs(device_key)
+                except NotesGraphError as e:
+                    emit("error", f"reading jobs at once failed: {e}")
+            continue
         try:
             job = client.claim(device_key, runner_id)
         except NotesGraphError as e:
-            slots.release()
+            release()
             emit("error", f"claim failed: {e}")
             if once:
                 return completed
@@ -1066,14 +1106,12 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
             continue
 
         if not job:
-            slots.release()
+            release()
             if once:
                 return completed
             time.sleep(poll_seconds)
             continue
 
-        with counted:
-            running += 1
         if once:
             work(job)
             return completed
