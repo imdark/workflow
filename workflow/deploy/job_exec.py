@@ -10,12 +10,17 @@ NotesGraph.
 
 Files in <job-dir>:
     cmd.json     written by the runner: {"argv": [...], "provider": "...",
-                 "env": {...extra environment}, "cwd": "where to run" | null}
+                 "env": {...extra environment}, "cwd": "where to run" | null,
+                 "resumed"?: true when it resumes an interrupted attempt,
+                 "job"?: {...what the checkpoint manifest names it by}}
     log.txt      the transcript, appended as the run goes
     result.json  {"result": str, "steps": int, "error": str|null,
                   "costUsd": float|null, "tokens": int|null,
                   "changes"?: what the run changed (see run_changes)}
     exit_code    written last; its presence means the run is over
+
+and base.json, session.json and checkpoint/, which say where the run started
+and carry it if it has to start again (see checkpoint).
 """
 
 import json
@@ -26,7 +31,8 @@ import time
 from pathlib import Path
 from typing import Optional, TextIO
 
-from workflow.deploy.run_changes import ChangeRecorder, git_base, git_changes
+from workflow.deploy.checkpoint import Checkpointer, run_base
+from workflow.deploy.run_changes import ChangeRecorder, git_changes
 
 # How long a finished session stays open for someone to read. The runner
 # does not wait for this; it reads exit_code.
@@ -68,6 +74,8 @@ class Narrator:
         self.steps = 0
         self.cost: Optional[float] = None
         self.tokens: Optional[int] = None
+        # Claude's session id, from its first init: what a resume needs.
+        self.session_id: Optional[str] = None
         self.started = False
         self.plain: list = []
 
@@ -103,6 +111,8 @@ class Narrator:
                 self.say("▶ continuing")
                 return
             self.started = True
+            if isinstance(event.get("session_id"), str):
+                self.session_id = event["session_id"]
             model = event.get("model") or "?"
             self.say(f"▶ started · model {model} · {event.get('cwd', '')}")
         elif kind == "assistant":
@@ -171,16 +181,24 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
         if spec.get("provider") == "research":
             narrator.say("  Researching with OmniSeek: cross-lingual search, papers, "
                          "PDFs and media.")
+        if spec.get("resumed"):
+            narrator.say("↻ resuming the interrupted attempt's session, in the "
+                         "worktree it left")
         code = 1
-        start = git_base(cwd)  # no cwd: the runner's own checkout, not the job's
+        # No cwd: the runner's own checkout, not the job's.
+        start = run_base(job_dir, cwd)
+        extra_env = spec.get("env") or {}
+        checkpoints = Checkpointer(job_dir, cwd, start, extra_env, spec.get("job"))
         try:
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env={**os.environ, **(spec.get("env") or {})},
+                text=True, bufsize=1, env={**os.environ, **extra_env},
                 cwd=cwd,
             )
             for line in proc.stdout:
                 narrator.feed(line)
+                checkpoints.note_session(narrator.session_id)
+                checkpoints.maybe(narrator)
             code = proc.wait()
             narrator.finish()
         except FileNotFoundError:
@@ -197,6 +215,12 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
             error = ("\n".join(narrator.plain[-20:]).strip()[:500]
                      or f"{argv[0]} exited {code}")
 
+    if error:
+        # The last one, so a failed run can be continued from where it ended.
+        checkpoints.take(narrator, "error")
+    else:
+        # A finished run's checkpoint is dropped; just let one in flight end.
+        checkpoints.wait()
     outcome = {"result": result, "steps": max(1, narrator.steps), "error": error,
                "costUsd": narrator.cost, "tokens": narrator.tokens}
     try:
