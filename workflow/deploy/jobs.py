@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from workflow.deploy import automations
 from workflow.deploy.notes import NotesReader
 from workflow.deploy.registry.notesgraph import NotesGraphError, load_token
 
@@ -71,6 +72,13 @@ class Job:
     # How to run it, as the server says (system prompt, allowed tools, tool
     # timeout); the constants below stand in for an older server's jobs.
     profile: Optional[dict] = None
+    # "agent", or "automation" for code to run (see automations.py); an
+    # older server sends neither.
+    kind: str = "agent"
+    # For an automation: its code, input and time limit.
+    payload: Optional[dict] = None
+    # For an automation: the workspace secrets its code names. Claims only.
+    secrets: Optional[dict] = None
 
     @classmethod
     def from_payload(cls, payload: dict) -> "Job":
@@ -86,6 +94,9 @@ class Job:
             max_steps=int(payload.get("maxSteps") or 8),
             max_cost_usd=float(payload["maxCostUsd"]) if payload.get("maxCostUsd") else None,
             profile=payload.get("profile") or None,
+            kind=payload.get("kind") or "agent",
+            payload=payload.get("payload") or None,
+            secrets=payload.get("secrets") or None,
         )
 
 
@@ -133,7 +144,9 @@ class JobClient:
                 detail = e.read().decode("utf-8")[:300]
             except Exception:
                 pass
-            raise NotesGraphError(f"{method} {path} failed: {e.code} {detail}") from e
+            error = NotesGraphError(f"{method} {path} failed: {e.code} {detail}")
+            error.status = e.code
+            raise error from e
         except (urllib.error.URLError, OSError) as e:
             raise NotesGraphError(f"registry unreachable at {self.url}: {e}") from e
 
@@ -149,11 +162,27 @@ class JobClient:
         self.max_jobs_set = (value if isinstance(value, int) and not isinstance(value, bool)
                              and value >= 1 else None)
 
+    # Whether to ask for automation jobs too: only with node to run them,
+    # and not once the server refused this token them (the claim reveals
+    # secrets, so it needs workspace settings access).
+    take_automations: bool = automations.can_run()
+
     def claim(self, device_key: str, runner_id: str) -> Optional[Job]:
-        payload = self._request(
-            "POST", f"{self._base()}/devices/{device_key}/jobs/claim",
-            {"runnerId": runner_id, "leaseSeconds": LEASE_SECONDS},
-        )
+        kinds = ["agent", "automation"] if self.take_automations else ["agent"]
+        try:
+            payload = self._request(
+                "POST", f"{self._base()}/devices/{device_key}/jobs/claim",
+                {"runnerId": runner_id, "leaseSeconds": LEASE_SECONDS,
+                 "kinds": kinds},
+            )
+        except NotesGraphError as e:
+            if not self.take_automations or getattr(e, "status", None) != 403:
+                raise
+            # Agent jobs only, rather than no jobs at all.
+            self.take_automations = False
+            print(f"{self.workspace}: this token may not run automations; "
+                  "taking agent jobs only", file=sys.stderr)
+            return self.claim(device_key, runner_id)
         # Absent from an older server: the runner's own setting holds.
         self._note_max_jobs(payload.get("maxJobs"))
         job = payload.get("job")
@@ -994,8 +1023,33 @@ class _Reporter:
         return (job or {}).get("status") == "cancelled"
 
 
+def _run_automation(client: JobClient, job: Job, emit) -> bool:
+    """Run an automation job's code and report how it ended."""
+    emit("claimed", job, "")
+    reporter = _Reporter(client, job.id, None)
+    try:
+        result = automations.run_automation(job.payload or {}, job.secrets,
+                                             on_tick=reporter)
+        client.report(job.id, status="done", result=result,
+                      **({"logAppend": reporter.pending} if reporter.pending else {}))
+        emit("done", job)
+        return True
+    except automations.AutomationCancelled:
+        emit("cancelled", job)
+    except Exception as e:
+        try:
+            client.report(job.id, status="error", error=str(e)[:2000],
+                          **({"logAppend": reporter.pending} if reporter.pending else {}))
+        except NotesGraphError:
+            pass
+        emit("failed", job, str(e))
+    return False
+
+
 def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
     """Run a claimed job and report how it ended. True if it finished."""
+    if job.kind == "automation":
+        return _run_automation(client, job, emit)
     session = tmux_session_name(job.id) if shutil.which("tmux") else None
     emit("claimed", job, session or "")
     reporter = _Reporter(client, job.id, session)

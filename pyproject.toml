@@ -42,7 +42,7 @@ include = ["workflow*", "commands*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-"workflow.deploy" = ["*.swift"]
+"workflow.deploy" = ["*.swift", "*.js"]
 
 [project.scripts]
 wf = "workflow.cli:app"
