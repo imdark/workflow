@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from workflow.deploy import automations
+from workflow.deploy import automations, checkpoint
 from workflow.deploy.notes import NotesReader
 from workflow.deploy.registry.notesgraph import NotesGraphError, load_token
 
@@ -470,7 +470,7 @@ def omniseek_endpoint(config: dict) -> tuple:
 
 
 def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
-                  config: dict, rules: str = "") -> tuple:
+                  config: dict, rules: str = "", resume: Optional[str] = None) -> tuple:
     """Claude Code as for a claude-code job, with OmniSeek's tools added."""
     url, token = omniseek_endpoint(config)
     return claude_code_argv(
@@ -483,6 +483,7 @@ def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
         extra_allowed=RESEARCH_ALLOWED_TOOLS,
         extra_prompt=RESEARCH_SYSTEM_PROMPT,
         rules=rules,
+        resume=resume,
     )
 
 
@@ -571,7 +572,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                      extra_mcp: Optional[dict] = None,
                      extra_allowed: Optional[list] = None,
                      extra_prompt: str = "", rules: str = "",
-                     session_context: str = "") -> tuple:
+                     session_context: str = "", resume: Optional[str] = None) -> tuple:
     """Claude Code with NotesGraph's tools and a way to ask the user.
 
     Returns (argv, env). The MCP config carries the NotesGraph token, so it
@@ -582,7 +583,9 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     `rules` is the user's "Agent rules" note (see load_agent_rules); it goes
     on the end of the system prompt, the server's or the built-in one alike,
     and to each subagent through a hook. `session_context` is added at
-    session start (see run_settings).
+    session start (see run_settings). `resume` is the session id of an
+    interrupted attempt to carry on (see checkpoint.resumable); `prompt` is
+    then what to tell it, not the task again.
     """
     mcp_path = job_dir / "mcp.json"
     mcp_config = {"mcpServers": {
@@ -629,6 +632,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         # No --max-turns: Claude Code counts every tool call as a turn, so an
         # agent's step limit (sized for the in-tab loop) ended real work a
         # couple of dozen calls in. The run's time limit bounds it instead.
+        *(["--resume", resume] if resume else []),
         prompt,
     ]
     return argv, {"MCP_TOOL_TIMEOUT": str(tool_timeout)}
@@ -831,6 +835,11 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     in the job directory; see `research_argv`. It fails up front if
     OmniSeek isn't installed or running.
 
+    A Claude job claimed again after an attempt that never finished (the
+    runner stopped, or lost contact long enough for the lease to lapse)
+    resumes that attempt's session in the same working directory, rather
+    than starting over; see checkpoint.
+
     Returns {"result", "steps", "session"}. When the capture proxy is
     reachable -- directly or down a reverse tunnel -- the conversation is
     recorded and billed to the account that owns the tunnel, so nothing
@@ -844,6 +853,9 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
 
     job_dir = JOB_ROOT / job.id
     job_dir.mkdir(parents=True, exist_ok=True)
+    # Before its files are cleared: an earlier attempt that never finished.
+    interrupted = checkpoint.interrupted_session(job_dir)
+    resume: Optional[str] = None
     for stale in ("log.txt", "result.json", "exit_code", *job_dir.glob("waiting-*")):
         (job_dir / stale).unlink(missing_ok=True)
 
@@ -858,12 +870,18 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             provider = job.model
             rules = load_agent_rules(client)
         if job.model == CLAUDE_CODE_MODEL:
-            argv, env = claude_code_argv(job, _prompt(job), job_dir, client, rules=rules)
             workdir = job_workdir(job_dir, cwd or Path.cwd())
+            resume = checkpoint.resumable(interrupted, job_dir, workdir)
+            argv, env = claude_code_argv(
+                job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
+                rules=rules, resume=resume)
         elif job.model == RESEARCH_MODEL:
-            argv, env = research_argv(job, _prompt(job), job_dir, client, config, rules=rules)
             # Research reads the world, not a repo: the job directory, no worktree.
             workdir = job_dir
+            resume = checkpoint.resumable(interrupted, job_dir, workdir)
+            argv, env = research_argv(
+                job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
+                config, rules=rules, resume=resume)
         elif job.model == COMMAND_MODEL:
             provider, argv = COMMAND_MODEL, command_argv(job, config)
             workdir = job_dir
@@ -877,16 +895,24 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
                                            Path.home() / ".wf" / "tasks" / issue.key.lower(),
                                            repo_path)
             from workflow.code_map import map_context
-            argv, env = claude_code_argv(job, _job_context(issue, job, workdir),
-                                         job_dir, client, plugin_dir, rules=rules,
-                                         session_context=map_context(workdir))
             # Same Claude account and capture proxy as `wf ai`.
-            env.update(apply_claude_env(dict(os.environ)))
+            claude_env = apply_claude_env(dict(os.environ))
+            resume = checkpoint.resumable(interrupted, job_dir, workdir, claude_env)
+            argv, env = claude_code_argv(
+                job, checkpoint.RESUME_PROMPT if resume else _job_context(issue, job, workdir),
+                job_dir, client, plugin_dir, rules=rules,
+                session_context=map_context(workdir), resume=resume)
+            env.update(claude_env)
         else:
             provider, argv = _provider_argv(job, config)
         (job_dir / "cmd.json").write_text(json.dumps(
             {"argv": argv, "provider": provider, "env": env,
-             "cwd": str(workdir) if workdir else None}))
+             "cwd": str(workdir) if workdir else None,
+             **({"resumed": True} if resume else {}),
+             # What its checkpoints name it by.
+             "job": {"id": job.id, "agentId": job.agent_id, "agentName": job.agent_name,
+                     "title": job.title, "model": job.model,
+                     "maxCostUsd": job.max_cost_usd}}))
         if repo_path:
             from workflow.pid_manager import create_ai_pid_file
             from workflow.session import task_branch_name
@@ -1060,9 +1086,14 @@ def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
                       steps=outcome["steps"], **outcome.get("usage", {}),
                       **({"changes": outcome["changes"]} if outcome.get("changes") else {}),
                       **({"logAppend": reporter.pending} if reporter.pending else {}))
+        # Done and reported: nothing will continue it. A failed run keeps its
+        # checkpoint, to be continued from.
+        checkpoint.discard(JOB_ROOT / job.id)
         emit("done", job)
         return True
     except JobCancelled:
+        # Stopped on purpose: nothing will continue it.
+        checkpoint.discard(JOB_ROOT / job.id)
         emit("cancelled", job)
     except Exception as e:
         try:
@@ -1101,6 +1132,9 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
     under a supervisor comes back on new code without dropping a job.
     """
     runner_id = runner_id or f"{socket.gethostname()}-{int(time.time())}"
+    # Failed runs' checkpoints past their keep: their refs pin objects in the
+    # user's repos.
+    checkpoint.prune(JOB_ROOT)
     emit = on_event or (lambda *a, **k: None)
     completed = 0
     # Slots taken: jobs running, and a claim in flight.
