@@ -1039,6 +1039,8 @@ def _run_claimed(client: JobClient, job: Job, config, emit) -> bool:
         emit("done", job)
         return True
     except JobCancelled:
+        # Stopped on purpose: nothing will continue it.
+        checkpoint.discard(JOB_ROOT / job.id)
         emit("cancelled", job)
     except Exception as e:
         try:
@@ -1077,6 +1079,9 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
     under a supervisor comes back on new code without dropping a job.
     """
     runner_id = runner_id or f"{socket.gethostname()}-{int(time.time())}"
+    # Failed runs' checkpoints past their keep: their refs pin objects in the
+    # user's repos.
+    checkpoint.prune(JOB_ROOT)
     emit = on_event or (lambda *a, **k: None)
     completed = 0
     # Slots taken: jobs running, and a claim in flight.

@@ -13,7 +13,8 @@ import pytest
 
 from workflow.deploy import checkpoint
 from workflow.deploy.checkpoint import (REF_PREFIX, Checkpointer, discard,
-                                        interrupted_session, resumable, run_base, snapshot)
+                                        interrupted_session, prune, resumable, run_base,
+                                        snapshot)
 from workflow.deploy.job_exec import Narrator
 from workflow.deploy.jobs import (Job, JobCancelled, JobClient, claude_code_argv,
                                   run_job)
@@ -143,7 +144,76 @@ def test_checkpoints_are_taken_at_most_every_so_often(repo, tmp_path):
     clock.now = 60
     assert not taker.maybe(narrator_with())
     clock.now = 121
-    assert taker.maybe(narrator_with())
+    assert taker.maybe(narrator_with()), "started in the background"
+    taker.wait()
+    assert (job_dir / "checkpoint" / "manifest.json").exists()
+    clock.now = 150
+    assert not taker.maybe(narrator_with()), "not again so soon"
+
+
+def test_an_idle_run_makes_no_new_commits(repo, tmp_path):
+    job_dir = tmp_path / "job1"
+    job_dir.mkdir()
+    taker = Checkpointer(job_dir, str(repo), run_base(job_dir, str(repo)))
+    (repo / "a.txt").write_text("a")
+    taker.take(narrator_with(), "periodic")
+    first = git(repo, "rev-parse", REF_PREFIX + "job1")
+    assert not taker.take(narrator_with(), "periodic")
+    assert git(repo, "rev-parse", REF_PREFIX + "job1") == first
+
+
+def test_a_change_in_spend_alone_is_a_new_checkpoint(repo, tmp_path):
+    job_dir = tmp_path / "job1"
+    job_dir.mkdir()
+    taker = Checkpointer(job_dir, str(repo), run_base(job_dir, str(repo)))
+    run = narrator_with()
+    taker.take(run, "periodic")
+    run.cost = 1.25
+    assert taker.take(run, "error")
+    manifest = json.loads((job_dir / "checkpoint" / "manifest.json").read_text())
+    assert manifest["why"] == "error" and manifest["spent"]["costUsd"] == 1.25
+
+
+def test_big_untracked_files_stay_out_of_the_repo(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(checkpoint, "MAX_FILE_BYTES", 100)
+    (repo / "big.bin").write_bytes(b"x" * 500)
+    (repo / "small.txt").write_text("s")
+    job_dir = tmp_path / "job1"
+    job_dir.mkdir()
+    Checkpointer(job_dir, str(repo), run_base(job_dir, str(repo))).take(narrator_with(), "end")
+    files = git(repo, "ls-tree", "-r", "--name-only", REF_PREFIX + "job1").split()
+    assert "small.txt" in files and "big.bin" not in files
+    manifest = json.loads((job_dir / "checkpoint" / "manifest.json").read_text())
+    assert manifest["repo"]["filesSkipped"] == ["big.bin"]
+
+
+def test_a_repo_holding_the_job_directory_is_not_snapshotted(repo, tmp_path):
+    """A home directory kept in git: the job's own files, token included."""
+    job_dir = repo / ".wf" / "agent-jobs" / "job1"
+    job_dir.mkdir(parents=True)
+    (job_dir / "mcp.json").write_text('{"token": "secret"}')
+    taker = Checkpointer(job_dir, str(job_dir), run_base(job_dir, str(job_dir)))
+    assert taker.take(narrator_with(steps=1), "error")
+    assert "repo" not in json.loads((job_dir / "checkpoint" / "manifest.json").read_text())
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q",
+                           REF_PREFIX + "job1"], capture_output=True).returncode != 0
+
+
+def test_old_checkpoints_are_pruned(repo, tmp_path):
+    import os
+    import time
+    root = tmp_path / "jobs"
+    for name in ("old", "new"):
+        job_dir = root / name
+        job_dir.mkdir(parents=True)
+        (repo / f"{name}.txt").write_text(name)
+        Checkpointer(job_dir, str(repo), run_base(job_dir, str(repo))).take(
+            narrator_with(), "error")
+    month_ago = time.time() - 30 * 86400
+    os.utime(root / "old" / "checkpoint" / "manifest.json", (month_ago, month_ago))
+    assert prune(root) == 1
+    assert not (root / "old" / "checkpoint").exists()
+    assert (root / "new" / "checkpoint").exists()
 
 
 def test_a_run_outside_a_repo_still_keeps_its_session(tmp_path, config_dir):

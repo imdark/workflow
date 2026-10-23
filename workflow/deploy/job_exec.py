@@ -215,8 +215,12 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
             error = ("\n".join(narrator.plain[-20:]).strip()[:500]
                      or f"{argv[0]} exited {code}")
 
-    # The last one, so a failed run can be continued from where it ended.
-    checkpoints.take(narrator, "error" if error else "end")
+    if error:
+        # The last one, so a failed run can be continued from where it ended.
+        checkpoints.take(narrator, "error")
+    else:
+        # A finished run's checkpoint is dropped; just let one in flight end.
+        checkpoints.wait()
     outcome = {"result": result, "steps": max(1, narrator.steps), "error": error,
                "costUsd": narrator.cost, "tokens": narrator.tokens}
     try:
