@@ -1,6 +1,7 @@
 # Mobile agents: moving a run to another machine, model or agent
 
-Status: design, not built (PERSONAL-144, 2026-10-21).
+Status: design (PERSONAL-144, 2026-10-21). Phase 1 is built: checkpoints
+in the job directory and same-device resume (`workflow/deploy/checkpoint.py`).
 
 A run today lives and dies on the device that claimed it. If that device
 drops off the network, the server notes "Lost contact" once the lease runs
