@@ -8,7 +8,9 @@
 // dialog with the whole question -- the tool input for a permission (a Bash
 // call as its description and its command, see `ToolInput`), the
 // choices for a question, a box to type in -- like the phone's notification
-// pane. The notification itself has quick Allow / Deny or Reply buttons.
+// pane. The notification itself has quick Allow / Allow all / Deny or Reply
+// buttons; "Allow all" also allows every later tool call in the run, as in
+// NotesGraph (deploying, spending and deleting still ask).
 //
 // The ask json: {"id", "kind": "question" | "permission", "heading",
 // "title", "text", "detail", "options", "dir", "parentPid"}.
@@ -16,7 +18,7 @@
 // Prints one JSON line on stdout and exits:
 //     {"shown": false, "error": ...}     notifications are off; nothing shown
 //     {"answer": ...}                    a question's answer
-//     {"allowed": true | false, "answer"?: ...}   a permission's
+//     {"allowed": true | false, "allowAll"?: true, "answer"?: ...}   a permission's
 // It quits quietly, taking the notification away, once `<dir>/<id>.cancel`
 // appears (answered elsewhere) or parentPid is gone.
 //
@@ -46,6 +48,7 @@ struct Click: Codable {
 
 let openAction = UNNotificationDefaultActionIdentifier
 let allowAction = "allow"
+let allowAllAction = "allow-all"
 let denyAction = "deny"
 let replyAction = "reply"
 
@@ -74,6 +77,7 @@ final class Notifier: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         identifier: "permission",
         actions: [
           UNNotificationAction(identifier: allowAction, title: "Allow"),
+          UNNotificationAction(identifier: allowAllAction, title: "Allow all"),
           UNNotificationAction(identifier: denyAction, title: "Deny"),
         ],
         intentIdentifiers: []),
@@ -167,6 +171,8 @@ final class Notifier: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     switch click.action {
     case allowAction:
       finish(["allowed": true])
+    case allowAllAction:
+      finish(["allowed": true, "allowAll": true])
     case denyAction:
       finish(["allowed": false])
     case replyAction:
@@ -223,6 +229,7 @@ final class Notifier: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     var choices: [String] = []
     if permission {
       alert.addButton(withTitle: "Allow")
+      alert.addButton(withTitle: "Allow all")
       alert.addButton(withTitle: "Deny")
     } else {
       alert.addButton(withTitle: "Send")
@@ -250,8 +257,9 @@ final class Notifier: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     let typed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
     if permission {
       switch index {
-      case 0, 1:
-        var result: [String: Any] = ["allowed": index == 0]
+      case 0, 1, 2:
+        var result: [String: Any] = ["allowed": index != 2]
+        if index == 1 { result["allowAll"] = true }
         if !typed.isEmpty { result["answer"] = typed }
         finish(result)
       default:
