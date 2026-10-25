@@ -652,7 +652,7 @@ def started(tmp_path, monkeypatch):
     monkeypatch.setattr("workflow.deploy.jobs._save_session",
                         lambda i, d, w: calls.__setitem__("saved", calls["saved"] + 1))
     monkeypatch.setattr("workflow.ai_providers.claude.skills_plugin_dir", lambda *a: None)
-    monkeypatch.setattr("workflow.session.apply_claude_env", lambda env=None: {})
+    monkeypatch.setattr("workflow.session.apply_claude_env", lambda env=None, project=None: {})
     return calls
 
 
@@ -730,10 +730,10 @@ def wf(repo, monkeypatch):
     """wf configured with one repo and the fake backend."""
     backend = FakeBackend()
     monkeypatch.setattr("workflow.backends.get_backend", lambda cfg, force_type=None: backend)
-    monkeypatch.setattr("workflow.config.load_effective_config", lambda: {})
+    monkeypatch.setattr("workflow.config.load_effective_config", lambda project=None: {})
     monkeypatch.setattr("workflow.config.is_git_enabled", lambda: True)
     monkeypatch.setattr("workflow.session.configured_repos",
-                        lambda: {str(repo): {"base_branch": "main"}})
+                        lambda project=None: {str(repo): {"base_branch": "main"}})
     monkeypatch.setattr("workflow.projects.get_current_project_repositories",
                         lambda: {str(repo): {}})
     monkeypatch.setattr("workflow.projects.get_default_repo", lambda project_name=None: None)
@@ -770,12 +770,31 @@ def test_a_reclaimed_job_keeps_its_ticket_and_worktree(repo, wf, tmp_path):
 
 
 def test_outside_a_configured_repo_it_runs_in_the_job_directory(wf, tmp_path, monkeypatch):
-    monkeypatch.setattr("workflow.session.configured_repos", lambda: {})
+    monkeypatch.setattr("workflow.session.configured_repos", lambda project=None: {})
     job_dir = tmp_path / "jobs" / "j1"
     job_dir.mkdir(parents=True)
     issue, workdir, repo_path = start_job_task(job(), job_dir, tmp_path)
     assert workdir == job_dir and repo_path is None
     assert wf.in_progress == [issue.key]
+
+
+def test_a_job_runs_in_the_repo_of_its_notesgraph_project(repo, wf, tmp_path, monkeypatch):
+    """Started from another checkout, a "notes" item still lands in the notes repo."""
+    seen = []
+    monkeypatch.setattr("workflow.projects.repo_for_notesgraph_project",
+                        lambda name, pid: seen.append((name, pid)) or ("personal", str(repo)))
+    monkeypatch.setattr("workflow.session.configured_repos",
+                        lambda project=None: {str(repo): {"base_branch": "main"}})
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    job_dir = tmp_path / "jobs" / "j1"
+    job_dir.mkdir(parents=True)
+
+    item = "Under: notes\nProject: notes (projectId: p-1)\n\nFix the board"
+    issue, workdir, repo_path = start_job_task(job(context=item), job_dir, elsewhere)
+
+    assert seen == [("notes", "p-1")]
+    assert workdir.parent == repo.parent and workdir.name.startswith("notes-ng-1-")
 
 
 def test_branch_names_drop_what_git_refuses():

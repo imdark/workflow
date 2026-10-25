@@ -87,3 +87,44 @@ class TestUpdateProject:
         cfg = yaml.safe_load(config_file.read_text())
         assert cfg["projects"]["personal"]["task_backend"] == "markdown"
         assert cfg["linear"]["team"] == "GLOBAL"
+
+
+class TestRepoForNotesgraphProject:
+    @pytest.fixture
+    def repos(self, tmp_path, monkeypatch):
+        """Two projects: personal with wf and notes-graph, work with robots."""
+        code = tmp_path / "code"
+        for name in ("workflow", "notes-graph", "robots", "app"):
+            (code / name).mkdir(parents=True)
+        cfg_path = tmp_path / "config.yaml"
+        monkeypatch.setattr("workflow.config.CFG", cfg_path)
+        monkeypatch.setattr("workflow.projects.get_current_project", lambda: "personal")
+        cfg_path.write_text(yaml.dump({"projects": {
+            "personal": {"repositories": {str(code / "workflow"): {},
+                                          str(code / "notes-graph"): {}}},
+            "work": {"default_repo": str(code / "robots"),
+                     "repositories": {str(code / "robots"): {},
+                                      str(code / "app"): {"notesgraph_project": "proj-9"}}},
+        }}))
+        return code
+
+    def test_a_repo_folder_named_like_the_project(self, repos):
+        from workflow.projects import repo_for_notesgraph_project
+
+        assert repo_for_notesgraph_project("notes graph", "e8b7") == \
+            ("personal", str(repos / "notes-graph"))
+
+    def test_a_wf_project_named_like_it_gives_its_default_repo(self, repos):
+        from workflow.projects import repo_for_notesgraph_project
+
+        assert repo_for_notesgraph_project("Work", "x") == ("work", str(repos / "robots"))
+
+    def test_a_repo_that_names_the_project_wins(self, repos):
+        from workflow.projects import repo_for_notesgraph_project
+
+        assert repo_for_notesgraph_project("Robots", "proj-9") == ("work", str(repos / "app"))
+
+    def test_nothing_matching(self, repos):
+        from workflow.projects import repo_for_notesgraph_project
+
+        assert repo_for_notesgraph_project("garden", "p-1") is None

@@ -410,23 +410,24 @@ def add_default_variables():
     return cfg
 
 
-def load_effective_config() -> Dict[str, Any]:
+def load_effective_config(project: Optional[str] = None) -> Dict[str, Any]:
     """
     Get the effective configuration, merging project config with global config.
     This is a wrapper around the projects module for backward compatibility.
+    `project` reads that project's config instead of the current one's.
     """
     try:
         from .projects import get_effective_config, migrate_to_project_config
-        
+
         # Check if we need to migrate
         cfg = load_config()
         if "projects" not in cfg or not cfg["projects"]:
             # Try auto-migration
             if migrate_to_project_config():
                 # Migration successful, get the new effective config
-                return get_effective_config()
-        
-        return get_effective_config()
+                return get_effective_config(project=project)
+
+        return get_effective_config(project=project)
     except ImportError:
         # Projects module not available, return regular config
         return load_config()

@@ -19,6 +19,7 @@ worktree and tmux session, so they don't share a checkout.
 import codecs
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -698,6 +699,30 @@ def _task_title(job: Job) -> str:
     return job.agent_name or f"Agent job {job.id[:8]}"
 
 
+# How NotesGraph names the project of the item a run was started on, in
+# the job's context (one line per item; the first is the run's own).
+_NOTESGRAPH_PROJECT_RE = re.compile(r"^Project: (.+) \(projectId: ([^)\s]+)\)\s*$", re.M)
+
+
+def job_home(job: Job) -> Optional[tuple]:
+    """The (wf project, repo) for the NotesGraph project the job's item is
+    in, or None when it names none or no configured repo matches.
+
+    Without it a job ran in whichever repo the runner was started in, so a
+    NotesGraph task filed under "notes graph" was worked on in wf's repo.
+    """
+    from workflow.projects import repo_for_notesgraph_project
+
+    for text in (job.context, job.instructions):
+        found = _NOTESGRAPH_PROJECT_RE.search(text or "")
+        if found:
+            try:
+                return repo_for_notesgraph_project(found.group(1).strip(), found.group(2))
+            except Exception:
+                return None
+    return None
+
+
 def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
     """Start a workflow job the way `wf start` starts a task.
 
@@ -707,6 +732,10 @@ def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
     In a configured repo the task's branch goes in a worktree beside the
     repo (`session.start_in_worktree`) -- never the checkout the runner
     was started in. Outside one, the job runs in its job directory.
+
+    The repo, and the wf project whose backend files the ticket, are the
+    ones matching the job's NotesGraph project (`job_home`) when one does;
+    otherwise the repo `cwd` resolves to, in the current project.
 
     Unlike `wf start` it leaves this machine's current task alone: a job
     in the background must not change what the terminal is working on.
@@ -718,7 +747,8 @@ def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
     from workflow.session import (base_branch_for, configured_repos,
                                   resolve_repo, start_in_worktree)
 
-    backend = get_backend(load_effective_config())
+    project, home_repo = job_home(job) or (None, None)
+    backend = get_backend(load_effective_config(project))
     task_file = job_dir / "task.json"
     issue = None
     if task_file.exists():
@@ -735,9 +765,12 @@ def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
 
     repo_path = None
     if is_git_enabled():
-        repos = configured_repos()
-        with chdir(cwd):
-            repo_path, _ = resolve_repo(repos)
+        repos = configured_repos(project)
+        if home_repo:
+            repo_path = home_repo
+        else:
+            with chdir(cwd):
+                repo_path, _ = resolve_repo(repos)
         if repo_path:
             workdir = Path(start_in_worktree(issue, repo_path, base_branch_for(repo_path, repos)))
             return issue, workdir, str(workdir)
@@ -831,6 +864,10 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     account, skills, task memory -- in the repo `cwd` resolves to; see
     `start_job_task`.
 
+    A claude-code or workflow job whose item is in a NotesGraph project runs
+    in the configured repo (and wf project) matching it instead of `cwd`'s;
+    see `job_home`.
+
     A "research" job is Claude Code with this device's OmniSeek attached,
     in the job directory; see `research_argv`. It fails up front if
     OmniSeek isn't installed or running.
@@ -869,8 +906,9 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
                 raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
             provider = job.model
             rules = load_agent_rules(client)
+        home = job_home(job) if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL) else None
         if job.model == CLAUDE_CODE_MODEL:
-            workdir = job_workdir(job_dir, cwd or Path.cwd())
+            workdir = job_workdir(job_dir, Path(home[1]) if home else cwd or Path.cwd())
             resume = checkpoint.resumable(interrupted, job_dir, workdir)
             argv, env = claude_code_argv(
                 job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
@@ -896,7 +934,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
                                            repo_path)
             from workflow.code_map import map_context
             # Same Claude account and capture proxy as `wf ai`.
-            claude_env = apply_claude_env(dict(os.environ))
+            claude_env = apply_claude_env(dict(os.environ), home[0] if home else None)
             resume = checkpoint.resumable(interrupted, job_dir, workdir, claude_env)
             argv, env = claude_code_argv(
                 job, checkpoint.RESUME_PROMPT if resume else _job_context(issue, job, workdir),

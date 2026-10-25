@@ -3,6 +3,7 @@ Project management for workflow
 """
 
 import os
+import re
 import yaml
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -259,23 +260,26 @@ def migrate_to_project_config() -> bool:
     return True
 
 
-def get_effective_config(auto_switch: bool = True) -> Dict[str, Any]:
+def get_effective_config(auto_switch: bool = True, project: Optional[str] = None) -> Dict[str, Any]:
     """
     Get the effective configuration, merging project config with global config.
     Project config takes precedence over global config.
-    
+
     Args:
-        auto_switch: If True, automatically switch to the project that matches 
+        auto_switch: If True, automatically switch to the project that matches
                      the current working directory
+        project: Use this project's config, without switching to it
     """
     cfg = load_config()
-    
+
     # Check if we need to migrate first
     if "projects" not in cfg or not cfg["projects"]:
         return cfg
-    
+
     # Get the appropriate project based on cwd
-    if auto_switch:
+    if project:
+        current_project = project
+    elif auto_switch:
         current_project = get_project_for_cwd(switch_if_needed=True, verbose=False)
     else:
         current_project = get_current_project()
@@ -324,6 +328,58 @@ def get_project_repositories(project_name: Optional[str] = None) -> Dict[str, An
     else:
         effective_config = get_effective_config()
         return effective_config.get("repositories", {})
+
+
+def _name_key(name: str) -> str:
+    """A name compared ignoring case, spaces and punctuation."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def repo_for_notesgraph_project(name: str, project_id: str = "") -> Optional[tuple]:
+    """The (wf project, repo path) a NotesGraph project's tasks run in.
+
+    A repo whose config names it (`notesgraph_project:` its name or id)
+    wins; then a repo whose folder is named like it, ignoring case, spaces
+    and dashes ("notes graph" is ~/code/notes-graph); then the default (or
+    first) repo of a wf project named like it. Only repos on disk count; the
+    current project's come first. The wf project is None for a global repo.
+    None when nothing matches.
+    """
+    key = _name_key(name or "")
+    if not key and not project_id:
+        return None
+    current = get_current_project()
+    projects = sorted(list_projects().items(), key=lambda item: item[0] != current)
+
+    candidates = []
+    for project_name, project in projects:
+        for path, conf in (project.get("repositories") or {}).items():
+            candidates.append((project_name, path, conf))
+    from .config import get_repositories
+    for path, conf in (get_repositories() or {}).items():
+        candidates.append((None, path, conf))
+    candidates = [(p, path, conf if isinstance(conf, dict) else {})
+                  for p, path, conf in candidates if Path(path).is_dir()]
+
+    for project_name, path, conf in candidates:
+        named = str(conf.get("notesgraph_project") or "")
+        if named and (named == project_id or (key and _name_key(named) == key)):
+            return project_name, path
+    if not key:
+        return None
+    for project_name, path, _ in candidates:
+        if _name_key(Path(path).name) == key:
+            return project_name, path
+    for project_name, project in projects:
+        if _name_key(project_name) != key:
+            continue
+        default = project.get("default_repo")
+        on_disk = [path for p, path, _ in candidates if p == project_name]
+        if default in on_disk:
+            return project_name, default
+        if on_disk:
+            return project_name, on_disk[0]
+    return None
 
 
 def set_default_repo(project_name: str, repo_path: str) -> None:
