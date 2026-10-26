@@ -45,6 +45,108 @@ def test_the_code_sees_nothing_of_the_runner():
 
 
 @needs_node
+def test_plain_code_has_no_sh():
+    assert json.loads(run_automation(code_job("return typeof sh"))) == "undefined"
+
+
+@needs_node
+def test_a_shell_automation_runs_commands_and_logs_their_output(tmp_path):
+    logs = []
+    result = run_automation(
+        code_job(
+            'const r = await sh("echo hi; pwd", {cwd: input.cwd});'
+            ' return r.output.trim().split("\\n")',
+            shell=True, input={"cwd": str(tmp_path)}),
+        on_tick=lambda text: logs.append(text) and False)
+    assert json.loads(result) == ["hi", str(tmp_path.resolve())]
+    assert "hi\n" in "".join(logs)
+
+
+@needs_node
+def test_a_failing_command_fails_a_shell_automation_unless_unchecked():
+    with pytest.raises(AutomationFailed, match="exited 3: nope"):
+        run_automation(code_job('await sh("echo nope; exit 3")', shell=True))
+    result = run_automation(code_job(
+        'return (await sh("exit 3", {check: false})).code', shell=True))
+    assert json.loads(result) == 3
+
+
+@needs_node
+def test_a_shell_automation_gets_home_but_not_wf_tokens(monkeypatch):
+    monkeypatch.setenv("NOTESGRAPH_TOKEN", "secret")
+    result = run_automation(code_job(
+        'return (await sh("echo $HOME:$NOTESGRAPH_TOKEN")).output.trim()',
+        shell=True))
+    assert json.loads(result) == f"{automations.os.environ['HOME']}:"
+
+
+@needs_node
+def test_a_timeout_stops_the_commands_a_shell_automation_started(tmp_path):
+    marker = tmp_path / "still-running"
+    with pytest.raises(AutomationFailed, match="^Timed out"):
+        run_automation(code_job(
+            f'await sh("sleep 3 && touch {marker}")',
+            shell=True, timeoutSeconds=1))
+    import time
+    time.sleep(3)
+    assert not marker.exists()
+
+
+def actions_job(code, **payload):
+    return {"code": code, "runtime": "actions", "timeoutSeconds": 10, **payload}
+
+
+def test_actions_yaml_runs_commands_in_order_with_inputs_and_earlier_results():
+    logs = []
+    result = run_automation(actions_job(
+        "actions:\n"
+        "  - id: greet\n"
+        "    type: custom_command\n"
+        "    command: echo hello {input.who}\n"
+        "  - id: again\n"
+        "    type: custom_command\n"
+        "    command: echo {steps.greet.stdout}!\n",
+        input={"who": "it's me; rm -rf /"}),
+        on_tick=lambda text: logs.append(text) and False)
+    steps = json.loads(result)
+    # Filled-in values are quoted: the input's `;` is text, not a command.
+    assert steps["greet"]["stdout"] == "hello it's me; rm -rf /"
+    assert steps["again"]["stdout"] == "hello it's me; rm -rf /!"
+    assert "▶ greet (custom_command)" in "".join(logs)
+
+
+def test_a_failing_action_fails_the_run_unless_optional():
+    with pytest.raises(AutomationFailed, match="boom: exited 2: nope"):
+        run_automation(actions_job(
+            "actions:\n  - id: boom\n    type: custom_command\n"
+            "    command: echo nope; exit 2\n"))
+    result = run_automation(actions_job(
+        "actions:\n  - id: boom\n    type: custom_command\n"
+        "    command: exit 2\n    optional: true\n"
+        "  - type: custom_command\n    command: echo after\n"))
+    assert json.loads(result)["step2"]["stdout"] == "after"
+
+
+def test_malformed_actions_yaml_says_why():
+    with pytest.raises(AutomationFailed, match="needs a `type`"):
+        run_automation(actions_job("actions:\n  - command: echo hi\n"))
+    with pytest.raises(AutomationFailed, match="names nothing"):
+        run_automation(actions_job(
+            "actions:\n  - type: custom_command\n    command: echo {input.nope}\n"))
+
+
+def test_a_timeout_stops_an_actions_command(tmp_path):
+    marker = tmp_path / "still-running"
+    with pytest.raises(AutomationFailed, match="^Timed out"):
+        run_automation(actions_job(
+            "actions:\n  - type: custom_command\n"
+            f"    command: sleep 3 && touch {marker}\n", timeoutSeconds=1))
+    import time
+    time.sleep(3)
+    assert not marker.exists()
+
+
+@needs_node
 def test_a_thrown_error_fails_the_run_with_its_message():
     with pytest.raises(AutomationFailed, match="no luck"):
         run_automation(code_job('throw new Error("no luck")'))

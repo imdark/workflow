@@ -17,6 +17,7 @@ class ActionType(Enum):
     BROWSER_CLICK = "browser_click"
     BROWSER_TYPE = "browser_type"
     GITHUB_COMMENT_LOOKUP = "github_comment_lookup"
+    CLOUD_DEPLOY = "cloud_deploy"
 
 
 class Action(ABC):
