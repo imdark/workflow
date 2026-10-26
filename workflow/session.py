@@ -14,14 +14,15 @@ from pathlib import Path
 from typing import Optional
 
 
-def configured_repos() -> dict:
-    """Every repository wf knows about: global ones plus the project's."""
+def configured_repos(project: Optional[str] = None) -> dict:
+    """Every repository wf knows about: global ones plus the project's
+    (the current one unless `project` names another)."""
     from workflow.config import get_repositories
     from workflow.projects import get_project_repositories
 
     repos = {}
     repos.update(get_repositories())
-    repos.update(get_project_repositories())
+    repos.update(get_project_repositories(project))
     return repos
 
 
@@ -71,11 +72,12 @@ def start_in_worktree(issue, repo_path: str, base_branch: str) -> str:
     return worktree_path
 
 
-def apply_claude_env(env: Optional[dict] = None) -> dict:
+def apply_claude_env(env: Optional[dict] = None, project: Optional[str] = None) -> dict:
     """Point a Claude launch at the project's account and the capture proxy.
 
     Sets CLAUDE_CONFIG_DIR and the proxy base URL in `env` (default: this
-    process's environment). Returns what it applied, for logging.
+    process's environment). The account is the current project's unless
+    `project` names another. Returns what it applied, for logging.
     """
     from workflow import claude_accounts
     from workflow.ai_providers.base import apply_proxy_env
@@ -83,7 +85,7 @@ def apply_claude_env(env: Optional[dict] = None) -> dict:
     if env is None:
         env = os.environ
     applied = dict(apply_proxy_env(env) or {})
-    account_dir = claude_accounts.apply(env)
+    account_dir = claude_accounts.apply(env, project)
     if account_dir:
         applied[claude_accounts.ENV_VAR] = account_dir
     return applied
