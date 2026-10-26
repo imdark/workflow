@@ -6539,6 +6539,10 @@ app.add_typer(deploy_app, name="deploy")
 from workflow.cli_agent import agent_app
 app.add_typer(agent_app, name="agent")
 
+# Persistent SSH sessions shared by every Claude session (the `ssh` MCP server).
+from workflow.cli_ssh import ssh_app
+app.add_typer(ssh_app, name="ssh")
+
 from commands.explore import explore as explore_cmd, list as explore_list, delete as explore_delete
 
 @explore_app.command("explore", help="Explore a codebase and store context as an AI skill")
