@@ -14,11 +14,12 @@ from .terminal import TerminalAction
 from .command import CustomCommandAction, AliasAction
 from .browser import BrowserAction
 from .github import GitHubCommentLookupAction
+from .deploy import CloudDeployAction
 
 __all__ = [
     'Action', 'ActionType', 'ActionRegistry',
     'get_action_registry', 'create_action_from_config',
     'NotificationAction', 'TaskAction', 'AIConsoleAction',
     'TerminalAction', 'CustomCommandAction', 'AliasAction',
-    'BrowserAction', 'GitHubCommentLookupAction'
+    'BrowserAction', 'GitHubCommentLookupAction', 'CloudDeployAction'
 ]

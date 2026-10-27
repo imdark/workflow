@@ -19,6 +19,7 @@ class ActionRegistry:
         from .command import CustomCommandAction, AliasAction
         from .browser import BrowserAction
         from .github import GitHubCommentLookupAction
+        from .deploy import CloudDeployAction
         from .base import ActionType
         
         self._action_creators = {
@@ -33,6 +34,7 @@ class ActionRegistry:
             ActionType.BROWSER_CLICK: lambda action_id: BrowserAction(action_id, 'click'),
             ActionType.BROWSER_TYPE: lambda action_id: BrowserAction(action_id, 'type'),
             ActionType.GITHUB_COMMENT_LOOKUP: lambda action_id: GitHubCommentLookupAction(action_id),
+            ActionType.CLOUD_DEPLOY: lambda action_id: CloudDeployAction(action_id),
         }
     
     def register_action(self, action: Any):

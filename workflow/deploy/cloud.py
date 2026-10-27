@@ -48,6 +48,33 @@ def target_from(project_config: Optional[dict]) -> Optional[CloudTarget]:
                        verify_url=section.get("verify_url"))
 
 
+def find_target(project: Optional[str] = None) -> Tuple[str, CloudTarget]:
+    """The cloud target to deploy: `project`'s, or else the current
+    project's, or else the only project's that has one. Raises ValueError
+    saying why there is none to pick."""
+    from workflow.projects import get_current_project, list_projects
+
+    projects = list_projects()
+    if project:
+        target = target_from(projects.get(project))
+        if not target:
+            raise ValueError(f"project '{project}' has no cloud deploy")
+        return project, target
+    current = get_current_project()
+    target = target_from(projects.get(current)) if current else None
+    if target:
+        return current, target
+    configured = [(name, t) for name, cfg in projects.items()
+                  if (t := target_from(cfg))]
+    if len(configured) == 1:
+        return configured[0]
+    if not configured:
+        raise ValueError("no project has a cloud deploy; set one with "
+                         "'wf deploy cloud-config'")
+    raise ValueError("several projects have a cloud deploy; name one with "
+                     "'project': " + ", ".join(name for name, _ in configured))
+
+
 def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
 
