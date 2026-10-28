@@ -180,7 +180,13 @@ case "$CURRENT_SHELL" in
 esac
 
 # -----------------------------
-# 8. Done
+# 8. Install the Claude skills this repo ships
+# -----------------------------
+echo "🧩 Installing Claude skills into ~/.claude/skills"
+./wf skill install || echo "⚠️  Could not install Claude skills; run: wf skill install"
+
+# -----------------------------
+# 9. Done
 # -----------------------------
 echo
 echo "✅ Installation complete"
