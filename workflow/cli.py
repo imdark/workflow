@@ -6543,6 +6543,31 @@ app.add_typer(agent_app, name="agent")
 from workflow.cli_ssh import ssh_app
 app.add_typer(ssh_app, name="ssh")
 
+
+# Fork the running Claude conversation into a new terminal tab (the /side skill).
+@app.command("side")
+def side(
+    session: str = typer.Option(None, "--session", "-s",
+                                          help="Session to fork (default: $CLAUDE_CODE_SESSION_ID)"),
+    cwd: str = typer.Option(None, "--cwd", help="Directory for the new tab (default: here)"),
+    terminal: str = typer.Option(None, "--terminal", "-t",
+                                           help="tmux, iterm or terminal (default: detected)"),
+):
+    """Open a new tab running a fork of the current Claude conversation, and switch to it."""
+    from workflow import side as side_mod
+
+    session = session or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session:
+        typer.echo("❌ No session to fork: run this from Claude Code or pass --session", err=True)
+        raise typer.Exit(1)
+    pid = os.environ.get("CLAUDE_PID")
+    try:
+        used = side_mod.open_side(session, cwd, terminal, int(pid) if pid else None)
+    except RuntimeError as e:
+        typer.echo(f"❌ {e}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"🍴 Forked {session[:8]} into a new {used} tab")
+
 from commands.explore import explore as explore_cmd, list as explore_list, delete as explore_delete
 
 @explore_app.command("explore", help="Explore a codebase and store context as an AI skill")
