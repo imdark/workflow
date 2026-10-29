@@ -122,3 +122,13 @@ def test_jobs_run_claude_as_the_account_wf_was_installed_from(monkeypatch):
 
     monkeypatch.delenv("CLAUDE_CONFIG_DIR")
     assert "CLAUDE_CONFIG_DIR" not in supervisor.service_env()
+
+
+def test_a_server_signs_claude_in_with_its_token(monkeypatch):
+    """A server has no browser for `claude login`; it runs on a `claude
+    setup-token` token, which only the environment carries."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-test")
+    assert supervisor.service_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-test"
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in supervisor.service_env()
