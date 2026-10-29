@@ -316,6 +316,24 @@ def command_argv(job: "Job", config: dict) -> list:
         raise RuntimeError("The monitor sent no command to run.")
     return ["sh", "-c", command]
 
+
+def keep_awake(config: dict, job_dir: Path) -> bool:
+    """Whether a run holds off sleep while it runs, on a Mac with `caffeinate`.
+
+    A prestart automation asks for it per job with the keep_awake action
+    (workflow/actions/keep_awake.py), which leaves a mark in the job's
+    directory. `agent.caffeinate` in the wf config overrides that: true for
+    every run, false for none.
+    """
+    from workflow.actions.keep_awake import MARKER
+
+    if sys.platform != "darwin" or shutil.which("caffeinate") is None:
+        return False
+    setting = (config.get("agent") or {}).get("caffeinate")
+    if setting is not None:
+        return bool(setting)
+    return (job_dir / MARKER).exists()
+
 # Appended to Claude Code's own system prompt for a claude-code job. The
 # point is that the agent asks rather than guesses, and that each answer is
 # written into NotesGraph so the next run finds it instead of asking again.
@@ -947,6 +965,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             {"argv": argv, "provider": provider, "env": env,
              "cwd": str(workdir) if workdir else None,
              **({"resumed": True} if resume else {}),
+             **({"caffeinate": True} if keep_awake(config, job_dir) else {}),
              # What its checkpoints name it by.
              "job": {"id": job.id, "agentId": job.agent_id, "agentName": job.agent_name,
                      "title": job.title, "model": job.model,
