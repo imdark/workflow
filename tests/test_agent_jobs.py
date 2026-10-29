@@ -5,6 +5,7 @@ tested is the runner's contract: it claims, it reports exactly once per
 outcome, and a failing job never takes the loop down.
 """
 
+import io
 import json
 
 import pytest
@@ -640,3 +641,56 @@ def test_an_unchanged_run_reports_no_changes_key(fake_provider):
     outcome = run_job(Job.from_payload(payload()), config={}, use_tmux=False,
                       tick_seconds=0.05)
     assert "changes" not in outcome
+
+
+@pytest.mark.parametrize("platform, on_path, agent, marked, expected", [
+    ("darwin", True, {}, False, False),
+    ("darwin", True, {}, True, True),
+    ("darwin", True, {"caffeinate": True}, False, True),
+    ("darwin", True, {"caffeinate": False}, True, False),
+    ("darwin", False, {}, True, False),
+    ("linux", True, {"caffeinate": True}, True, False),
+])
+def test_a_run_keeps_a_mac_awake_when_an_automation_or_the_config_asks(
+        tmp_path, monkeypatch, platform, on_path, agent, marked, expected):
+    from workflow.deploy import jobs
+
+    monkeypatch.setattr(jobs.sys, "platform", platform)
+    monkeypatch.setattr(jobs.shutil, "which", lambda name: "/usr/bin/caffeinate" if on_path else None)
+    if marked:
+        (tmp_path / "keep-awake").touch()
+    assert jobs.keep_awake({"agent": agent}, tmp_path) is expected
+
+
+def test_the_keep_awake_action_marks_the_prestart_hooks_job(tmp_path, monkeypatch):
+    from workflow.deploy import automation_actions
+
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path)
+    steps = automation_actions.run({
+        "code": "actions:\n  - id: awake\n    type: keep_awake\n",
+        "input": {"hook": "prestart", "job": {"id": "job-1", "title": "x"}},
+    })
+    assert steps["awake"] == {"success": True, "job": "job-1"}
+    assert (tmp_path / "job-1" / "keep-awake").exists()
+
+
+@pytest.mark.parametrize("job", [None, "", "../etc", {"title": "no id"}])
+def test_the_keep_awake_action_needs_a_job(tmp_path, monkeypatch, job):
+    from workflow.actions.keep_awake import KeepAwakeAction
+
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path)
+    assert KeepAwakeAction("awake").execute({"job": job})["success"] is False
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_caffeinated_run_watches_the_providers_pid(tmp_path, monkeypatch):
+    import sys
+    from workflow.deploy import job_exec
+
+    (tmp_path / "cmd.json").write_text(json.dumps(
+        {"argv": [sys.executable, "-c", "print('hi')"], "provider": "x", "caffeinate": True}))
+    watched = []
+    monkeypatch.setattr(job_exec, "keep_awake", watched.append)
+    monkeypatch.setattr(job_exec, "run_base", lambda *a: None)
+    job_exec.run(tmp_path, out=io.StringIO())
+    assert len(watched) == 1 and isinstance(watched[0], int)

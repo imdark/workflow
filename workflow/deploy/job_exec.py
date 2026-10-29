@@ -12,6 +12,7 @@ Files in <job-dir>:
     cmd.json     written by the runner: {"argv": [...], "provider": "...",
                  "env": {...extra environment}, "cwd": "where to run" | null,
                  "resumed"?: true when it resumes an interrupted attempt,
+                 "caffeinate"?: true to keep the Mac awake while it runs,
                  "job"?: {...what the checkpoint manifest names it by}}
     log.txt      the transcript, appended as the run goes
     result.json  {"result": str, "steps": int, "error": str|null,
@@ -167,6 +168,19 @@ class Narrator:
             self.say(f"✓ finished in {self.steps} turns{tail}")
 
 
+def keep_awake(pid: int) -> None:
+    """Hold off idle and system sleep until the process `pid` exits.
+
+    `caffeinate -w` watches the process and lets go when it ends, however it
+    ends, so nothing has to stop it.
+    """
+    try:
+        subprocess.Popen(["caffeinate", "-ims", "-w", str(pid)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        pass
+
+
 def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
     spec = json.loads((job_dir / "cmd.json").read_text())
     argv = spec["argv"]
@@ -195,6 +209,8 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
                 text=True, bufsize=1, env={**os.environ, **extra_env},
                 cwd=cwd,
             )
+            if spec.get("caffeinate"):
+                keep_awake(proc.pid)
             for line in proc.stdout:
                 narrator.feed(line)
                 checkpoints.note_session(narrator.session_id)

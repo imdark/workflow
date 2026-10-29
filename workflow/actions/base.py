@@ -18,6 +18,7 @@ class ActionType(Enum):
     BROWSER_TYPE = "browser_type"
     GITHUB_COMMENT_LOOKUP = "github_comment_lookup"
     CLOUD_DEPLOY = "cloud_deploy"
+    KEEP_AWAKE = "keep_awake"
 
 
 class Action(ABC):

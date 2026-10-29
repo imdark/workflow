@@ -20,6 +20,7 @@ class ActionRegistry:
         from .browser import BrowserAction
         from .github import GitHubCommentLookupAction
         from .deploy import CloudDeployAction
+        from .keep_awake import KeepAwakeAction
         from .base import ActionType
         
         self._action_creators = {
@@ -35,6 +36,7 @@ class ActionRegistry:
             ActionType.BROWSER_TYPE: lambda action_id: BrowserAction(action_id, 'type'),
             ActionType.GITHUB_COMMENT_LOOKUP: lambda action_id: GitHubCommentLookupAction(action_id),
             ActionType.CLOUD_DEPLOY: lambda action_id: CloudDeployAction(action_id),
+            ActionType.KEEP_AWAKE: lambda action_id: KeepAwakeAction(action_id),
         }
     
     def register_action(self, action: Any):

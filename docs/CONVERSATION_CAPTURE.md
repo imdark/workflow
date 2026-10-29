@@ -444,6 +444,31 @@ wf agent jobs               # recent jobs and their outcomes
 usually needs no arguments. Ctrl-C stops it; a job already running is left to
 finish, and its lease lapses if the process dies.
 
+### Keeping a Mac awake during a run
+
+A `prestart` automation can keep the Mac awake while an agent run goes on,
+with the `keep_awake` action. Create it in NotesGraph with the **actions**
+runtime, a **hook: prestart** trigger, and deploy it to the Mac the agent
+runs on:
+
+```yaml
+actions:
+  - id: awake
+    type: keep_awake
+```
+
+It marks the job it was started for; when that job runs on this device, the
+run holds off sleep (`caffeinate -ims -w` on the agent's process) until the
+agent exits, however it ends. Add a trigger filter (`agentId`, ...) to do it
+for some agents only. To decide on the device instead, `agent.caffeinate`
+overrides any automation: `true` for every run, `false` for none.
+
+```yaml
+# ~/.wf/config.yaml
+agent:
+  caffeinate: true
+```
+
 ## The "Agent rules" note
 
 The conventions a Claude run follows (facts go under "Agent memory", every
