@@ -193,8 +193,10 @@ WantedBy=default.target
 
 
 # Which Claude account jobs run as. Without it `claude` falls back to
-# ~/.claude, whose login may be a different account or long expired.
-CLAUDE_ENV = ("CLAUDE_CONFIG_DIR",)
+# ~/.claude, whose login may be a different account or long expired. A
+# server with no browser to log in from signs in with a `claude setup-token`
+# token instead, which only the environment carries.
+CLAUDE_ENV = ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN")
 
 
 def service_env() -> dict:
