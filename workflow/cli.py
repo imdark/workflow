@@ -3005,13 +3005,11 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                     pr_created = True  # Count existing PR as successful for task status
                     continue
                 
-                # Get repository info for PR base branch
-                base_branch = repos.get(current_repo_path, {}).get("base_branch")
-                
-                # Use smart default if no base branch configured
-                if not base_branch:
-                    base_branch = get_default_branch(current_repo_path)
-                
+                # The PR goes into the base the task's branch started from;
+                # from a task worktree that's its main checkout's setting.
+                from workflow.session import base_branch_for
+                base_branch = base_branch_for(current_repo_path, repos)
+
                 # Check if there are any differences with base branch or for specified repo
                 has_diff = has_diff_with_base(current_repo_path, base_branch)
                 

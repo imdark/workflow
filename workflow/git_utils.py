@@ -140,8 +140,56 @@ def get_uncommitted_changes_summary(repo_path: Optional[str] = None) -> str:
     
     return ", ".join(changes) if changes else "no changes"
 
+def remote_default_branch(repo_path: Optional[str] = None) -> Optional[str]:
+    """The branch origin's HEAD points at (GitHub's default branch), or None.
+
+    Asks the remote, since the local origin/HEAD is only set at clone time and
+    goes stale when the default changes; falls back to it when offline.
+    """
+    cwd = repo_path or "."
+    try:
+        out = subprocess.run(
+            ["git", "ls-remote", "--symref", "origin", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, timeout=15,
+        )
+        for line in out.stdout.splitlines():
+            # "ref: refs/heads/stage\tHEAD"
+            if line.startswith("ref: refs/heads/"):
+                return line.split()[1].removeprefix("refs/heads/")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        out = subprocess.run(
+            ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            cwd=cwd, capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip().startswith("origin/"):
+            return out.stdout.strip().removeprefix("origin/")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+def main_checkout(repo_path: str) -> Optional[str]:
+    """The main checkout a worktree belongs to (itself for a main checkout), or None."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=repo_path, capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    common = out.stdout.strip()
+    if out.returncode != 0 or not common.endswith("/.git"):
+        return None
+    return common.removesuffix("/.git")
+
 def get_default_branch(repo_path: Optional[str] = None) -> str:
     """Get the best default branch for the repository with priority order"""
+    # The remote's own default wins: a repo whose default is `stage` also has
+    # a `main`, and guessing by name would pick that.
+    remote = remote_default_branch(repo_path)
+    if remote:
+        return remote
     available_branches = get_available_branches(repo_path)
     standard_branches = ["main", "master", "develop", "dev", "development"]
     

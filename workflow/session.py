@@ -53,10 +53,21 @@ def task_branch_name(issue) -> str:
 
 
 def base_branch_for(repo_path: str, repos: dict, base: Optional[str] = None) -> str:
-    """The branch new task work starts from in `repo_path`."""
-    from workflow.git_utils import get_default_branch
+    """The branch task work in `repo_path` starts from and its PR goes into.
 
-    return base or (repos.get(repo_path) or {}).get("base_branch") or get_default_branch(repo_path)
+    A task's worktree isn't in the config itself, so its main checkout's
+    setting is used; with neither, the remote's default branch.
+    """
+    from workflow.git_utils import get_default_branch, main_checkout
+
+    if base:
+        return base
+    configured = (repos.get(repo_path) or {}).get("base_branch")
+    if not configured:
+        checkout = main_checkout(repo_path)
+        if checkout and checkout != repo_path:
+            configured = (repos.get(checkout) or {}).get("base_branch")
+    return configured or get_default_branch(repo_path)
 
 
 def start_in_worktree(issue, repo_path: str, base_branch: str) -> str:
