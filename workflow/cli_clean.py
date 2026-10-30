@@ -157,10 +157,14 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
             for current_repo_path in repo_paths:
                 typer.echo(f"Processing repository: {current_repo_path}")
                 
-                # The PR goes into the base the task's branch started from;
-                # from a task worktree that's its main checkout's setting.
-                from workflow.session import base_branch_for
-                base_branch = base_branch_for(current_repo_path, repos)
+                # The PR goes into the repo's configured base branch; from a
+                # task worktree that's its main checkout's setting.
+                from workflow.session import BaseBranchNotConfigured, base_branch_for
+                try:
+                    base_branch = base_branch_for(current_repo_path, repos)
+                except BaseBranchNotConfigured as e:
+                    typer.echo(f"❌ {e}")
+                    raise typer.Exit(1)
 
                 # Check if there are any differences with base branch or for specified repo
                 if has_diff_with_base(current_repo_path, base_branch) or repo_path:
