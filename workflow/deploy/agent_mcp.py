@@ -52,6 +52,20 @@ POLL_SECONDS = 2.0
 NOTIFY_AFTER_SECONDS = 5.0
 # Matches the server's cap on a question's detail (registry jobs.ts MAX_DETAIL).
 MAX_DETAIL = 200_000
+# Rate limited, or the server restarting: worth asking again, for up to
+# RETRY_FOR_SECONDS, rather than failing the tool call.
+RETRY_STATUSES = {429, 502, 503, 504}
+RETRY_FOR_SECONDS = 120.0
+RETRY_PAUSE_SECONDS = 5.0
+
+
+def retry_after(header: Optional[str]) -> float:
+    """Seconds to wait before asking again: the server's Retry-After, kept
+    between 1 and 30, or RETRY_PAUSE_SECONDS when it gave none."""
+    try:
+        return min(max(float(header), 1.0), 30.0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return RETRY_PAUSE_SECONDS
 
 TOOLS = [
     {
@@ -264,22 +278,37 @@ class Questions:
 
     def __init__(self, url: str, workspace: str, job: str, token: str,
                  job_dir: Optional[Path] = None, poll_seconds: float = POLL_SECONDS,
-                 notify_after: float = NOTIFY_AFTER_SECONDS):
+                 notify_after: float = NOTIFY_AFTER_SECONDS,
+                 retry_for: float = RETRY_FOR_SECONDS):
         self.job_url = f"{url.rstrip('/')}/api/registry/workspaces/{workspace}/jobs/{job}"
         self.base = f"{self.job_url}/questions"
         self.token, self.job_dir, self.poll_seconds = token, job_dir, poll_seconds
-        self.notify_after = notify_after
+        self.notify_after, self.retry_for = notify_after, retry_for
         self.title = ""  # the run's name once set_title has given it one
 
-    def _request(self, method: str, url: str, payload: Optional[dict] = None) -> dict:
+    def _request(self, method: str, url: str, payload: Optional[dict] = None,
+                 retry: bool = True) -> dict:
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
-        request = urllib.request.Request(
-            url, data=body, method=method,
-            headers={"Authorization": f"Bearer {self.token}",
-                     "Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8") or "{}")
+        waited = 0.0 if retry else self.retry_for
+        while True:
+            request = urllib.request.Request(
+                url, data=body, method=method,
+                headers={"Authorization": f"Bearer {self.token}",
+                         "Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    return json.loads(response.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as e:
+                # Every run on this machine shares the server's rate limit,
+                # and a 429 on a permission would deny a tool the person
+                # allowed (with "Allow all", one after another). Wait it out.
+                if e.code not in RETRY_STATUSES or waited >= self.retry_for:
+                    raise
+                pause = min(retry_after(e.headers.get("Retry-After")),
+                            self.retry_for - waited)
+                time.sleep(pause)
+                waited += max(pause, 0.1)
 
     def take_steers(self) -> list:
         """The instructions sent to the run since the last take, each once.
@@ -287,7 +316,9 @@ class Questions:
         Empty when the server can't be reached: they wait there for the
         next step, and a failed read is no reason to stop the run."""
         try:
-            return self._request("POST", f"{self.job_url}/steer/take", {}).get("steers") or []
+            # No waiting out a rate limit: they keep for the next take.
+            return self._request("POST", f"{self.job_url}/steer/take", {},
+                                 retry=False).get("steers") or []
         except (urllib.error.URLError, OSError, ValueError):
             return []
 
@@ -323,7 +354,7 @@ class Questions:
                                          args=(notifier, question["id"], heading, text),
                                          daemon=True).start()
                 try:
-                    data = self._request("GET", f"{self.base}/{question['id']}")
+                    data = self._request("GET", f"{self.base}/{question['id']}", retry=False)
                 except (urllib.error.URLError, OSError):
                     # A server blip while someone is thinking is not an
                     # answer; keep waiting.
