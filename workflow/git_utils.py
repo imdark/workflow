@@ -140,6 +140,20 @@ def get_uncommitted_changes_summary(repo_path: Optional[str] = None) -> str:
     
     return ", ".join(changes) if changes else "no changes"
 
+def main_checkout(repo_path: str) -> Optional[str]:
+    """The main checkout a worktree belongs to (itself for a main checkout), or None."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=repo_path, capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    common = out.stdout.strip()
+    if out.returncode != 0 or not common.endswith("/.git"):
+        return None
+    return common.removesuffix("/.git")
+
 def get_default_branch(repo_path: Optional[str] = None) -> str:
     """Get the best default branch for the repository with priority order"""
     available_branches = get_available_branches(repo_path)

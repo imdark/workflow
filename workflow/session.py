@@ -52,11 +52,31 @@ def task_branch_name(issue) -> str:
     return re.sub(r"-{2,}", "-", name).strip("-./")
 
 
-def base_branch_for(repo_path: str, repos: dict, base: Optional[str] = None) -> str:
-    """The branch new task work starts from in `repo_path`."""
-    from workflow.git_utils import get_default_branch
+class BaseBranchNotConfigured(RuntimeError):
+    """The repo has no base_branch set, so there's no branch to work from."""
 
-    return base or (repos.get(repo_path) or {}).get("base_branch") or get_default_branch(repo_path)
+
+def base_branch_for(repo_path: str, repos: dict, base: Optional[str] = None) -> str:
+    """The branch task work in `repo_path` starts from and its PR goes into.
+
+    It's the repo's `base_branch` setting; it differs by repo (one PRs into
+    main, another into stage), so it's never guessed. A task's worktree isn't
+    in the config itself, so its main checkout's setting is used.
+    """
+    from workflow.git_utils import main_checkout
+
+    if base:
+        return base
+    configured = (repos.get(repo_path) or {}).get("base_branch")
+    checkout = main_checkout(repo_path)
+    if not configured and checkout and checkout != repo_path:
+        configured = (repos.get(checkout) or {}).get("base_branch")
+    if not configured:
+        raise BaseBranchNotConfigured(
+            f"No base_branch is set for {checkout or repo_path}. Set the branch "
+            f"its PRs go into: wf config repo-add {checkout or repo_path} --base-branch <branch>"
+        )
+    return configured
 
 
 def start_in_worktree(issue, repo_path: str, base_branch: str) -> str:

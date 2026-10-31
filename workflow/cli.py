@@ -2725,8 +2725,12 @@ def start(
                     )
         
         # Create git branch
-        from workflow.session import base_branch_for
-        branch_base = base_branch_for(repo_path, repos, base)
+        from workflow.session import BaseBranchNotConfigured, base_branch_for
+        try:
+            branch_base = base_branch_for(repo_path, repos, base)
+        except BaseBranchNotConfigured as e:
+            typer.echo(f"❌ {e}")
+            raise typer.Exit(1)
         
         # Check for uncommitted changes on non-default branch (someone is working)
         has_changes = has_uncommitted_changes(repo_path) if repo_path else False
@@ -3005,13 +3009,15 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                     pr_created = True  # Count existing PR as successful for task status
                     continue
                 
-                # Get repository info for PR base branch
-                base_branch = repos.get(current_repo_path, {}).get("base_branch")
-                
-                # Use smart default if no base branch configured
-                if not base_branch:
-                    base_branch = get_default_branch(current_repo_path)
-                
+                # The PR goes into the repo's configured base branch; from a
+                # task worktree that's its main checkout's setting.
+                from workflow.session import BaseBranchNotConfigured, base_branch_for
+                try:
+                    base_branch = base_branch_for(current_repo_path, repos)
+                except BaseBranchNotConfigured as e:
+                    typer.echo(f"❌ {e}")
+                    raise typer.Exit(1)
+
                 # Check if there are any differences with base branch or for specified repo
                 has_diff = has_diff_with_base(current_repo_path, base_branch)
                 
