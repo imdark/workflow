@@ -28,8 +28,9 @@ class FakeInventory:
     """Just enough of the questions API: ask, poll, and an answer to give."""
 
     def __init__(self, answer=None, allowed=None, answer_after=0.0, job_status="running",
-                 allowed_on_ask=False):
+                 allowed_on_ask=False, throttled=0):
         self.answer, self.allowed = answer, allowed
+        self.throttled = throttled  # questions posted that get a 429 first
         self.answer_after, self.job_status = answer_after, job_status
         self.allowed_on_ask = allowed_on_ask  # "Allow all", or one of the run's own tools
         self.asked = []
@@ -68,6 +69,13 @@ class FakeInventory:
                     inventory.answer, inventory.allowed = body.get("answer"), body.get("allowed")
                     inventory.answer_after = 0
                     self._send({"question": {"id": "q1", "answeredAt": 1.0, **body}})
+                    return
+                if inventory.throttled:
+                    inventory.throttled -= 1
+                    self.send_response(429)
+                    self.send_header("Retry-After", "0")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
                     return
                 inventory.asked.append(body)
                 inventory.asked_at = time.monotonic()
@@ -285,6 +293,34 @@ def test_a_permission_allowed_as_it_is_asked_shows_nothing(inventory, notified, 
     assert notified == []
     assert inv.polls == 0
     assert not list(tmp_path.glob("waiting-*"))
+
+
+def test_a_rate_limited_permission_is_asked_again_not_denied(inventory, monkeypatch):
+    # Every run on the machine shares the server's rate limit; with "Allow
+    # all" on, a 429 used to come back as a denied tool.
+    monkeypatch.setattr(agent_mcp, "retry_after", lambda header: 0.01)
+    inv = inventory(allowed_on_ask=True, throttled=2)
+    result = agent_mcp.call_tool(inv.questions(), "approve",
+                                 {"tool_name": "Bash", "input": {"command": "ls"}})
+    assert json.loads(result_text(result))["behavior"] == "allow"
+    assert len(inv.asked) == 1
+
+
+def test_a_rate_limit_that_lasts_still_fails_the_call(inventory, monkeypatch):
+    monkeypatch.setattr(agent_mcp, "retry_after", lambda header: 0.01)
+    inv = inventory(allowed_on_ask=True, throttled=1000)
+    q = agent_mcp.Questions(inv.url, "ws-1", "job-1", "pat", retry_for=0.1)
+    result = agent_mcp.call_tool(q, "approve", {"tool_name": "Bash", "input": {"command": "ls"}})
+    assert result["isError"] is True
+    assert "429" in result_text(result)
+
+
+def test_retry_after_is_kept_within_bounds():
+    assert agent_mcp.retry_after("0") == 1.0
+    assert agent_mcp.retry_after("7") == 7.0
+    assert agent_mcp.retry_after("3600") == 30.0
+    assert agent_mcp.retry_after(None) == agent_mcp.RETRY_PAUSE_SECONDS
+    assert agent_mcp.retry_after("Wed, 21 Oct 2026 07:28:00 GMT") == agent_mcp.RETRY_PAUSE_SECONDS
 
 
 def test_a_question_answered_quickly_shows_nothing(inventory, notified):
