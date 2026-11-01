@@ -257,17 +257,33 @@ def start_supervisord(paths: Paths, env: dict, run=subprocess.run) -> str:
     return "supervisord in the background (not started at login on this system)"
 
 
+TERMINAL_PROGRAM = "wf-terminal"
+
+
+def terminal_command(device: Optional[str]) -> List[str]:
+    """`wf terminal serve`, on this interpreter like the runner."""
+    command = [sys.executable, "-m", "workflow.cli", "terminal", "serve", "--exit-on-update"]
+    if device:
+        command += ["--device", device]
+    return command
+
+
 def install(device: Optional[str], cwd: Path, max_jobs: int,
             paths: Optional[Paths] = None, run=subprocess.run) -> str:
     """Set the service up (or update it) and start it. Returns how it starts."""
+    return install_program(PROGRAM, serve_command(device, max_jobs), cwd, paths, run)
+
+
+def install_program(name: str, command: List[str], cwd: Path,
+                    paths: Optional[Paths] = None, run=subprocess.run) -> str:
+    """Add (or update) one program under the shared supervisord and start it."""
     paths = paths or default_paths()
     ensure_supervisor(run)
     env = service_env()
     for directory in (paths.root, paths.programs, paths.logs):
         directory.mkdir(parents=True, exist_ok=True)
     paths.conf.write_text(render_supervisord_conf(paths))
-    paths.program_file().write_text(
-        render_program(paths, serve_command(device, max_jobs), cwd, env))
+    paths.program_file(name).write_text(render_program(paths, command, cwd, env, name))
     how = start_supervisord(paths, env, run)
     if not _wait_for_socket(paths):
         raise RuntimeError(f"supervisord didn't come up; see {paths.logs / 'supervisord.log'}")
@@ -276,12 +292,19 @@ def install(device: Optional[str], cwd: Path, max_jobs: int,
     return how
 
 
-def uninstall(paths: Optional[Paths] = None, run=subprocess.run) -> None:
-    """Stop the runner and remove it; supervisord and its login item go too."""
+def uninstall(paths: Optional[Paths] = None, run=subprocess.run,
+              name: str = PROGRAM) -> None:
+    """Stop one program and remove it. supervisord and its login item go too
+    once no other program is left under it."""
     paths = paths or default_paths()
     if paths.socket.exists():
-        ctl(paths, "stop", PROGRAM, run=run)
-    paths.program_file().unlink(missing_ok=True)
+        ctl(paths, "stop", name, run=run)
+    paths.program_file(name).unlink(missing_ok=True)
+    if paths.programs.exists() and any(paths.programs.glob("*.ini")):
+        if paths.socket.exists():
+            ctl(paths, "reread", run=run)
+            ctl(paths, "update", run=run)
+        return
     system = platform.system()
     if system == "Darwin" and paths.launchd_plist.exists():
         run(["launchctl", "bootout", f"gui/{os.getuid()}", str(paths.launchd_plist)],
@@ -294,11 +317,13 @@ def uninstall(paths: Optional[Paths] = None, run=subprocess.run) -> None:
         ctl(paths, "shutdown", run=run)
 
 
-def status(paths: Optional[Paths] = None, run=subprocess.run) -> str:
+def status(paths: Optional[Paths] = None, run=subprocess.run,
+           name: str = PROGRAM) -> str:
     paths = paths or default_paths()
-    if not paths.program_file().exists():
-        return "not installed (run: wf agent install)"
+    if not paths.program_file(name).exists():
+        how = "wf terminal install" if name == TERMINAL_PROGRAM else "wf agent install"
+        return f"not installed (run: {how})"
     if not paths.socket.exists():
         return "installed, but supervisord isn't running"
-    result = ctl(paths, "status", PROGRAM, run=run)
+    result = ctl(paths, "status", name, run=run)
     return (result.stdout or result.stderr).strip()

@@ -15,4 +15,5 @@ playwright
 fastmcp
 desktop-notifier
 aiohttp
+python-socketio[client]
 
