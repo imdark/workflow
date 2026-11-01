@@ -6565,6 +6565,10 @@ app.add_typer(deploy_app, name="deploy")
 from workflow.cli_agent import agent_app
 app.add_typer(agent_app, name="agent")
 
+# Remote terminals: a harness on this device, driven from NotesGraph.
+from workflow.cli_terminal import terminal_app
+app.add_typer(terminal_app, name="terminal")
+
 # Persistent SSH sessions shared by every Claude session (the `ssh` MCP server).
 from workflow.cli_ssh import ssh_app
 app.add_typer(ssh_app, name="ssh")
