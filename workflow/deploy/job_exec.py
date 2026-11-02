@@ -26,6 +26,7 @@ and carry it if it has to start again (see checkpoint).
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -33,6 +34,8 @@ from pathlib import Path
 from typing import Optional, TextIO
 
 from workflow.deploy.checkpoint import Checkpointer, run_base
+from workflow.deploy.profile_automation import (StepFailed, handed_over, kill_current,
+                                                run_steps)
 from workflow.deploy.run_changes import ChangeRecorder, git_changes
 
 # How long a finished session stays open for someone to read. The runner
@@ -168,6 +171,10 @@ class Narrator:
             self.say(f"✓ finished in {self.steps} turns{tail}")
 
 
+class _SetupFailed(Exception):
+    """A setup step failed; the agent is not run (see run)."""
+
+
 def keep_awake(pid: int) -> None:
     """Hold off idle and system sleep until the process `pid` exits.
 
@@ -181,15 +188,37 @@ def keep_awake(pid: int) -> None:
         pass
 
 
+def _automation_steps(spec: dict, phase: str, cwd: Optional[str], say) -> None:
+    """Run the profile's `phase` steps (setup or teardown), as cmd.json carries
+    them: {"setup": [...], "teardown": [...], "values": {...}, "env": {...}}.
+    Raises StepFailed for a non-optional step that fails (see profile_automation)."""
+    steps = spec.get(phase) or []
+    if not steps:
+        return
+    env = dict(spec.get("env") or {})
+    if cwd:
+        env["AGENT_CWD"] = cwd
+    # Setup runs in the job directory (what it prepares may not exist yet);
+    # teardown where the agent worked, as its tools did -- unless setup
+    # never got that far, when the job directory is all there is.
+    where = cwd if phase == "teardown" and cwd and os.path.isdir(cwd) else env["JOB_DIR"]
+    run_steps(phase, steps, spec.get("values") or {}, where, env, say)
+
+
 def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
     spec = json.loads((job_dir / "cmd.json").read_text())
     argv = spec["argv"]
     cwd = spec.get("cwd") or None
+    automation = spec.get("automation") or {}
+    if automation:
+        automation.setdefault("env", {}).setdefault("JOB_DIR", str(job_dir))
+        # A stop (SIGTERM from the runner) takes the step running now with it.
+        signal.signal(signal.SIGTERM, lambda *_: (kill_current(), sys.exit(143)))
 
     with open(job_dir / "log.txt", "a", encoding="utf-8") as log:
         narrator = Narrator(out, log, cwd or os.getcwd())
         narrator.say(f"$ {argv[0]} … ({spec.get('provider', argv[0])}, job {job_dir.name})")
-        if spec.get("provider") in ("claude-code", "workflow", "research"):
+        if spec.get("claude") or spec.get("provider") in ("claude-code", "workflow", "research"):
             narrator.say("  Claude can read and write your notes, and will ask you in "
                          "NotesGraph when it needs something.")
         if spec.get("provider") == "research":
@@ -199,11 +228,28 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
             narrator.say("↻ resuming the interrupted attempt's session, in the "
                          "worktree it left")
         code = 1
+        prepared = True
+        if automation.get("setup"):
+            try:
+                _automation_steps(automation, "setup", cwd, narrator.say)
+            except StepFailed as e:
+                # Nothing to run the agent in: the run ends here, saying why.
+                narrator.error = str(e)
+                narrator.say(f"✗ {narrator.error}")
+                prepared = False
+        if cwd and prepared:
+            # Setup may be what makes the agent's directory, or may say where
+            # it is (automation.json, as `wf agent prepare-task` writes).
+            cwd = handed_over(job_dir).get("cwd") or cwd
+            Path(cwd).mkdir(parents=True, exist_ok=True)
+            narrator.recorder = ChangeRecorder(cwd)
         # No cwd: the runner's own checkout, not the job's.
         start = run_base(job_dir, cwd)
         extra_env = spec.get("env") or {}
         checkpoints = Checkpointer(job_dir, cwd, start, extra_env, spec.get("job"))
         try:
+            if not prepared:
+                raise _SetupFailed()
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, env={**os.environ, **extra_env},
@@ -221,6 +267,15 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
             narrator.error = f"'{argv[0]}' is not on PATH on this device"
             narrator.say(f"✗ {narrator.error}")
             code = 127
+        except _SetupFailed:
+            code = 1
+        finally:
+            if automation.get("teardown"):
+                # However the run ended; a failing teardown is said, not fatal.
+                try:
+                    _automation_steps(automation, "teardown", cwd, narrator.say)
+                except StepFailed as e:
+                    narrator.say(f"⚙ teardown did not finish: {e}")
 
         result = narrator.result
         if result is None and code == 0 and not narrator.error:

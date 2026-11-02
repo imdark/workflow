@@ -31,6 +31,7 @@ is the protocol, so nothing else may be printed there.
 
 import hashlib
 import json
+import mimetypes
 import os
 import shutil
 import subprocess
@@ -39,6 +40,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -52,6 +54,10 @@ POLL_SECONDS = 2.0
 NOTIFY_AFTER_SECONDS = 5.0
 # Matches the server's cap on a question's detail (registry jobs.ts MAX_DETAIL).
 MAX_DETAIL = 200_000
+# An artifact is for looking at on a phone: a preview, not the master.
+MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
+# Artifacts shown with one question.
+MAX_ATTACHMENTS = 6
 # Rate limited, or the server restarting: worth asking again, for up to
 # RETRY_FOR_SECONDS, rather than failing the tool call.
 RETRY_STATUSES = {429, 502, 503, 504}
@@ -77,7 +83,10 @@ TOOLS = [
             "specific question; group closely related unknowns into it. When "
             "the answer is one of a few choices (yes/no, which of these, go on "
             "or stop), pass them as options so they can pick with one click; "
-            "they can still type something else."
+            "they can still type something else. To show them something you "
+            "made (a preview video, a filmstrip, a chart), upload it first with "
+            "upload_artifact and pass its key in attachments: it is shown with "
+            "the question, on their phone too."
         ),
         "inputSchema": {
             "type": "object",
@@ -88,8 +97,33 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": "Optional short choices, e.g. [\"Yes, open the PR\", \"No, stop here\"]. At most 10.",
                 },
+                "attachments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": ("Artifact keys from upload_artifact to show with the question "
+                                    "(a video or image), e.g. a preview cut with options "
+                                    "[\"Approve\", \"Revise\", \"Try another take\"]. At most 6."),
+                },
             },
             "required": ["question"],
+        },
+    },
+    {
+        "name": "upload_artifact",
+        "description": (
+            "Upload a file this run made (a preview mp4, a filmstrip png, a "
+            "rendered final) to NotesGraph, so the person can see it. Returns "
+            "its key and URL. Pass the key in ask_user's attachments to show "
+            "it with a question; put the URL in a note for the final result. "
+            "Keep uploads under 100 MB: a 720p preview, not the 4K master."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path of the file to upload."},
+                "name": {"type": "string", "description": "A file name to show; default the file's own."},
+            },
+            "required": ["path"],
         },
     },
     {
@@ -327,12 +361,42 @@ class Questions:
         self.title = self._request("POST", f"{self.job_url}/title", {"title": title})["job"]["title"]
         return self.title
 
+    def upload_artifact(self, path: str, name: Optional[str] = None) -> dict:
+        """Upload a file the run made to the job's artifacts; returns the
+        artifact the server recorded ({id, key, name, mime, size, url, ...}).
+
+        The bytes go as the request body, with the file's media type, so the
+        server stores and serves it as what it is. Capped at MAX_ARTIFACT_BYTES:
+        a preview is for looking at on a phone, not the master."""
+        file = Path(path).expanduser()
+        if not file.is_file():
+            raise FileNotFoundError(f"no file at {file}")
+        size = file.stat().st_size
+        if size > MAX_ARTIFACT_BYTES:
+            raise ValueError(
+                f"{file.name} is {size / (1024 * 1024):.0f} MB; the limit is "
+                f"{MAX_ARTIFACT_BYTES // (1024 * 1024)} MB. Upload a shorter or lower-resolution "
+                "preview (720p, or a clip of the part in question) instead.")
+        shown = (name or file.name).strip() or file.name
+        mime = mimetypes.guess_type(shown)[0] or mimetypes.guess_type(file.name)[0] or "application/octet-stream"
+        request = urllib.request.Request(
+            f"{self.job_url}/artifacts?name={urllib.parse.quote(shown)}",
+            data=file.read_bytes(), method="POST",
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": mime},
+        )
+        with urllib.request.urlopen(request, timeout=600) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")["artifact"]
+
     def ask(self, kind: str, text: str, detail: Optional[str] = None,
-            options: Optional[list] = None) -> dict:
-        """Post a question and block until it is answered; returns it."""
+            options: Optional[list] = None, attachments: Optional[list] = None) -> dict:
+        """Post a question and block until it is answered; returns it.
+        `attachments` are artifact keys (see upload_artifact) shown with it."""
         question = self._request("POST", self.base,
                                  {"kind": kind, "text": text, "detail": detail,
-                                  "options": options or []})["question"]
+                                  "options": options or [],
+                                  # Only when given: a server from before
+                                  # attachments may refuse a field it doesn't know.
+                                  **({"attachments": attachments} if attachments else {})})["question"]
         if question.get("answeredAt"):
             # Allowed on the spot ("Allow all", or one of the run's own
             # tools): a notification would only flash up and vanish.
@@ -422,8 +486,32 @@ def call_tool(questions: Questions, name: str, args: dict) -> dict:
                 return text("question is required", error=True)
             options = args.get("options")
             options = [str(o).strip() for o in options if str(o).strip()] if isinstance(options, list) else []
-            answer = questions.ask("question", asked, options=options)
+            attachments = args.get("attachments")
+            attachments = ([str(a).strip() for a in attachments if str(a).strip()][:MAX_ATTACHMENTS]
+                           if isinstance(attachments, list) else [])
+            answer = questions.ask("question", asked, options=options, attachments=attachments)
             return with_steers(answer.get("answer") or "")
+
+        if name == "upload_artifact":
+            path = str(args.get("path") or "").strip()
+            if not path:
+                return text("path is required", error=True)
+            try:
+                artifact = questions.upload_artifact(path, args.get("name"))
+            except (FileNotFoundError, ValueError) as e:
+                return text(str(e), error=True)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return text("This NotesGraph server does not take artifacts yet; describe "
+                                "the result in words instead.", error=True)
+                raise
+            size = artifact.get("size")
+            shown = f"{size / (1024 * 1024):.1f} MB" if isinstance(size, (int, float)) else "uploaded"
+            return with_steers(
+                f"Uploaded {artifact.get('name') or Path(path).name} ({shown}).\n"
+                f"key: {artifact.get('key')}\nurl: {artifact.get('url')}\n"
+                "Pass the key in ask_user's attachments to show it with a question; "
+                "use the url in a note.")
 
         if name == "set_title":
             title = " ".join(str(args.get("title") or "").split())

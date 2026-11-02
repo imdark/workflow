@@ -489,7 +489,8 @@ def omniseek_endpoint(config: dict) -> tuple:
 
 
 def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
-                  config: dict, rules: str = "", resume: Optional[str] = None) -> tuple:
+                  config: dict, rules: str = "", resume: Optional[str] = None,
+                  tools_spec: Optional[Path] = None) -> tuple:
     """Claude Code as for a claude-code job, with OmniSeek's tools added."""
     url, token = omniseek_endpoint(config)
     return claude_code_argv(
@@ -503,6 +504,7 @@ def research_argv(job: Job, prompt: str, job_dir: Path, client: "JobClient",
         extra_prompt=RESEARCH_SYSTEM_PROMPT,
         rules=rules,
         resume=resume,
+        tools_spec=tools_spec,
     )
 
 
@@ -591,7 +593,8 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                      extra_mcp: Optional[dict] = None,
                      extra_allowed: Optional[list] = None,
                      extra_prompt: str = "", rules: str = "",
-                     session_context: str = "", resume: Optional[str] = None) -> tuple:
+                     session_context: str = "", resume: Optional[str] = None,
+                     tools_spec: Optional[Path] = None) -> tuple:
     """Claude Code with NotesGraph's tools and a way to ask the user.
 
     Returns (argv, env). The MCP config carries the NotesGraph token, so it
@@ -604,9 +607,19 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     and to each subagent through a hook. `session_context` is added at
     session start (see run_settings). `resume` is the session id of an
     interrupted attempt to carry on (see checkpoint.resumable); `prompt` is
-    then what to tell it, not the task again.
+    then what to tell it, not the task again. `tools_spec` is the file the
+    profile's automation tools were written to (see prepare_automation);
+    with it the agent gets them as mcp__automation__<name>.
     """
     mcp_path = job_dir / "mcp.json"
+    automation_mcp = {
+        "automation": {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": ["-m", "workflow.deploy.automation_mcp"],
+            "env": {"NG_AUTOMATION_TOOLS": str(tools_spec)},
+        },
+    } if tools_spec else {}
     mcp_config = {"mcpServers": {
         # NotesGraph's own MCP endpoint, as the user who owns this runner.
         "notesgraph": {
@@ -622,6 +635,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                     "NG_JOB": job.id, "NG_TOKEN": client.token or "",
                     "NG_JOB_DIR": str(job_dir)},
         },
+        **automation_mcp,
         **(extra_mcp or {}),
     }}
     fd = os.open(mcp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -633,7 +647,11 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     profile = job.profile or {}
     system_prompt = with_agent_rules(profile.get("systemPrompt") or (
         CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else "")), rules)
-    allowed = profile.get("allowedTools") or [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])]
+    allowed = list(profile.get("allowedTools") or [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])])
+    # The automation's tools are the profile owner's own commands: allowed
+    # without asking, like NotesGraph's (the cloud runner does the same).
+    if tools_spec and "mcp__automation" not in allowed:
+        allowed.append("mcp__automation")
     tool_timeout = int(profile.get("toolTimeoutMs") or ASK_TIMEOUT_MS)
     skills_dir = profile_skills_plugin(job, job_dir)
     argv = [
@@ -655,6 +673,68 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         prompt,
     ]
     return argv, {"MCP_TOOL_TIMEOUT": str(tool_timeout)}
+
+
+def is_profiled_claude_job(job: Job) -> bool:
+    """A job the server has a Claude Code profile for (a system prompt and
+    tools) under a model this runner has no handling of its own for -- a
+    video editor, say. It runs as a claude-code job in the job directory,
+    with whatever automation the profile brings; the profile is the whole
+    agent, so nothing here has to know the model."""
+    profile = job.profile or {}
+    return (job.model not in (*CLAUDE_MODELS, COMMAND_MODEL, None, "")
+            and bool(profile.get("systemPrompt")))
+
+
+def _runner_repo(cwd: Path) -> tuple:
+    """(origin URL, base branch) of the repo the runner was started in, for
+    a profile's {repo} and {base_branch}; ("", "main") outside one."""
+    origin = _git("-C", str(cwd), "config", "--get", "remote.origin.url")
+    repo = origin.stdout.strip() if origin.returncode == 0 else ""
+    head = _git("-C", str(cwd), "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    base = head.stdout.strip().split("/", 1)[-1] if head.returncode == 0 else "main"
+    return repo, base or "main"
+
+
+def prepare_automation(job: Job, job_dir: Path, cwd: Path,
+                       agent_cwd: Optional[Path] = None) -> tuple:
+    """The profile's automation, made ready for this job.
+
+    Returns (spec for cmd.json or None, tools file or None, agent cwd). The
+    spec carries the setup and teardown steps rendered, for job_exec to run
+    around the agent; the tools file is what automation_mcp serves.
+
+    A profile that works in a repo (`workdir: 'repo'`, claude-code and
+    workflow jobs) gets no setup or teardown here: wf prepares the worktree
+    itself, which is what the server's steps would do (agent-profiles.ts
+    says a Mac runner may skip them). Its tools still come along and work
+    in that worktree. A profile that works in the job directory
+    (`workdir: 'job'`) gets all three, and the agent starts where the
+    profile says (`automation.cwd`, default the job directory).
+    """
+    from workflow.deploy import profile_automation as pa
+
+    profile = job.profile or {}
+    automation = profile.get("automation") or {}
+    tools = [t for t in (automation.get("tools") or []) if isinstance(t, dict) and t.get("name")]
+    in_repo = profile.get("workdir") == "repo"
+    setup = [] if in_repo else list(automation.get("setup") or [])
+    teardown = [] if in_repo else list(automation.get("teardown") or [])
+    if not (tools or setup or teardown):
+        return None, None, agent_cwd
+    pa.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    repo, base_branch = _runner_repo(cwd)
+    prompt_file = job_dir / "prompt.md"
+    prompt_file.write_text(_prompt(job))
+    if (job.title or "").strip():
+        (job_dir / "title.txt").write_text(job.title.strip())
+    values = pa.placeholders(job.id, job_dir, pa.CACHE_DIR, repo, base_branch, prompt_file)
+    if agent_cwd is None:
+        agent_cwd = Path(pa.render(str(automation.get("cwd") or "{job_dir}"), values))
+    env = pa.shell_env(job.id, job_dir, str(agent_cwd))
+    tools_file = pa.write_tools_spec(job_dir, tools, values, str(agent_cwd), env) if tools else None
+    spec = {"setup": setup, "teardown": teardown, "values": values, "env": env}
+    return spec, tools_file, agent_cwd
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
@@ -918,8 +998,12 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     workdir: Optional[Path] = None
     issue = repo_path = None
     rules = ""
+    # The profile's setup and teardown, run by job_exec around the agent,
+    # and its tools, served to the agent (see prepare_automation).
+    automation = tools_spec = None
+    profiled = is_profiled_claude_job(job)
     with _SETUP_LOCK:
-        if job.model in CLAUDE_MODELS:
+        if job.model in CLAUDE_MODELS or profiled:
             if client is None:
                 raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
             provider = job.model
@@ -927,17 +1011,29 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
         home = job_home(job) if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL) else None
         if job.model == CLAUDE_CODE_MODEL:
             workdir = job_workdir(job_dir, Path(home[1]) if home else cwd or Path.cwd())
+            automation, tools_spec, _ = prepare_automation(job, job_dir, cwd or Path.cwd(), workdir)
             resume = checkpoint.resumable(interrupted, job_dir, workdir)
             argv, env = claude_code_argv(
                 job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
-                rules=rules, resume=resume)
+                rules=rules, resume=resume, tools_spec=tools_spec)
         elif job.model == RESEARCH_MODEL:
             # Research reads the world, not a repo: the job directory, no worktree.
-            workdir = job_dir
+            automation, tools_spec, workdir = prepare_automation(job, job_dir, cwd or Path.cwd())
+            workdir = workdir or job_dir
             resume = checkpoint.resumable(interrupted, job_dir, workdir)
             argv, env = research_argv(
                 job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
-                config, rules=rules, resume=resume)
+                config, rules=rules, resume=resume, tools_spec=tools_spec)
+        elif profiled:
+            # The server's profile is the whole agent (prompt, tools, skills,
+            # automation); it works in the job directory, or where its
+            # automation says. Setup may be what creates that directory.
+            automation, tools_spec, workdir = prepare_automation(job, job_dir, cwd or Path.cwd())
+            workdir = workdir or job_dir
+            resume = checkpoint.resumable(interrupted, job_dir, workdir)
+            argv, env = claude_code_argv(
+                job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
+                rules=rules, resume=resume, tools_spec=tools_spec)
         elif job.model == COMMAND_MODEL:
             provider, argv = COMMAND_MODEL, command_argv(job, config)
             workdir = job_dir
@@ -953,17 +1049,20 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             from workflow.code_map import map_context
             # Same Claude account and capture proxy as `wf ai`.
             claude_env = apply_claude_env(dict(os.environ), home[0] if home else None)
+            automation, tools_spec, _ = prepare_automation(job, job_dir, cwd or Path.cwd(), workdir)
             resume = checkpoint.resumable(interrupted, job_dir, workdir, claude_env)
             argv, env = claude_code_argv(
                 job, checkpoint.RESUME_PROMPT if resume else _job_context(issue, job, workdir),
                 job_dir, client, plugin_dir, rules=rules,
-                session_context=map_context(workdir), resume=resume)
+                session_context=map_context(workdir), resume=resume, tools_spec=tools_spec)
             env.update(claude_env)
         else:
             provider, argv = _provider_argv(job, config)
         (job_dir / "cmd.json").write_text(json.dumps(
             {"argv": argv, "provider": provider, "env": env,
              "cwd": str(workdir) if workdir else None,
+             **({"claude": True} if job.model in CLAUDE_MODELS or profiled else {}),
+             **({"automation": automation} if automation else {}),
              **({"resumed": True} if resume else {}),
              **({"caffeinate": True} if keep_awake(config, job_dir) else {}),
              # What its checkpoints name it by.
