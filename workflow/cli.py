@@ -2434,6 +2434,35 @@ def skill_propose(
     typer.echo("\n💡 Review, then 'wf skill promote <name>' to turn one on.")
 
 
+@app.command("learn")
+def learn(
+    task: str = typer.Option(None, "--task", "-t", help="Only look at this task's sessions"),
+    limit: int = typer.Option(10, "--limit", "-l", help="Max proposals"),
+    scan_only: bool = typer.Option(False, "--scan-only", help="Show the mechanical findings; no model, no files"),
+):
+    """Propose harness changes (rules, skills, memory) from mistakes repeated across sessions"""
+    from workflow.conversation_store import get_store
+    from workflow.learn import (format_findings, has_findings, propose_changes,
+                                publish_proposals, render_proposals, save_proposals, scan)
+    from workflow.projects import get_current_project
+
+    store = get_store()
+    if scan_only:
+        found = scan(store, task_key=task)
+        typer.echo(format_findings(found) if has_findings(found) else "ℹ️  No loops or repeated questions found")
+        return
+    cfg = load_effective_config()
+    result = propose_changes(store, cfg, task_key=task, limit=limit)
+    if not result["proposals"]:
+        typer.echo("ℹ️  Nothing worth proposing (needs repeated loops or questions and a provider)")
+        return
+    text = render_proposals(result["proposals"], result["found"])
+    path = save_proposals(text)
+    doc_id = publish_proposals(text, get_current_project(), cfg)
+    typer.echo(f"📝 {len(result['proposals'])} proposals  {path}" + (f"  (note {doc_id})" if doc_id else ""))
+    typer.echo("\n💡 Nothing was applied. Copy the lines you accept into their target.")
+
+
 @skill_app.command("drafts")
 def skill_drafts_list():
     """List proposed skill drafts and whether they were promoted"""
