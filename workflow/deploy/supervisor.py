@@ -235,6 +235,14 @@ def ctl(paths: Paths, *args: str, run=subprocess.run, check: bool = False):
                capture_output=True, text=True, check=check)
 
 
+def supervisord_running(paths: Paths, run=subprocess.run) -> bool:
+    """Whether supervisord answers on its socket (not just a file left there)."""
+    if not paths.socket.is_socket():
+        return False
+    result = ctl(paths, "pid", run=run)
+    return result.returncode == 0 and (result.stdout or "").strip().isdigit()
+
+
 def _wait_for_socket(paths: Paths, timeout: float = 20.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -285,7 +293,13 @@ def install_program(name: str, command: List[str], cwd: Path,
         directory.mkdir(parents=True, exist_ok=True)
     paths.conf.write_text(render_supervisord_conf(paths))
     paths.program_file(name).write_text(render_program(paths, command, cwd, env, name))
-    how = start_supervisord(paths, env, run)
+    if supervisord_running(paths, run):
+        # Restarting supervisord would restart every program under it: the
+        # runner's jobs and every open terminal. reread/update below touch
+        # only the one whose file changed.
+        how = "supervisord (already running)"
+    else:
+        how = start_supervisord(paths, env, run)
     if not _wait_for_socket(paths):
         raise RuntimeError(f"supervisord didn't come up; see {paths.logs / 'supervisord.log'}")
     ctl(paths, "reread", run=run)

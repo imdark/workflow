@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import shutil
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -276,3 +278,105 @@ def test_the_terminal_service_runs_beside_the_agent_runner(tmp_path, monkeypatch
     assert paths.program_file().exists()
     sub = [argv[3:] for argv in calls if str(argv[0]).endswith("supervisorctl")]
     assert sub == [["stop", "wf-terminal"], ["reread"], ["update"]]
+
+
+# --- what the review of PR #48 found here too ------------------------------------
+
+@pytest.mark.parametrize("sid", ["..", ".", "...", "/tmp/x", "a/../..", "", None])
+def test_a_session_id_that_is_a_path_is_ignored(tmp_path, sid):
+    """The id names the session's folder, which is deleted when it ends."""
+    sessions = tmp_path / "terminal"
+    sessions.mkdir()
+    (tmp_path / "keep").write_text("config")
+    events = []
+
+    async def emit(ev, body):
+        events.append(ev)
+
+    async def go():
+        d = Device("w", "dev", emit, sessions_dir=sessions,
+                   overrides={"claude": "true"})
+        await d.spawn({"id": sid, "harness": "claude"})
+        await asyncio.sleep(0.2)
+
+    asyncio.run(go())
+    assert events == []
+    assert (tmp_path / "keep").exists()
+
+
+def test_a_dropped_connection_keeps_the_harness_and_its_output(tmp_path):
+    """Output while the socket is down waits for it, instead of killing the
+    reader -- and with it the harness."""
+    sent, down = [], {"on": False}
+
+    async def emit(ev, body):
+        if down["on"]:
+            raise ConnectionError("not a connected namespace")
+        sent.append((ev, body))
+
+    async def go():
+        d = Device("w", "dev", emit,
+                   overrides={"claude": "sh -c 'sleep 0.4; echo during; sleep 0.4; exit 5'"})
+        await d.spawn({"id": "s1", "harness": "claude"})
+        down["on"] = True
+        await asyncio.sleep(1.5)       # it prints and exits while disconnected
+        assert d.backlog["s1"]
+        down["on"] = False
+        return await d.flush()
+
+    ended = asyncio.run(go())
+    assert ended == {"s1"}
+    assert "during" in output(sent)
+    assert sent[-1] == ("terminal:device:exit", {"workspaceId": "w", "sessionId": "s1", "code": 5})
+
+
+def test_a_failed_start_leaves_no_token_behind(tmp_path, monkeypatch):
+    events = []
+
+    async def emit(ev, body):
+        events.append((ev, body))
+
+    def broken_fork():
+        raise OSError("out of ptys")
+
+    monkeypatch.setattr("workflow.deploy.terminal_serve.pty.fork", broken_fork)
+    monkeypatch.setattr("workflow.session.apply_claude_env", lambda env, *a: env)
+    mcp = NotesGraphMcp("https://ng", "w", "secret")
+    asyncio.run(Device("w", "dev", emit, mcp=mcp, sessions_dir=tmp_path)
+                .spawn({"id": "s1", "harness": "claude"}))
+    assert not (tmp_path / "s1").exists()
+    assert events[-1][1]["code"] == 127
+
+
+def test_installing_a_program_leaves_a_running_supervisord_alone(tmp_path, monkeypatch):
+    """Restarting it would restart the runner's jobs and every open terminal."""
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+
+        class Done:
+            stdout, stderr, returncode = ("4242\n" if argv[-1] == "pid" else ""), "", 0
+        return Done()
+
+    import socket
+    import tempfile
+
+    # A short home, so the socket is its own and not the shared fallback.
+    home = Path(tempfile.mkdtemp(dir="/tmp"))
+    paths = supervisor.Paths(home)
+    paths.socket.parent.mkdir(parents=True, exist_ok=True)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(paths.socket))
+    monkeypatch.setattr(supervisor, "ensure_supervisor", lambda run=None: None)
+    restarted = []
+    monkeypatch.setattr(supervisor, "start_supervisord",
+                        lambda p, env, run=None: restarted.append(1) or "restarted")
+
+    how = supervisor.install_program(supervisor.TERMINAL_PROGRAM,
+                                     supervisor.terminal_command("laptop"), tmp_path,
+                                     paths=paths, run=run)
+    listener.close()
+    shutil.rmtree(home)
+    assert restarted == [] and "already running" in how
+    assert [argv[3:] for argv in calls] == [["pid"], ["reread"], ["update"]]
