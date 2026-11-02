@@ -236,8 +236,8 @@ def ctl(paths: Paths, *args: str, run=subprocess.run, check: bool = False):
 
 
 def supervisord_running(paths: Paths, run=subprocess.run) -> bool:
-    """Whether supervisord answers on its socket."""
-    if not paths.socket.exists():
+    """Whether supervisord answers on its socket (not just a file left there)."""
+    if not paths.socket.is_socket():
         return False
     result = ctl(paths, "pid", run=run)
     return result.returncode == 0 and (result.stdout or "").strip().isdigit()

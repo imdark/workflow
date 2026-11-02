@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import shutil
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -357,9 +359,15 @@ def test_installing_a_program_leaves_a_running_supervisord_alone(tmp_path, monke
             stdout, stderr, returncode = ("4242\n" if argv[-1] == "pid" else ""), "", 0
         return Done()
 
-    paths = supervisor.Paths(tmp_path)
+    import socket
+    import tempfile
+
+    # A short home, so the socket is its own and not the shared fallback.
+    home = Path(tempfile.mkdtemp(dir="/tmp"))
+    paths = supervisor.Paths(home)
     paths.socket.parent.mkdir(parents=True, exist_ok=True)
-    paths.socket.touch()
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(paths.socket))
     monkeypatch.setattr(supervisor, "ensure_supervisor", lambda run=None: None)
     restarted = []
     monkeypatch.setattr(supervisor, "start_supervisord",
@@ -368,5 +376,7 @@ def test_installing_a_program_leaves_a_running_supervisord_alone(tmp_path, monke
     how = supervisor.install_program(supervisor.TERMINAL_PROGRAM,
                                      supervisor.terminal_command("laptop"), tmp_path,
                                      paths=paths, run=run)
+    listener.close()
+    shutil.rmtree(home)
     assert restarted == [] and "already running" in how
     assert [argv[3:] for argv in calls] == [["pid"], ["reread"], ["update"]]
