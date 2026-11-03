@@ -139,6 +139,39 @@ def _text_of(result: dict) -> str:
                    if isinstance(item, dict) and item.get("type") == "text")
 
 
+def upsert_note(reader, title: str, content, agent: str,
+                under: Optional[str] = None) -> dict:
+    """Update the note titled `title`, or create it and file it under the
+    note titled `under`.
+
+    `content` is the text, or a function of the existing text (None when the
+    note is new) returning it. Returns {"docId", "created", "filed"}; filed
+    is None when nothing was to be filed, False when `under` wasn't found.
+    """
+    note = reader.find(title)
+    if note:
+        text = content(reader.read(note["docId"])) if callable(content) else content
+        reader.call("update_document", {"docId": note["docId"], "content": text, "agent": agent})
+        return {"docId": note["docId"], "created": False, "filed": None}
+    text = content(None) if callable(content) else content
+    reply = reader.call("create_document", {"title": title, "content": text, "agent": agent})
+    doc_id = None
+    try:
+        doc_id = json.loads(reply).get("docId")
+    except (ValueError, TypeError, AttributeError):
+        pass
+    if not doc_id:
+        # Not every server says the new id; find it by its title instead.
+        doc_id = (reader.find(title) or {}).get("docId")
+    filed = None
+    if under and doc_id:
+        parent = reader.find(under)
+        filed = bool(parent)
+        if parent:
+            reader.call("link_document", {"parentDocId": parent["docId"], "childDocId": doc_id})
+    return {"docId": doc_id, "created": True, "filed": filed}
+
+
 def reader_from_config(cfg: dict) -> NotesReader:
     """A reader for the workspace in `deploy.notesgraph`, as the runner uses."""
     ng = (cfg.get("deploy") or {}).get("notesgraph") or {}
