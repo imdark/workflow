@@ -6611,6 +6611,10 @@ app.add_typer(agent_app, name="agent")
 from workflow.cli_terminal import terminal_app
 app.add_typer(terminal_app, name="terminal")
 
+# Notes from a shell: find, read, edit and file them into folder notes.
+from workflow.cli_notes import notes_app
+app.add_typer(notes_app, name="notes")
+
 # Persistent SSH sessions shared by every Claude session (the `ssh` MCP server).
 from workflow.cli_ssh import ssh_app
 app.add_typer(ssh_app, name="ssh")

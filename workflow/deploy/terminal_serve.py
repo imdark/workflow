@@ -95,6 +95,11 @@ class NotesGraphMcp:
             "headers": {"Authorization": f"Bearer {self.token}"},
         }}}
 
+    def env(self) -> dict:
+        """What `wf notes` reads to work on this workspace from the session."""
+        return {"NOTESGRAPH_URL": self.url, "NOTESGRAPH_WORKSPACE": self.workspace,
+                "NOTESGRAPH_TOKEN": self.token}
+
 
 def claude_launch(argv: list, session_dir: Path,
                   mcp: Optional[NotesGraphMcp]) -> tuple:
@@ -193,13 +198,19 @@ class Device:
         harness = session.get("harness", "shell")
         argv = harness_argv(harness, session.get("resume"), self.overrides,
                             self.allow_shell)
+        own_claude = harness == "claude" and not self.overrides.get("claude")
+        # A shell and wf's own Claude can run `wf notes` on the workspace the
+        # session was opened from. Not Codex, Gemini or an owner's override:
+        # the token would be in the environment of a program wf didn't vet,
+        # for it and whatever it runs to log or pass on.
+        notes_env = self.mcp.env() if self.mcp and (harness == "shell" or own_claude) else {}
         # Only wf's own Claude gets the MCP config; an override is the
         # device owner's command, run as written.
-        if harness == "claude" and not self.overrides.get("claude"):
+        if own_claude:
             session_dir = self.sessions_dir / sid
             argv, env = claude_launch(argv, session_dir, self.mcp)
-            return argv, env, session_dir
-        return argv, {}, None
+            return argv, {**notes_env, **env}, session_dir
+        return argv, notes_env, None
 
     async def spawn(self, session: dict) -> None:
         sid = str(session.get("id") or "")
