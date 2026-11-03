@@ -80,12 +80,22 @@ class NotesReader:
 
     def call(self, tool: str, arguments: Optional[dict] = None) -> str:
         """Call one MCP tool; returns the text it answered with."""
+        result = self._rpc("tools/call", {"name": tool, "arguments": arguments or {}}, tool)
+        if result.get("isError"):
+            raise NotesGraphError(f"NotesGraph {tool} failed: {_text_of(result)[:300]}")
+        return _text_of(result)
+
+    def tools(self) -> list:
+        """The tools the endpoint offers: [{name, description, inputSchema}]."""
+        return self._rpc("tools/list", {}, "tools/list").get("tools") or []
+
+    def _rpc(self, method: str, params: dict, what: str) -> dict:
         if not self.token:
             raise NotesGraphError(
                 "No NotesGraph token. Run 'wf deploy notes-login <token>' first.")
         self._next_id += 1
-        body = json.dumps({"jsonrpc": "2.0", "id": self._next_id, "method": "tools/call",
-                           "params": {"name": tool, "arguments": arguments or {}}}).encode("utf-8")
+        body = json.dumps({"jsonrpc": "2.0", "id": self._next_id, "method": method,
+                           "params": params}).encode("utf-8")
         request = urllib.request.Request(
             self.endpoint, data=body, method="POST",
             headers={"Authorization": f"Bearer {self.token}",
@@ -99,7 +109,7 @@ class NotesReader:
                 detail = e.read().decode("utf-8")[:300]
             except Exception:
                 pass
-            raise NotesGraphError(f"NotesGraph {tool} failed: {e.code} {detail}") from e
+            raise NotesGraphError(f"NotesGraph {what} failed: {e.code} {detail}") from e
         except (urllib.error.URLError, OSError) as e:
             raise NotesGraphError(f"NotesGraph unreachable at {self.url}: {e}") from e
         try:
@@ -109,13 +119,10 @@ class NotesReader:
                 raise NotesGraphError(
                     "the MCP endpoint returned a web page, not JSON — it is not "
                     "available on this server.") from e
-            raise NotesGraphError(f"NotesGraph {tool} returned invalid JSON: {e}") from e
+            raise NotesGraphError(f"NotesGraph {what} returned invalid JSON: {e}") from e
         if reply.get("error"):
-            raise NotesGraphError(f"NotesGraph {tool} failed: {reply['error'].get('message')}")
-        result = reply.get("result") or {}
-        if result.get("isError"):
-            raise NotesGraphError(f"NotesGraph {tool} failed: {_text_of(result)[:300]}")
-        return _text_of(result)
+            raise NotesGraphError(f"NotesGraph {what} failed: {reply['error'].get('message')}")
+        return reply.get("result") or {}
 
     def search(self, query: str) -> list:
         """Notes matching `query` by title or text: [{docId, title, …}]."""
