@@ -169,7 +169,7 @@ def test_it_speaks_enough_mcp_to_be_loaded():
     assert agent_mcp.handle(q, {"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
 
     tools = agent_mcp.handle(q, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert {t["name"] for t in tools["result"]["tools"]} == {"ask_user", "approve", "set_title"}
+    assert {t["name"] for t in tools["result"]["tools"]} == {"ask_user", "approve", "set_title", "upload_artifact"}
 
 
 def test_set_title_renames_the_job_without_waiting(inventory):
