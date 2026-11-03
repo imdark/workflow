@@ -454,8 +454,65 @@ def has_diff_with_base(repo_path: Optional[str] = None, base_branch: Optional[st
         # Branch doesn't exist on remote yet
         return False
 
-def create_pr(issue, reviewers: Optional[str] = None, repo_path: Optional[str] = None, base_branch=None):
-    """Create a pull request using GitHub CLI"""
+# How an agent job's ticket description starts: the whole prompt the agent
+# was given (see deploy/jobs.py `_prompt` and the cloud runner's run-job.ts).
+AGENT_PROMPT_PREFIX = "THE TASK - "
+
+
+def commit_summary(repo_path: Optional[str], base_branch: str) -> tuple:
+    """(title, body) from the branch's own commits: the subject of a lone
+    commit as the title (None for several), and their messages as the body."""
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "log", "--reverse", "--no-merges", "--format=%s%x1f%b%x1e",
+         f"origin/{base_branch}..HEAD"],
+        capture_output=True, text=True, cwd=repo_path or None)
+    if result.returncode != 0:
+        return None, ""
+    commits = []
+    for record in result.stdout.split("\x1e"):
+        if not record.strip():
+            continue
+        subject, _, body = record.strip("\n").partition("\x1f")
+        # Attribution trailers say nothing about the change.
+        body = "\n".join(line for line in body.strip().splitlines()
+                         if not line.startswith("Co-Authored-By:")).strip()
+        commits.append((subject.strip(), body))
+    if not commits:
+        return None, ""
+    if len(commits) == 1:
+        return commits[0][0], commits[0][1]
+    return None, "\n\n".join(f"- {subject}" + (f"\n\n{body}" if body else "")
+                             for subject, body in commits)
+
+
+def pr_text(issue, repo_path: Optional[str], base_branch: str,
+            title: Optional[str] = None, body: Optional[str] = None) -> tuple:
+    """The PR's title and body.
+
+    A title or body given (an agent's own summary) wins. Otherwise a ticket
+    filed by an agent job, whose description is the agent's whole prompt and
+    whose title is whatever the note item said, is described by the branch's
+    commits instead; a person's ticket keeps its title and description.
+    The title always starts with the task key: that is how an existing PR
+    for the task is found.
+    """
+    agent_ticket = (issue.description or "").startswith(AGENT_PROMPT_PREFIX)
+    if agent_ticket and (title is None or body is None):
+        commit_title, commit_body = commit_summary(repo_path, base_branch)
+        title = title or commit_title
+        body = body if body is not None else commit_body
+    title = " ".join((title or issue.title or "").split())
+    if body is None:
+        body = issue.description or ""
+    return f"{issue.key} {title}".strip(), body
+
+
+def create_pr(issue, reviewers: Optional[str] = None, repo_path: Optional[str] = None, base_branch=None,
+              title: Optional[str] = None, body: Optional[str] = None):
+    """Create a pull request using GitHub CLI. `title` and `body` describe
+    the change; see `pr_text` for what is used without them."""
     import subprocess
     import json
     from rich.console import Console
@@ -491,9 +548,8 @@ def create_pr(issue, reviewers: Optional[str] = None, repo_path: Optional[str] =
         base_branch = selected_base
     
     # Build GitHub CLI command
-    pr_title = f"{issue.key} {issue.title}"
-    pr_body = issue.description or ""
-    
+    pr_title, pr_body = pr_text(issue, repo_path, base_branch, title, body)
+
     cmd = [
         "gh", "pr", "create",
         "--title", pr_title,

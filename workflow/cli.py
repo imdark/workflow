@@ -2570,6 +2570,46 @@ def bench(
         raise typer.Exit(1)
 
 
+learn_app = typer.Typer(
+    help="Learn from past agent runs: find repeated mistakes, propose small "
+         "fixes to the Agent rules, skills or memory, apply only what you accept",
+    no_args_is_help=True)
+app.add_typer(learn_app, name="learn")
+
+
+@learn_app.command("run")
+def learn_run(
+    days: int = typer.Option(14, "--days", help="Look at runs from this many days back"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Only show the findings; no model call, nothing written"),
+):
+    """Scan captured runs for repeated mistakes and propose fixes for review"""
+    from workflow.conversation_store import get_store
+    from workflow.learn import run_learn
+    cfg = load_effective_config()
+    raise typer.Exit(run_learn(get_store(cfg), cfg, days, dry_run, echo=typer.echo))
+
+
+@learn_app.command("list")
+def learn_list(show_all: bool = typer.Option(False, "--all", help="Include accepted and rejected")):
+    """List proposals waiting for a decision"""
+    from workflow.learn import list_proposals
+    raise typer.Exit(list_proposals(echo=typer.echo, show_all=show_all))
+
+
+@learn_app.command("accept")
+def learn_accept(pid: str = typer.Argument(..., help="Proposal id, e.g. L-1a2b3c")):
+    """Accept a proposal; a rule is added under Learned in the Agent rules note"""
+    from workflow.learn import accept_proposal
+    raise typer.Exit(accept_proposal(pid, load_effective_config(), echo=typer.echo))
+
+
+@learn_app.command("reject")
+def learn_reject(pid: str = typer.Argument(..., help="Proposal id, e.g. L-1a2b3c")):
+    """Reject a proposal so it is not proposed again"""
+    from workflow.learn import reject_proposal
+    raise typer.Exit(reject_proposal(pid, load_effective_config(), echo=typer.echo))
+
+
 @app.command()
 def debt(
     path: Path = typer.Argument(None, help="Repo to scan (default: the current one)"),
@@ -2933,7 +2973,9 @@ def switch(
 
 @app.command()
 def done(reviewers: str = typer.Option(None, help="Comma-separated list of reviewers"), repo_path: str = typer.Option(None, help="Repository path"),
-         task: str = typer.Option(None, "--task", help="Task key to finish instead of the current task (background agents don't set one)")):
+         task: str = typer.Option(None, "--task", help="Task key to finish instead of the current task (background agents don't set one)"),
+         title: str = typer.Option(None, "--title", help="PR title: what the change does (the task key is put in front)"),
+         body: str = typer.Option(None, "--body", help="PR description: what changed and why")):
     cfg = load_config()
     backend = get_backend(load_effective_config())
     # A background agent runs without a terminal: take the defaults rather
@@ -3053,7 +3095,7 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                 
                 if has_diff:
                     try:
-                        pr = create_pr(issue, reviewers, current_repo_path, base_branch)
+                        pr = create_pr(issue, reviewers, current_repo_path, base_branch, title=title, body=body)
                         if pr and pr.get("url") and not pr.get("url").startswith("existing"):
                             typer.echo(f"✅ Created PR for {current_repo_path}")
                             pr_created = True
@@ -3070,7 +3112,7 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                             from workflow.git_utils import push_branch
                             push_branch(current_repo_path)
                             typer.echo(f"✅ Pushed branch '{current_branch}'")
-                            pr = create_pr(issue, reviewers, current_repo_path, base_branch)
+                            pr = create_pr(issue, reviewers, current_repo_path, base_branch, title=title, body=body)
                             if pr and pr.get("url") and not pr.get("url").startswith("existing"):
                                 typer.echo(f"✅ Created PR for {current_repo_path}")
                                 pr_created = True
