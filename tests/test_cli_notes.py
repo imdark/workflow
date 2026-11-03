@@ -187,3 +187,17 @@ def test_a_terminal_session_gets_the_workspace_for_wf_notes(harness, tmp_path, m
     assert env["NOTESGRAPH_WORKSPACE"] == "ws-1"
     assert env["NOTESGRAPH_URL"] == "https://ng.example"
     assert env["NOTESGRAPH_TOKEN"] == "pat"
+
+
+@pytest.mark.parametrize("harness, overrides", [
+    ("codex", {}), ("gemini", {}), ("claude", {"claude": "my-claude --x"})])
+def test_other_harnesses_dont_get_the_token(harness, overrides, tmp_path, monkeypatch):
+    monkeypatch.setattr("workflow.session.apply_claude_env", lambda env, project=None: None)
+
+    async def emit(*a):
+        pass
+
+    device = Device("ws-1", "dev", emit, overrides=overrides, sessions_dir=tmp_path,
+                    mcp=NotesGraphMcp("https://ng.example", "ws-1", "pat"))
+    _, env, _ = device._launch({"harness": harness}, "s1")
+    assert "NOTESGRAPH_TOKEN" not in env

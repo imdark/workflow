@@ -198,12 +198,15 @@ class Device:
         harness = session.get("harness", "shell")
         argv = harness_argv(harness, session.get("resume"), self.overrides,
                             self.allow_shell)
-        # Every session, a shell included, can run `wf notes` on the
-        # workspace it was opened from.
-        notes_env = self.mcp.env() if self.mcp else {}
+        own_claude = harness == "claude" and not self.overrides.get("claude")
+        # A shell and wf's own Claude can run `wf notes` on the workspace the
+        # session was opened from. Not Codex, Gemini or an owner's override:
+        # the token would be in the environment of a program wf didn't vet,
+        # for it and whatever it runs to log or pass on.
+        notes_env = self.mcp.env() if self.mcp and (harness == "shell" or own_claude) else {}
         # Only wf's own Claude gets the MCP config; an override is the
         # device owner's command, run as written.
-        if harness == "claude" and not self.overrides.get("claude"):
+        if own_claude:
             session_dir = self.sessions_dir / sid
             argv, env = claude_launch(argv, session_dir, self.mcp)
             return argv, {**notes_env, **env}, session_dir
