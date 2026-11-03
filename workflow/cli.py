@@ -2434,35 +2434,6 @@ def skill_propose(
     typer.echo("\n💡 Review, then 'wf skill promote <name>' to turn one on.")
 
 
-@app.command("learn")
-def learn(
-    task: str = typer.Option(None, "--task", "-t", help="Only look at this task's sessions"),
-    limit: int = typer.Option(10, "--limit", "-l", help="Max proposals"),
-    scan_only: bool = typer.Option(False, "--scan-only", help="Show the mechanical findings; no model, no files"),
-):
-    """Propose harness changes (rules, skills, memory) from mistakes repeated across sessions"""
-    from workflow.conversation_store import get_store
-    from workflow.learn import (format_findings, has_findings, propose_changes,
-                                publish_proposals, render_proposals, save_proposals, scan)
-    from workflow.projects import get_current_project
-
-    store = get_store()
-    if scan_only:
-        found = scan(store, task_key=task)
-        typer.echo(format_findings(found) if has_findings(found) else "ℹ️  No loops or repeated questions found")
-        return
-    cfg = load_effective_config()
-    result = propose_changes(store, cfg, task_key=task, limit=limit)
-    if not result["proposals"]:
-        typer.echo("ℹ️  Nothing worth proposing (needs repeated loops or questions and a provider)")
-        return
-    text = render_proposals(result["proposals"], result["found"])
-    path = save_proposals(text)
-    doc_id = publish_proposals(text, get_current_project(), cfg)
-    typer.echo(f"📝 {len(result['proposals'])} proposals  {path}" + (f"  (note {doc_id})" if doc_id else ""))
-    typer.echo("\n💡 Nothing was applied. Copy the lines you accept into their target.")
-
-
 @skill_app.command("drafts")
 def skill_drafts_list():
     """List proposed skill drafts and whether they were promoted"""
@@ -2597,6 +2568,46 @@ def bench(
     except LookupError as e:
         typer.echo(f"❌ {e}")
         raise typer.Exit(1)
+
+
+learn_app = typer.Typer(
+    help="Learn from past agent runs: find repeated mistakes, propose small "
+         "fixes to the Agent rules, skills or memory, apply only what you accept",
+    no_args_is_help=True)
+app.add_typer(learn_app, name="learn")
+
+
+@learn_app.command("run")
+def learn_run(
+    days: int = typer.Option(14, "--days", help="Look at runs from this many days back"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Only show the findings; no model call, nothing written"),
+):
+    """Scan captured runs for repeated mistakes and propose fixes for review"""
+    from workflow.conversation_store import get_store
+    from workflow.learn import run_learn
+    cfg = load_effective_config()
+    raise typer.Exit(run_learn(get_store(cfg), cfg, days, dry_run, echo=typer.echo))
+
+
+@learn_app.command("list")
+def learn_list(show_all: bool = typer.Option(False, "--all", help="Include accepted and rejected")):
+    """List proposals waiting for a decision"""
+    from workflow.learn import list_proposals
+    raise typer.Exit(list_proposals(echo=typer.echo, show_all=show_all))
+
+
+@learn_app.command("accept")
+def learn_accept(pid: str = typer.Argument(..., help="Proposal id, e.g. L-1a2b3c")):
+    """Accept a proposal; a rule is added under Learned in the Agent rules note"""
+    from workflow.learn import accept_proposal
+    raise typer.Exit(accept_proposal(pid, load_effective_config(), echo=typer.echo))
+
+
+@learn_app.command("reject")
+def learn_reject(pid: str = typer.Argument(..., help="Proposal id, e.g. L-1a2b3c")):
+    """Reject a proposal so it is not proposed again"""
+    from workflow.learn import reject_proposal
+    raise typer.Exit(reject_proposal(pid, load_effective_config(), echo=typer.echo))
 
 
 @app.command()
