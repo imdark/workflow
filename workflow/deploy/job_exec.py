@@ -34,8 +34,9 @@ from pathlib import Path
 from typing import Optional, TextIO
 
 from workflow.deploy.checkpoint import Checkpointer, run_base
-from workflow.deploy.profile_automation import (StepFailed, handed_over, kill_current,
-                                                run_steps)
+from workflow.deploy.profile_automation import (SECRET_ENV, TOOLS_FILE, handed_over,
+                                                kill_running, retarget_tools, run_steps,
+                                                write_private)
 from workflow.deploy.run_changes import ChangeRecorder, git_changes
 
 # How long a finished session stays open for someone to read. The runner
@@ -86,9 +87,17 @@ class Narrator:
     def say(self, text: str, sub: bool = False) -> None:
         if sub:
             text = "\n".join(f"    ↳ {line}" for line in text.split("\n"))
-        for stream in (self.out, self.log):
-            stream.write(text if text.endswith("\n") else text + "\n")
-            stream.flush()
+        line = text if text.endswith("\n") else text + "\n"
+        self.log.write(line)
+        self.log.flush()
+        if self.out is None:
+            return
+        try:
+            self.out.write(line)
+            self.out.flush()
+        except (OSError, ValueError):
+            # The terminal went (tmux kill-session): the log is still kept.
+            self.out = None
 
     def feed(self, line: str) -> None:
         stripped = line.strip()
@@ -175,6 +184,64 @@ class _SetupFailed(Exception):
     """A setup step failed; the agent is not run (see run)."""
 
 
+class _Stopped(Exception):
+    """The runner stopped the job: SIGTERM, or SIGHUP when it kills the
+    job's tmux session."""
+
+
+# How long a stopped agent gets to exit before it is killed.
+STOP_GRACE_SECONDS = 10
+
+
+class _StopHandler:
+    """Turns a stop into _Stopped while setup or the agent runs, after taking
+    down whatever step or tool is running; later (teardown, writing the
+    result) it only records it, so the run still ends properly."""
+
+    def __init__(self):
+        self.requested = False
+        self.armed = False
+
+    def __call__(self, signum, frame) -> None:
+        if self.requested:
+            return
+        self.requested = True
+        kill_running()
+        if self.armed:
+            raise _Stopped()
+
+    def install(self) -> None:
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, self)
+
+
+def _end_agent(proc: Optional[subprocess.Popen]) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _scrub(job_dir: Path) -> None:
+    """Once the run is over: the tools' spec goes, and cmd.json keeps no
+    token a step was given."""
+    (job_dir / TOOLS_FILE).unlink(missing_ok=True)
+    path = job_dir / "cmd.json"
+    try:
+        spec = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    env = (spec.get("automation") or {}).get("env") or {}
+    if any(key in env for key in SECRET_ENV):
+        for key in SECRET_ENV:
+            env.pop(key, None)
+        write_private(path, spec)
+
+
 def keep_awake(pid: int) -> None:
     """Hold off idle and system sleep until the process `pid` exits.
 
@@ -212,8 +279,11 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
     automation = spec.get("automation") or {}
     if automation:
         automation.setdefault("env", {}).setdefault("JOB_DIR", str(job_dir))
-        # A stop (SIGTERM from the runner) takes the step running now with it.
-        signal.signal(signal.SIGTERM, lambda *_: (kill_current(), sys.exit(143)))
+    # A stop takes the running step, tool or agent with it, then the run
+    # still ends properly: teardown, result.json, exit_code.
+    stop = _StopHandler()
+    stop.install()
+    proc = None
 
     with open(job_dir / "log.txt", "a", encoding="utf-8") as log:
         narrator = Narrator(out, log, cwd or os.getcwd())
@@ -229,18 +299,30 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
                          "worktree it left")
         code = 1
         prepared = True
-        if automation.get("setup"):
+        stop.armed = True
+        if automation.get("setup") and spec.get("resumed"):
+            # The interrupted attempt's setup made what it works in; running
+            # it again could rebuild it under the session being resumed.
+            narrator.say("⚙ setup skipped: resuming where the last attempt left it")
+        elif automation.get("setup"):
             try:
                 _automation_steps(automation, "setup", cwd, narrator.say)
-            except StepFailed as e:
+            except _Stopped:
+                narrator.error = "stopped during setup"
+                narrator.say(f"✗ {narrator.error}")
+                prepared, code = False, 143
+            except Exception as e:  # StepFailed, or a step it couldn't run
                 # Nothing to run the agent in: the run ends here, saying why.
-                narrator.error = str(e)
+                narrator.error = str(e) or type(e).__name__
                 narrator.say(f"✗ {narrator.error}")
                 prepared = False
         if cwd and prepared:
             # Setup may be what makes the agent's directory, or may say where
             # it is (automation.json, as `wf agent prepare-task` writes).
-            cwd = handed_over(job_dir).get("cwd") or cwd
+            moved = handed_over(job_dir).get("cwd")
+            if moved and moved != cwd:
+                retarget_tools(job_dir, moved)
+            cwd = moved or cwd
             Path(cwd).mkdir(parents=True, exist_ok=True)
             narrator.recorder = ChangeRecorder(cwd)
         # No cwd: the runner's own checkout, not the job's.
@@ -250,6 +332,8 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
         try:
             if not prepared:
                 raise _SetupFailed()
+            if stop.requested:
+                raise _Stopped()
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, env={**os.environ, **extra_env},
@@ -268,14 +352,31 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
             narrator.say(f"✗ {narrator.error}")
             code = 127
         except _SetupFailed:
-            code = 1
+            pass
+        except _Stopped:
+            narrator.error = narrator.error or "stopped"
+            narrator.say("✗ stopped")
+            code = 143
         finally:
+            stop.armed = False
+            # Teardown must not run under an agent still writing there.
+            _end_agent(proc)
             if automation.get("teardown"):
                 # However the run ended; a failing teardown is said, not fatal.
                 try:
                     _automation_steps(automation, "teardown", cwd, narrator.say)
-                except StepFailed as e:
-                    narrator.say(f"⚙ teardown did not finish: {e}")
+                except Exception as e:
+                    narrator.say(f"⚙ teardown did not finish: {e or type(e).__name__}")
+            _scrub(job_dir)
+
+        if stop.requested:
+            # Stopped, not ended: no exit_code, which would mark the attempt
+            # finished (checkpoint.interrupted_session) and keep it from being
+            # resumed. `stopped` tells the runner the agent is down and
+            # teardown done (jobs._stop waits for it).
+            checkpoints.wait()
+            (job_dir / "stopped").write_text(narrator.error or "stopped")
+            return 143
 
         result = narrator.result
         if result is None and code == 0 and not narrator.error:
@@ -308,9 +409,28 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
     return code
 
 
+def _record_crash(job_dir: Path, error: str) -> None:
+    """A run that died before its end still says how it ended, so the runner
+    watching for exit_code never waits on it forever."""
+    if (job_dir / "exit_code").exists():
+        return
+    (job_dir / "result.json").write_text(json.dumps(
+        {"result": None, "steps": 1, "error": error, "costUsd": None, "tokens": None}))
+    tmp = job_dir / "exit_code.tmp"
+    tmp.write_text("1")
+    os.replace(tmp, job_dir / "exit_code")
+
+
 def main() -> None:
     job_dir = Path(sys.argv[1])
-    code = run(job_dir)
+    try:
+        code = run(job_dir)
+    except BaseException as e:
+        _record_crash(job_dir, f"the job's process failed: {type(e).__name__}: {e}"[:500])
+        raise
+    if code == 143:
+        # Stopped: nobody is left to read the session.
+        sys.exit(code)
     if os.environ.get("TMUX"):
         print(f"\n── job finished (exit {code}). This session closes in "
               f"{LINGER_SECONDS // 60} min; Ctrl-C to close it now.")

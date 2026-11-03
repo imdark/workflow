@@ -737,6 +737,18 @@ def prepare_automation(job: Job, job_dir: Path, cwd: Path,
     return spec, tools_file, agent_cwd
 
 
+def _resume_workdir(job_dir: Path, workdir: Path, interrupted, automation) -> Path:
+    """Where an interrupted attempt's agent worked: the directory its setup
+    handed over (automation.json), if it did, rather than the profile's
+    default. Resuming is decided against it, and a resumed run skips setup
+    (see job_exec), so the session carries on in what it left."""
+    if not (interrupted and automation and automation.get("setup")):
+        return workdir
+    from workflow.deploy.profile_automation import handed_over
+    moved = handed_over(job_dir).get("cwd")
+    return Path(moved) if moved else workdir
+
+
 def _git(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], capture_output=True, text=True)
 
@@ -927,11 +939,26 @@ def _launch(job_dir: Path, session: Optional[str]) -> Optional[subprocess.Popen]
                             stderr=subprocess.DEVNULL)
 
 
-def _stop(session: Optional[str], proc: Optional[subprocess.Popen]) -> None:
+# How long a stopped run gets to take down its agent and run its teardown.
+STOP_WAIT_SECONDS = 60
+
+
+def _stop(session: Optional[str], proc: Optional[subprocess.Popen],
+          job_dir: Optional[Path] = None) -> None:
+    """Stop the run, and wait for it to wind down (its agent ended, its
+    teardown run): it says so with a `stopped` file. Until then a job claimed
+    again could start in the same directory as a teardown still running."""
     if session:
         subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
     elif proc and proc.poll() is None:
         proc.terminate()
+    deadline = time.monotonic() + STOP_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return
+        if job_dir is None or (job_dir / "stopped").exists() or (job_dir / "exit_code").exists():
+            return
+        time.sleep(0.2)
 
 
 class JobCancelled(Exception):
@@ -991,7 +1018,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     # Before its files are cleared: an earlier attempt that never finished.
     interrupted = checkpoint.interrupted_session(job_dir)
     resume: Optional[str] = None
-    for stale in ("log.txt", "result.json", "exit_code", *job_dir.glob("waiting-*")):
+    for stale in ("log.txt", "result.json", "exit_code", "stopped", *job_dir.glob("waiting-*")):
         (job_dir / stale).unlink(missing_ok=True)
 
     env: dict = {}
@@ -1019,7 +1046,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
         elif job.model == RESEARCH_MODEL:
             # Research reads the world, not a repo: the job directory, no worktree.
             automation, tools_spec, workdir = prepare_automation(job, job_dir, cwd or Path.cwd())
-            workdir = workdir or job_dir
+            workdir = _resume_workdir(job_dir, workdir or job_dir, interrupted, automation)
             resume = checkpoint.resumable(interrupted, job_dir, workdir)
             argv, env = research_argv(
                 job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
@@ -1029,7 +1056,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             # automation); it works in the job directory, or where its
             # automation says. Setup may be what creates that directory.
             automation, tools_spec, workdir = prepare_automation(job, job_dir, cwd or Path.cwd())
-            workdir = workdir or job_dir
+            workdir = _resume_workdir(job_dir, workdir or job_dir, interrupted, automation)
             resume = checkpoint.resumable(interrupted, job_dir, workdir)
             argv, env = claude_code_argv(
                 job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
@@ -1058,7 +1085,9 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             env.update(claude_env)
         else:
             provider, argv = _provider_argv(job, config)
-        (job_dir / "cmd.json").write_text(json.dumps(
+        from workflow.deploy.profile_automation import write_private
+        # Owner-only: its env and a profile's steps carry tokens.
+        write_private(job_dir / "cmd.json", (
             {"argv": argv, "provider": provider, "env": env,
              "cwd": str(workdir) if workdir else None,
              **({"claude": True} if job.model in CLAUDE_MODELS or profiled else {}),
@@ -1121,7 +1150,7 @@ def _watch(job: Job, job_dir: Path, timeout: Optional[int],
         done = exit_path.exists() or (proc is not None and proc.poll() is not None)
         text = drain()
         if on_tick and on_tick(text) and not done:
-            _stop(session, proc)
+            _stop(session, proc, job_dir)
             raise JobCancelled()
         if done:
             break
@@ -1131,7 +1160,7 @@ def _watch(job: Job, job_dir: Path, timeout: Optional[int],
             # Waiting on the user: their thinking time is not the run's.
             deadline += tick_seconds
         elif time.monotonic() > deadline:
-            _stop(session, proc)
+            _stop(session, proc, job_dir)
             raise RuntimeError(f"the run exceeded {timeout}s")
         time.sleep(tick_seconds)
 

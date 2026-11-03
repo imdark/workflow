@@ -15,12 +15,13 @@ stdio; stdout is the protocol, so nothing else may be printed there.
 
 import json
 import os
+import signal
 import sys
 import threading
 from pathlib import Path
 from typing import Optional
 
-from workflow.deploy.profile_automation import run_tool, tool_schema
+from workflow.deploy.profile_automation import kill_running, run_tool, tool_schema
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -47,7 +48,10 @@ class Tools:
         spec = next((t for t in self.tools if t["name"] == name), None)
         if spec is None:
             return {"content": [{"type": "text", "text": f"unknown tool {name}"}], "isError": True}
-        text, ok = run_tool(spec, args or {}, self.values, self.cwd, self.env)
+        if not isinstance(args, dict):
+            return {"content": [{"type": "text", "text": f"{name}: arguments must be an object"}],
+                    "isError": True}
+        text, ok = run_tool(spec, args, self.values, self.cwd, self.env)
         return {"content": [{"type": "text", "text": text}], "isError": not ok}
 
 
@@ -80,25 +84,46 @@ def main() -> None:
     lock = threading.Lock()
 
     def reply(message: dict) -> None:
-        response = handle(tools, message)
+        try:
+            response = handle(tools, message)
+        except Exception as e:
+            # Every request gets an answer: without one the agent waits out
+            # the tool timeout, which a profile may set to a day.
+            response = None if message.get("id") is None else {
+                "jsonrpc": "2.0", "id": message.get("id"),
+                "error": {"code": -32603, "message": f"{type(e).__name__}: {e}"}}
         if response is not None:
             with lock:
                 sys.stdout.write(json.dumps(response) + "\n")
                 sys.stdout.flush()
 
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if message.get("method") == "tools/call":
-            # A render or an install can take minutes; it must not hold up
-            # pings or a second call behind it.
-            threading.Thread(target=reply, args=(message,), daemon=True).start()
-        else:
-            reply(message)
+    def stop(*_):
+        kill_running()
+        os._exit(0)
+
+    # Claude stopping its servers, or the job's session going away.
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            if message.get("method") == "tools/call":
+                # A render or an install can take minutes; it must not hold up
+                # pings or a second call behind it.
+                threading.Thread(target=reply, args=(message,), daemon=True).start()
+            else:
+                reply(message)
+    finally:
+        # Stdin closed: Claude is gone. Its tools' commands run in sessions of
+        # their own and would outlive it.
+        kill_running()
 
 
 if __name__ == "__main__":

@@ -105,22 +105,41 @@ def _tail(text: str, chars: int) -> str:
     return trimmed if len(trimmed) <= chars else "…" + trimmed[-chars:]
 
 
+def seconds(value, default: int = DEFAULT_TIMEOUT_SECONDS) -> int:
+    """A step's or tool's timeout: 600, "600", "90s", "10m", "1h". Anything
+    else, or nothing, is `default`, rather than a crash in the middle of a job."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return int(value) if value > 0 else default
+    match = re.fullmatch(r"\s*(\d+)\s*([smh]?)\s*", str(value or ""))
+    if not match:
+        return default
+    n = int(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[match.group(2)]
+    return n or default
+
+
 def _indent(text: str) -> str:
     return "\n".join(f"    {line}" for line in text.split("\n"))
 
 
-# The step or tool running now, so a SIGTERM to job_exec takes its whole
-# process group with it rather than orphaning a clone or an install.
-_current = threading.local()
+# The steps and tools running now, in any thread, so a stop takes each
+# one's whole process group with it rather than orphaning a clone, an
+# install or a render. (Each runs in a session of its own, so it gets no
+# SIGHUP when the terminal goes.)
+_running: set = set()
+_running_lock = threading.Lock()
 
 
-def kill_current() -> None:
-    proc = getattr(_current, "proc", None)
-    if proc is not None and proc.poll() is None:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
+def kill_running() -> None:
+    with _running_lock:
+        procs = list(_running)
+    for proc in procs:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
 
 
 def run_command(command: str, timeout: Optional[int], cwd: Optional[str], env: dict,
@@ -140,7 +159,8 @@ def run_command(command: str, timeout: Optional[int], cwd: Optional[str], env: d
         )
     except OSError as e:
         return None, str(e), False
-    _current.proc = proc
+    with _running_lock:
+        _running.add(proc)
     output: list = []
     size = 0
     timed_out = False
@@ -167,7 +187,8 @@ def run_command(command: str, timeout: Optional[int], cwd: Optional[str], env: d
         code = proc.wait()
     finally:
         timer.cancel()
-        _current.proc = None
+        with _running_lock:
+            _running.discard(proc)
     return code, _tail("".join(output), OUTPUT_CHARS), timed_out
 
 
@@ -176,17 +197,22 @@ def run_steps(phase: str, steps: list, values: dict, cwd: Optional[str], env: di
     """Run steps in order, saying each in the transcript. A failing step
     stops the list (StepFailed) unless it is optional."""
     for step in steps or []:
-        name = str(step.get("name") or step.get("run", "step").split()[0])[:40]
-        timeout = int(step.get("timeout") or DEFAULT_TIMEOUT_SECONDS)
+        if not isinstance(step, dict):
+            step = {"run": str(step)}
+        run = str(step.get("run") or "")
+        name = str(step.get("name") or (run.split() or ["step"])[0])[:40]
+        if not run.strip():
+            say(f"⚙ {phase} · {name}: nothing to run, skipped")
+            continue
+        timeout = seconds(step.get("timeout"))
         started = time.monotonic()
-        code, output, timed_out = run_command(
-            render(str(step.get("run") or ""), values), timeout, cwd, env)
-        seconds = f"{time.monotonic() - started:.1f}"
+        code, output, timed_out = run_command(render(run, values), timeout, cwd, env)
+        took = f"{time.monotonic() - started:.1f}"
         if code == 0:
-            say(f"⚙ {phase} · {name} ✓ ({seconds}s)")
+            say(f"⚙ {phase} · {name} ✓ ({took}s)")
             continue
         why = f"timed out after {timeout}s" if timed_out else f"exit {code}"
-        say(f"⚙ {phase} · {name} ✗ {why} ({seconds}s)")
+        say(f"⚙ {phase} · {name} ✗ {why} ({took}s)")
         if output.strip():
             say(_indent(_tail(output, LOG_TAIL_CHARS)))
         if not step.get("optional"):
@@ -200,7 +226,7 @@ def run_tool(spec: dict, args: dict, values: dict, cwd: Optional[str], env: dict
         env = tool_env(spec, args, env)
     except KeyError as e:
         return f"{spec.get('name')} needs '{e.args[0]}'", False
-    timeout = int(spec.get("timeout") or DEFAULT_TIMEOUT_SECONDS)
+    timeout = seconds(spec.get("timeout"))
     code, output, timed_out = run_command(render(str(spec.get("run") or ""), values),
                                           timeout, cwd, env)
     ok = code == 0
@@ -254,9 +280,37 @@ def handed_over(job_dir: Path) -> dict:
     return out
 
 
+# What steps and tools may carry from the runner that must not outlive a run
+# on disk (see scrub_secrets).
+SECRET_ENV = ("GH_TOKEN", "GITHUB_TOKEN")
+
+
+def write_private(path: Path, data: dict) -> None:
+    """JSON readable by this user only: the env it carries may hold tokens."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # An existing file keeps its mode through O_CREAT; make sure.
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+
+
 def write_tools_spec(job_dir: Path, tools: list, values: dict, cwd: Optional[str],
                      env: dict) -> Path:
-    """What automation_mcp needs to serve the tools, in one file."""
+    """What automation_mcp needs to serve the tools, in one file. It holds
+    the steps' env, so it is owner-only and removed when the run ends."""
     path = job_dir / TOOLS_FILE
-    path.write_text(json.dumps({"tools": tools, "values": values, "cwd": cwd, "env": env}))
+    write_private(path, {"tools": tools, "values": values, "cwd": cwd, "env": env})
     return path
+
+
+def retarget_tools(job_dir: Path, cwd: str) -> None:
+    """Point the tools at where the agent works after setup handed over
+    another directory, before the agent (and with it the tools' server) starts."""
+    path = job_dir / TOOLS_FILE
+    try:
+        spec = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    spec["cwd"] = cwd
+    spec.setdefault("env", {})["AGENT_CWD"] = cwd
+    write_private(path, spec)

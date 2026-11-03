@@ -405,3 +405,173 @@ def test_the_run_tools_advertise_upload_and_attachments():
     ask = next(t for t in agent_mcp.TOOLS if t["name"] == "ask_user")
     assert "attachments" in ask["inputSchema"]["properties"]
     assert "upload_artifact" in ask["description"]
+
+
+# --- from the review of #55 ----------------------------------------------------
+
+import signal
+import stat
+import subprocess
+import time
+
+
+def _start_job(job_dir: Path) -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, "-m", "workflow.deploy.job_exec", str(job_dir)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _wait_for(path: Path, timeout: float = 10) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists() and path.read_text().strip():
+            return path.read_text().strip()
+        time.sleep(0.05)
+    raise AssertionError(f"{path} never appeared")
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("sig", [signal.SIGHUP, signal.SIGTERM])
+def test_a_stop_during_setup_kills_the_step_and_still_tears_down(tmp_path, sig):
+    """tmux kill-session sends SIGHUP; a runner without tmux sends SIGTERM."""
+    _cmd(tmp_path, {
+        "setup": [{"name": "clone", "run": "echo $$ > {job_dir}/step.pid; exec sleep 30"}],
+        "teardown": [{"name": "clean", "run": "echo cleaned > {job_dir}/teardown"}],
+        "values": {"job_dir": str(tmp_path)}, "env": pa.shell_env("job-1", tmp_path),
+    })
+    job = _start_job(tmp_path)
+    step = int(_wait_for(tmp_path / "step.pid"))
+    job.send_signal(sig)
+    assert job.wait(timeout=15) == 143
+    assert not _alive(step), "the setup step must not outlive the job"
+    assert (tmp_path / "teardown").read_text().strip() == "cleaned"
+    # Stopped, not finished: no exit_code, so the attempt can still be resumed.
+    assert _wait_for(tmp_path / "stopped") == "stopped during setup"
+    assert not (tmp_path / "exit_code").exists()
+
+
+def test_a_stop_ends_the_agent_before_teardown_runs(tmp_path):
+    agent = (f"import os, time; open({str(tmp_path / 'agent.pid')!r}, 'w').write(str(os.getpid()));"
+             " time.sleep(30)")
+    _cmd(tmp_path, {
+        "setup": [], "values": {"job_dir": str(tmp_path)}, "env": pa.shell_env("job-1", tmp_path),
+        "teardown": [{"name": "clean",
+                      "run": "kill -0 $(cat {job_dir}/agent.pid) 2>/dev/null && r=alive || r=gone; "
+                             "echo $r > {job_dir}/teardown"}],
+    }, argv=[sys.executable, "-c", agent])
+    job = _start_job(tmp_path)
+    pid = int(_wait_for(tmp_path / "agent.pid"))
+    job.send_signal(signal.SIGTERM)
+    assert job.wait(timeout=30) == 143
+    assert (tmp_path / "teardown").read_text().strip() == "gone"
+    assert not _alive(pid)
+    assert _wait_for(tmp_path / "stopped") == "stopped"
+    assert not (tmp_path / "exit_code").exists()
+
+
+def test_timeouts_take_units_and_odd_steps_do_not_crash(tmp_path):
+    assert [pa.seconds(v) for v in (90, "90", "90s", "10m", "1h")] == [90, 90, 90, 600, 3600]
+    assert pa.seconds("soon") == pa.seconds(None) == pa.seconds(0) == pa.DEFAULT_TIMEOUT_SECONDS
+    said = []
+    pa.run_steps("setup", [{"run": ""}, {"run": "true", "timeout": "10m"}, "true"], {}, str(tmp_path),
+                 {"PATH": os.environ["PATH"]}, said.append)
+    assert "nothing to run, skipped" in said[0] and said[1].startswith("⚙ setup · true ✓")
+
+
+def test_a_run_that_crashes_still_writes_its_exit_code(tmp_path):
+    (tmp_path / "cmd.json").write_text(json.dumps({"provider": "x"}))  # no argv
+    job = _start_job(tmp_path)
+    job.wait(timeout=15)
+    assert _wait_for(tmp_path / "exit_code") == "1"
+    assert "KeyError" in json.loads((tmp_path / "result.json").read_text())["error"]
+
+
+def test_tool_commands_are_killed_when_claude_goes(tmp_path):
+    spec = pa.write_tools_spec(tmp_path, [{"name": "render", "run": f"echo $$ > {tmp_path}/tool.pid; exec sleep 30"}],
+                               {}, str(tmp_path), {"PATH": os.environ["PATH"]})
+    server = subprocess.Popen([sys.executable, "-m", "workflow.deploy.automation_mcp"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                              env={**os.environ, "NG_AUTOMATION_TOOLS": str(spec)})
+    server.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "render", "arguments": {}}}) + "\n")
+    server.stdin.flush()
+    pid = int(_wait_for(tmp_path / "tool.pid"))
+    server.stdin.close()  # Claude exited
+    server.wait(timeout=10)
+    time.sleep(0.2)
+    assert not _alive(pid)
+
+
+def test_every_tool_call_gets_an_answer(tmp_path):
+    spec = pa.write_tools_spec(tmp_path, [{"name": "ok", "run": "true"},
+                                          {"name": "broken", "run": "true", "params": ["x"]}],
+                               {}, str(tmp_path), {"PATH": os.environ["PATH"]})
+    calls = [{"name": "ok", "arguments": ["not", "a", "dict"]}, {"name": "broken", "arguments": {}}]
+    lines = "".join(json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": c}) + "\n"
+                    for i, c in enumerate(calls, 1))
+    out = subprocess.run([sys.executable, "-m", "workflow.deploy.automation_mcp"], input=lines,
+                         capture_output=True, text=True, timeout=20,
+                         env={**os.environ, "NG_AUTOMATION_TOOLS": str(spec)}).stdout
+    replies = {r["id"]: r for r in map(json.loads, out.splitlines())}
+    assert replies[1]["result"]["isError"] and "must be an object" in replies[1]["result"]["content"][0]["text"]
+    assert replies[2]["error"]["code"] == -32603
+
+
+def test_handed_over_cwd_reaches_the_tools(tmp_path):
+    handed = tmp_path / "elsewhere"
+    pa.write_tools_spec(tmp_path, [{"name": "where", "run": "pwd"}], {}, str(tmp_path),
+                        {"AGENT_CWD": str(tmp_path)})
+    _cmd(tmp_path, {
+        "setup": [{"name": "prepare",
+                   "run": f"mkdir -p {handed} && echo '{{\"cwd\": \"{handed}\"}}' > {{job_dir}}/automation.json"}],
+        "teardown": [], "values": {"job_dir": str(tmp_path)}, "env": pa.shell_env("job-1", tmp_path),
+    }, argv=[sys.executable, "-c", "import json, os; print(json.load(open(os.environ.get('X', 'automation-tools.json'))) ['cwd'])"])
+    # The agent (started in the handed-over cwd) reads the tools' spec from the job dir.
+    spec = json.loads((tmp_path / "cmd.json").read_text())
+    spec["env"] = {"X": str(tmp_path / pa.TOOLS_FILE)}
+    (tmp_path / "cmd.json").write_text(json.dumps(spec))
+    assert job_exec.run(tmp_path, out=open(os.devnull, "w")) == 0
+    assert json.loads((tmp_path / "result.json").read_text())["result"] == str(handed)
+
+
+def test_a_resumed_run_skips_setup(tmp_path):
+    _cmd(tmp_path, {
+        "setup": [{"name": "wipe", "run": "echo ran > {job_dir}/setup-ran"}],
+        "teardown": [], "values": {"job_dir": str(tmp_path)}, "env": pa.shell_env("job-1", tmp_path),
+    })
+    spec = json.loads((tmp_path / "cmd.json").read_text())
+    spec["resumed"] = True
+    (tmp_path / "cmd.json").write_text(json.dumps(spec))
+    assert job_exec.run(tmp_path, out=open(os.devnull, "w")) == 0
+    assert not (tmp_path / "setup-ran").exists()
+    assert "setup skipped: resuming" in (tmp_path / "log.txt").read_text()
+
+
+def test_resume_is_decided_where_setup_moved_the_agent(tmp_path):
+    from workflow.deploy.jobs import _resume_workdir
+
+    (tmp_path / "automation.json").write_text(json.dumps({"cwd": str(tmp_path / "repo")}))
+    setup = {"setup": [{"run": "x"}]}
+    assert _resume_workdir(tmp_path, tmp_path, "sess", setup) == tmp_path / "repo"
+    assert _resume_workdir(tmp_path, tmp_path, None, setup) == tmp_path  # not resuming
+    assert _resume_workdir(tmp_path, tmp_path, "sess", {"setup": []}) == tmp_path
+
+
+def test_files_with_tokens_are_private_and_scrubbed_after(tmp_path):
+    env = {**pa.shell_env("job-1", tmp_path), "GH_TOKEN": "ghp_secret"}
+    tools = pa.write_tools_spec(tmp_path, [{"name": "t", "run": "true"}], {}, str(tmp_path), env)
+    assert stat.S_IMODE(tools.stat().st_mode) == 0o600
+    pa.write_private(tmp_path / "cmd.json", {
+        "argv": [sys.executable, "-c", "print(1)"], "provider": "x", "env": {}, "cwd": None,
+        "automation": {"setup": [], "teardown": [], "values": {}, "env": env}})
+    assert stat.S_IMODE((tmp_path / "cmd.json").stat().st_mode) == 0o600
+    assert job_exec.run(tmp_path, out=open(os.devnull, "w")) == 0
+    assert not tools.exists()
+    assert "ghp_secret" not in (tmp_path / "cmd.json").read_text()
+    assert stat.S_IMODE((tmp_path / "cmd.json").stat().st_mode) == 0o600
