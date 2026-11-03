@@ -129,8 +129,17 @@ MEMORY (from earlier sessions on this task):
     context_parts.append(f"""
 WHEN YOU ARE DONE:
 Once the implementation is complete and verified, ship it: commit all your
-changes on this branch, then run `wf done --task {issue.key}`. That pushes the
-branch, opens a PR and moves the task to Committed. Don't stop before this.
+changes on this branch, then run
+`wf done --task {issue.key} --title "<title>" --body "<description>"`.
+That pushes the branch, opens a PR and moves the task to Committed. Don't
+stop before this.
+
+The title and description are for a reviewer who hasn't seen this task or
+your session. The title says what the change does, in under 70 characters
+(the task key is added in front). The description says what changed and
+why, how you verified it, and anything left undone, in a few short
+paragraphs or bullets. Never paste the task text, your instructions or your
+session log into either.
 """)
 
     # Add MCP tools information

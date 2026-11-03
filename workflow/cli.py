@@ -2973,7 +2973,9 @@ def switch(
 
 @app.command()
 def done(reviewers: str = typer.Option(None, help="Comma-separated list of reviewers"), repo_path: str = typer.Option(None, help="Repository path"),
-         task: str = typer.Option(None, "--task", help="Task key to finish instead of the current task (background agents don't set one)")):
+         task: str = typer.Option(None, "--task", help="Task key to finish instead of the current task (background agents don't set one)"),
+         title: str = typer.Option(None, "--title", help="PR title: what the change does (the task key is put in front)"),
+         body: str = typer.Option(None, "--body", help="PR description: what changed and why")):
     cfg = load_config()
     backend = get_backend(load_effective_config())
     # A background agent runs without a terminal: take the defaults rather
@@ -3093,7 +3095,7 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                 
                 if has_diff:
                     try:
-                        pr = create_pr(issue, reviewers, current_repo_path, base_branch)
+                        pr = create_pr(issue, reviewers, current_repo_path, base_branch, title=title, body=body)
                         if pr and pr.get("url") and not pr.get("url").startswith("existing"):
                             typer.echo(f"✅ Created PR for {current_repo_path}")
                             pr_created = True
@@ -3110,7 +3112,7 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                             from workflow.git_utils import push_branch
                             push_branch(current_repo_path)
                             typer.echo(f"✅ Pushed branch '{current_branch}'")
-                            pr = create_pr(issue, reviewers, current_repo_path, base_branch)
+                            pr = create_pr(issue, reviewers, current_repo_path, base_branch, title=title, body=body)
                             if pr and pr.get("url") and not pr.get("url").startswith("existing"):
                                 typer.echo(f"✅ Created PR for {current_repo_path}")
                                 pr_created = True
