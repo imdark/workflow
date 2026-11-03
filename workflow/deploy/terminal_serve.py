@@ -20,6 +20,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import shlex
 import shutil
 import signal
@@ -27,6 +28,7 @@ import struct
 import termios
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections import deque
 from typing import Callable, Optional
 
 # The server refuses output frames over 256 KB; stay well under.
@@ -46,6 +48,12 @@ RESUME_ARGS = {
 SESSIONS_DIR = Path.home() / ".wf" / "terminal"
 # How often an --exit-on-update runner checks for new code.
 UPDATE_POLL_SECONDS = 10.0
+# Output kept per session while the socket is down, sent on reconnect.
+BACKLOG_LIMIT = 512 * 1024
+
+# A session id names its folder under SESSIONS_DIR, so it may not be a path:
+# no separators, and not "." or "..".
+SESSION_ID = re.compile(r"^(?!\.+$)[A-Za-z0-9._-]{1,128}$")
 
 
 class HarnessRefused(ValueError):
@@ -86,6 +94,11 @@ class NotesGraphMcp:
             "url": f"{self.url}/api/workspaces/{self.workspace}/mcp",
             "headers": {"Authorization": f"Bearer {self.token}"},
         }}}
+
+    def env(self) -> dict:
+        """What `wf notes` reads to work on this workspace from the session."""
+        return {"NOTESGRAPH_URL": self.url, "NOTESGRAPH_WORKSPACE": self.workspace,
+                "NOTESGRAPH_TOKEN": self.token}
 
 
 def claude_launch(argv: list, session_dir: Path,
@@ -135,37 +148,90 @@ class Device:
     mcp: Optional[NotesGraphMcp] = None
     sessions_dir: Path = SESSIONS_DIR
     ptys: dict = field(default_factory=dict)
+    # Output and exits that couldn't be sent while the socket was down, by
+    # session, in order; `flush` sends them on reconnect.
+    backlog: dict = field(default_factory=dict)
 
     def _ref(self, session_id: str) -> dict:
         return {"workspaceId": self.workspace_id, "sessionId": session_id}
+
+    async def _send(self, event: str, payload: dict) -> None:
+        """Send, or keep it for `flush` when the socket is down.
+
+        A harness keeps running through a dropped connection: its output and
+        exit wait here instead of failing the reader that produced them.
+        """
+        sid = payload["sessionId"]
+        queue = self.backlog.get(sid)
+        if not queue:
+            try:
+                await self.emit(event, payload)
+                return
+            except Exception:
+                queue = self.backlog.setdefault(sid, deque())
+        queue.append((event, payload))
+        size = sum(len(p.get("data", "")) for _, p in queue)
+        # Drop the oldest output past the limit; never an exit.
+        while size > BACKLOG_LIMIT and queue[0][0] == "terminal:device:output":
+            size -= len(queue.popleft()[1].get("data", ""))
+
+    async def flush(self) -> set:
+        """Send what waited while disconnected. Returns the sessions whose
+        exit went out with it."""
+        ended = set()
+        for sid in list(self.backlog):
+            queue = self.backlog[sid]
+            while queue:
+                event, payload = queue[0]
+                try:
+                    await self.emit(event, payload)
+                except Exception:
+                    return ended
+                queue.popleft()
+                if event == "terminal:device:exit":
+                    ended.add(sid)
+            self.backlog.pop(sid, None)
+        return ended
 
     def _launch(self, session: dict, sid: str) -> tuple:
         """(argv, env, session_dir) for a session; raises if refused."""
         harness = session.get("harness", "shell")
         argv = harness_argv(harness, session.get("resume"), self.overrides,
                             self.allow_shell)
+        own_claude = harness == "claude" and not self.overrides.get("claude")
+        # A shell and wf's own Claude can run `wf notes` on the workspace the
+        # session was opened from. Not Codex, Gemini or an owner's override:
+        # the token would be in the environment of a program wf didn't vet,
+        # for it and whatever it runs to log or pass on.
+        notes_env = self.mcp.env() if self.mcp and (harness == "shell" or own_claude) else {}
         # Only wf's own Claude gets the MCP config; an override is the
         # device owner's command, run as written.
-        if harness == "claude" and not self.overrides.get("claude"):
+        if own_claude:
             session_dir = self.sessions_dir / sid
             argv, env = claude_launch(argv, session_dir, self.mcp)
-            return argv, env, session_dir
-        return argv, {}, None
+            return argv, {**notes_env, **env}, session_dir
+        return argv, notes_env, None
 
     async def spawn(self, session: dict) -> None:
-        sid = str(session["id"])
+        sid = str(session.get("id") or "")
+        if not SESSION_ID.match(sid):
+            # Not one the gateway makes; nothing safe to name a folder after.
+            return
         if sid in self.ptys:
             return
         cols = int(session.get("cols") or 80)
         rows = int(session.get("rows") or 24)
+        session_dir = None
         try:
             argv, env, session_dir = self._launch(session, sid)
             pid, fd = pty.fork()
         except Exception as err:  # refused harness, fork failure
-            await self.emit("terminal:device:started", self._ref(sid))
-            await self.emit("terminal:device:output",
-                            {**self._ref(sid), "data": f"\r\n[wf] cannot start: {err}\r\n"})
-            await self.emit("terminal:device:exit", {**self._ref(sid), "code": 127})
+            if session_dir:
+                shutil.rmtree(session_dir, ignore_errors=True)
+            await self._send("terminal:device:started", self._ref(sid))
+            await self._send("terminal:device:output",
+                             {**self._ref(sid), "data": f"\r\n[wf] cannot start: {err}\r\n"})
+            await self._send("terminal:device:exit", {**self._ref(sid), "code": 127})
             return
         if pid == 0:  # child
             try:
@@ -180,7 +246,7 @@ class Device:
         set_winsize(fd, cols, rows)
         p = Pty(id=sid, pid=pid, fd=fd, session_dir=session_dir)
         self.ptys[sid] = p
-        await self.emit("terminal:device:started", self._ref(sid))
+        await self._send("terminal:device:started", self._ref(sid))
         p.reader = asyncio.create_task(self._pump(p))
 
     async def _pump(self, p: Pty) -> None:
@@ -216,8 +282,8 @@ class Device:
                     else:
                         decoder_tail = b""
                 if text:
-                    await self.emit("terminal:device:output",
-                                    {**self._ref(p.id), "data": text})
+                    await self._send("terminal:device:output",
+                                     {**self._ref(p.id), "data": text})
         finally:
             code = await self._reap(p)
             self.ptys.pop(p.id, None)
@@ -227,7 +293,7 @@ class Device:
                 pass
             if p.session_dir:
                 shutil.rmtree(p.session_dir, ignore_errors=True)
-            await self.emit("terminal:device:exit", {**self._ref(p.id), "code": code})
+            await self._send("terminal:device:exit", {**self._ref(p.id), "code": code})
 
     async def _reap(self, p: Pty) -> int:
         for _ in range(50):
@@ -309,9 +375,12 @@ async def serve(url: str, token: str, workspace_id: str, device_key: str,
         if isinstance(ack, dict) and ack.get("error"):
             raise RuntimeError(ack["error"].get("message", "refused"))
         data = (ack or {}).get("data") or {}
+        # What sessions printed, and how they ended, while the socket was down.
+        ended = await device.flush()
         # `live` sessions we no longer have (this process restarted) are gone.
         for s in data.get("live") or []:
-            if str(s["id"]) not in device.ptys:
+            if str(s["id"]) not in device.ptys and str(s["id"]) not in ended \
+                    and str(s["id"]) not in device.backlog:
                 await emit("terminal:device:exit",
                            {"workspaceId": workspace_id, "sessionId": s["id"], "code": None})
         for s in data.get("pending") or []:
@@ -342,8 +411,10 @@ async def serve(url: str, token: str, workspace_id: str, device_key: str,
     async def _kill(body):
         device.kill(body["sessionId"])
 
+    # retry: keep trying when NotesGraph (or the network) isn't there yet,
+    # as at login, instead of exiting for the supervisor to give up on.
     await sio.connect(url, headers={"Authorization": f"Bearer {token}"},
-                      transports=["websocket"], wait_timeout=20)
+                      transports=["websocket"], wait_timeout=20, retry=True)
     try:
         if stop_when is None:
             await sio.wait()

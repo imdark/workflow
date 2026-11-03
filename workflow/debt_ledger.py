@@ -133,21 +133,11 @@ def run_debt(root: Path, tag: str, under: Optional[str], dry_run: bool,
             from workflow.config import load_effective_config
             from workflow.deploy.notes import reader_from_config
             reader = reader_from_config(load_effective_config())
-        note = reader.find(title)
-        if note:
-            content = render_ledger(markers, tags, reader.read(note["docId"]))
-            reader.call("update_document", {"docId": note["docId"], "content": content, "agent": "wf debt"})
-        else:
-            reader.call("create_document", {"title": title, "content": render_ledger(markers, tags),
-                                            "agent": "wf debt"})
-            note = reader.find(title)
-            if under and note:
-                parent = reader.find(under)
-                if not parent:
-                    echo(f"⚠️  no note titled \"{under}\" to file the ledger under")
-                else:
-                    reader.call("link_document", {"parentDocId": parent["docId"],
-                                                  "childDocId": note["docId"]})
+        from workflow.deploy.notes import upsert_note
+        saved = upsert_note(reader, title, lambda existing: render_ledger(markers, tags, existing or ""),
+                            "wf debt", under)
+        if saved["filed"] is False:
+            echo(f"⚠️  no note titled \"{under}\" to file the ledger under")
     except NotesGraphError as e:
         echo(f"❌ {e}")
         return 1
