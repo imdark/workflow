@@ -27,7 +27,8 @@ class Run:
         self.turns.append(Turn(self.sid, len(self.turns), "tool_call", json.dumps(args),
                                tool_name=tool, tool_call_id=cid))
         self.turns.append(Turn(self.sid, len(self.turns), "tool_result", result, tool_call_id=cid,
-                               raw={"is_error": True} if error else None))
+                               # As the proxy records an Anthropic tool_result block.
+                               raw={"type": "tool_result", **({"is_error": True} if error else {})}))
         self.n += 1
         return self
 
@@ -196,3 +197,121 @@ def test_render_note_escapes_tags_outside_code():
     note = learn.render_note([{"id": "L-1", "target": "agent_rules", "change": "Set `X=<serial>`",
                                "evidence": ["ls: <path>: missing"], "status": "pending"}])
     assert "`X=<serial>`" in note and "ls: &lt;path>: missing" in note
+
+
+# --- from the review of PR #51 --------------------------------------------------
+
+def test_a_reworded_rejected_change_is_not_proposed_again(monkeypatch):
+    ledger = [{"id": "L-abc123", "target": "agent_rules", "status": "rejected",
+               "change": "Use grep via Bash; the Grep tool is unavailable"}]
+    again = {"id": "L-zzz999", "target": "agent_rules",
+             "change": "Use grep via Bash, the Grep tool is not available"}
+    other = {"id": "L-yyy888", "target": "agent_rules", "change": "Run tests with pytest -q"}
+    assert learn.merge(ledger, [again, other]) == [other]
+
+    # And the model is told what was already proposed.
+    prompts = []
+    monkeypatch.setattr("workflow.ladder._run_llm", lambda prompt, cfg: prompts.append(prompt) or "[]")
+    learn.propose([learn.Finding("stuck", "x", 3, ["a"])], ledger=ledger)
+    assert "ALREADY PROPOSED" in prompts[0] and "[rejected] agent_rules: Use grep via Bash" in prompts[0]
+
+
+def test_rejecting_an_accepted_rule_takes_it_out_of_agent_rules(tmp_path, monkeypatch):
+    path = tmp_path / "proposals.json"
+    learn.save_ledger([{"id": "L-abc123", "target": "agent_rules", "change": "Use grep via Bash",
+                        "status": "accepted"}], path)
+    rules = "* mine\n\n## Learned\n\n* Use grep via Bash (L-abc123, learned 2026-11-01)\n* other (L-def456, learned 2026-11-01)\n"
+    reader = FakeReader({"Agent rules": ("rules", rules)})
+    monkeypatch.setattr(learn, "_reader", lambda cfg: reader)
+    assert learn.reject_proposal("L-abc123", {}, echo=lambda *a: None, ledger_path=path) == 0
+    assert learn.load_ledger(path)[0]["status"] == "rejected"
+    tool, args = reader.calls[0]
+    assert tool == "update_document" and "L-abc123" not in args["content"]
+    assert "* mine" in args["content"] and "L-def456" in args["content"]
+
+
+def test_reading_a_file_in_parts_is_not_a_reread():
+    run = Run("a")
+    for offset in (0, 2000, 4000):
+        run.call("Read", {"file_path": "/big.py", "offset": offset, "limit": 2000})
+    assert learn.detect([learn.scan_session("a", run.turns)]) == []
+
+
+@pytest.mark.parametrize("write", [
+    ("Bash", {"command": "sed -i '' s/a/b/ /f.py"}),
+    ("Bash", {"command": "black f.py"}),
+    ("MultiEdit", {"file_path": "/f.py", "edits": []}),
+])
+def test_a_write_by_other_means_resets_the_reread_count(write):
+    run = Run("a")
+    run.call("Read", {"file_path": "/f.py"}).call("Read", {"file_path": "/f.py"})
+    run.call(*write)
+    run.call("Read", {"file_path": "/f.py"}).call("Read", {"file_path": "/f.py"})
+    assert learn.detect([learn.scan_session("a", run.turns)]) == []
+
+
+def test_errors_from_runs_with_no_error_flag_are_seen():
+    """OpenAI chat and Responses results carry no is_error."""
+    turns = []
+    for i in range(3):
+        turns += [Turn("a", len(turns), "tool_call", json.dumps({"command": "adb devices"}),
+                       tool_name="shell", tool_call_id=f"c{i}"),
+                  Turn("a", len(turns) + 1, "tool_result", "zsh: command not found: adb",
+                       tool_call_id=f"c{i}", raw={"type": "function_call_output", "call_id": f"c{i}"})]
+    assert [f.kind for f in learn.detect([learn.scan_session("a", turns)])] == ["stuck"]
+    ok = Turn("a", 0, "tool_result", "3 errors found in the log", raw={"type": "function_call_output"})
+    assert not learn._is_error(ok)
+
+
+@pytest.mark.parametrize("item", [
+    {"target": "agent_rules", "change": {"text": "x"}, "evidence": ["F-?"]},
+    {"target": "agent_rules", "change": "x", "evidence": [["F-?"]]},
+    {"target": "agent_rules", "change": "x", "evidence": {"id": "F-?"}},
+    {"target": "agent_rules", "change": "x", "why": ["no"], "evidence": "F-?"},
+])
+def test_odd_model_output_is_skipped_not_a_crash(monkeypatch, item):
+    finding = learn.Finding("stuck", "x", 3, ["a"])
+    item = json.loads(json.dumps(item).replace("F-?", finding.id))
+    good = {"target": "memory", "change": "y", "evidence": [finding.id]}
+    monkeypatch.setattr("workflow.ladder._run_llm", lambda prompt, cfg: json.dumps([item, good]))
+    out = learn.propose([finding])
+    assert out[-1]["change"] == "y"
+    # A bare id string is taken as one id, not its characters.
+    if isinstance(item["evidence"], str):
+        assert out[0]["change"] == "x" and out[0]["why"] == ""
+
+
+@pytest.mark.parametrize("args", [
+    {"questions": ["Which branch?"]},
+    {"question": {"text": "Which branch?"}},
+    {"questions": [None]},
+])
+def test_odd_question_shapes_do_not_stop_the_scan(args):
+    run = Run("a").call("AskUserQuestion", args)
+    run.call("Bash", {"command": ["not", "a", "string"]}, "Error: boom", error=True)
+    learn.scan_session("a", run.turns)
+
+
+def test_one_bad_transcript_does_not_stop_the_others(store, monkeypatch):
+    _save(store, Run("a").call("Bash", {"command": "ls"}), Run("b").call("Bash", {"command": "ls"}))
+    real = learn.scan_session
+    monkeypatch.setattr(learn, "scan_session",
+                        lambda sid, turns: (_ for _ in ()).throw(ValueError()) if sid == "a" else real(sid, turns))
+    assert [s["session_id"] for s in learn.scan_store(store)] == ["b"]
+
+
+def test_learned_goes_under_the_real_heading_only():
+    rules = "* a\n\n## Tools\n\n### Learned shortcuts\n\n* s\n\n## Leave alone\n\n* b\n"
+    out = learn.add_learned_rule(rules, {"id": "L-abc123", "change": "Do X", "decided": "2026-11-01"})
+    assert "### Learned shortcuts\n\n* s\n\n## Leave alone" in out
+    assert out.rstrip().endswith("## Learned\n\n* Do X (L-abc123, learned 2026-11-01)")
+
+
+def test_a_stuck_error_is_not_also_reported_as_recurring():
+    scans = []
+    for sid in ("a", "b", "c"):
+        run = Run(sid)
+        for _ in range(3):
+            run.call("Bash", {"command": "adb devices"}, "command not found: adb", error=True)
+        scans.append(learn.scan_session(sid, run.turns))
+    assert [f.kind for f in learn.detect(scans)] == ["stuck"]
