@@ -383,6 +383,10 @@ CLAUDE_CODE_ALLOWED_TOOLS = [
 # Claude Code gives an MCP tool call this long (ms) before giving up. A
 # question waits for a person, who may be at dinner.
 ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000
+# The longest timeout Claude Code takes (a JS timer's limit, about 24.8
+# days); anything above it is cut down to it. The run server's tools get
+# this, so a question has no timeout of its own.
+NO_TIMEOUT_MS = 2**31 - 1
 
 # The conventions above (where facts go, how they are dated, the task status
 # workflow) are fixed in code. A note of this title in the workspace is the
@@ -634,6 +638,10 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
             "env": {"NG_URL": client.url, "NG_WORKSPACE": client.workspace,
                     "NG_JOB": job.id, "NG_TOKEN": client.token or "",
                     "NG_JOB_DIR": str(job_dir)},
+            # ask_user and approve wait for a person, as long as they take.
+            # Claude Code caps a timeout at this; its idle timeout is kept
+            # off by the progress agent_mcp sends while a question waits.
+            "timeout": NO_TIMEOUT_MS,
         },
         **automation_mcp,
         **(extra_mcp or {}),
