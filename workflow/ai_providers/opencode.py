@@ -34,7 +34,9 @@ def get_skills_for_session(issue=None, repo_path=None):
 class OpenCodeProvider(AIProvider):
     name = "opencode"
 
-    def run(self, context: str, issue=None):
+    def run(self, context: str, issue=None, args=None):
+        if args:
+            print(f"⚠️  opencode provider ignores CLI arguments: {' '.join(args)}", file=sys.stderr)
         # Determine task directory - prefer issue key, fallback to current task or prompt-based name
         current_issue = None
         repo_path = None

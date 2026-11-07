@@ -180,6 +180,27 @@ case "$CURRENT_SHELL" in
 esac
 
 # -----------------------------
+# 7b. `claude` goes through `wf ai`: task context, the project's Claude
+# account, the capture proxy and the task's skills. Everything after `--`
+# reaches the claude CLI untouched, so `claude -r`, `claude -p ...` all
+# work. `command claude` bypasses it.
+# -----------------------------
+WF_CLAUDE_ALIAS="alias claude='wf ai --'"
+case "$CURRENT_SHELL" in
+  bash) RC_FILE="$HOME/.bashrc" ;;
+  zsh)  RC_FILE="$HOME/.zshrc" ;;
+  *)    RC_FILE="" ;;
+esac
+if [ -n "$RC_FILE" ]; then
+  if ! grep -qF "$WF_CLAUDE_ALIAS" "$RC_FILE" 2>/dev/null; then
+    echo "" >> "$RC_FILE"
+    echo "# wf: claude runs through wf ai (task context, account, capture proxy). \`command claude\` bypasses it." >> "$RC_FILE"
+    echo "$WF_CLAUDE_ALIAS" >> "$RC_FILE"
+    echo "📝 Added 'claude' alias to $RC_FILE"
+  fi
+fi
+
+# -----------------------------
 # 8. Install the Claude skills this repo ships
 # -----------------------------
 echo "🧩 Installing Claude skills into ~/.claude/skills"

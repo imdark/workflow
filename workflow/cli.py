@@ -3219,27 +3219,47 @@ def unshelve(repo_path: str = typer.Option(None, help="Repository path")):
 
 
 
-@app.command()
+@app.command(context_settings={"allow_extra_args": True})
 def ai(
-    prompt: str = typer.Option(None, "--prompt", help="Custom prompt to use instead of current task context")
+    ctx: typer.Context,
+    prompt: str = typer.Option(None, "--prompt", help="Custom prompt to use instead of current task context"),
 ):
+    """Start an AI session (Claude by default) on the current task.
+
+    Everything after `--` goes to the claude CLI untouched, so any claude
+    flag works:  wf ai -- -r   |  wf ai -- --model opus  |  wf ai -- -p "hi"
+
+    The current task's context is piped in as the first message. With a
+    resume/continue flag (-r, -c, --from-pr) it is left out: that session
+    already has it. With no current task Claude starts without context.
+    """
     # Use configurable AI provider
-    print("DEBUG: Starting ai command", flush=True)
     from workflow.ai import get_ai_provider
+    from workflow.ai_providers.claude import resumes_session
     from workflow.memory import save_session, save_summary, save_meta
     from workflow.pid_manager import create_ai_pid_file, remove_ai_pid_file
     from workflow.projects import get_default_repo
     from workflow.ai_context import build_context
     from pathlib import Path
     import os
-    
-    print("DEBUG: Imports done", flush=True)
-    
+    import sys
+
+    # Status goes to stderr: with `-- -p` claude's answer is the stdout.
+    def say(msg):
+        print(msg, file=sys.stderr, flush=True)
+
+    def debug(msg):
+        if os.environ.get("WF_DEBUG"):
+            say(f"DEBUG: {msg}")
+
+    claude_args = [a for a in ctx.args if a != "--"]
+    debug(f"claude args: {claude_args}")
+
     # Create PID file to track this AI session
     pid_file = None
     repo_path = None
     issue = None
-    
+
     # First check if we're in a worktree (use current directory)
     try:
         import subprocess
@@ -3251,33 +3271,37 @@ def ai(
         )
         if result.returncode == 0:
             repo_path = result.stdout.strip()
-            print(f"DEBUG: Using current worktree: {repo_path}", flush=True)
+            debug(f"Using current worktree: {repo_path}")
     except:
         pass
-    
+
     # If not in a worktree, try to get the default repo
     if not repo_path:
         default_repo = get_default_repo()
-        print(f"DEBUG: default_repo: {default_repo}", flush=True)
+        debug(f"default_repo: {default_repo}")
         if default_repo:
             repo_path = default_repo
-    
+
+    issue = get_current_task()
+    debug(f"Got issue: {issue}")
     if prompt:
         # Use custom prompt
         context = prompt
-        print("🤖 Starting AI session with custom prompt...")
-    else:
-        # Use current task
-        print("DEBUG: Getting current task...", flush=True)
-        issue = get_current_task()
-        print(f"DEBUG: Got issue: {issue}", flush=True)
-        if not issue:
-            typer.echo("No current task set. Use 'wf start' to begin a task or use --prompt.")
-            return
+        say("🤖 Starting AI session with custom prompt...")
+    elif resumes_session(claude_args):
+        # The resumed session already has its context; piping it again
+        # would repeat it and hide claude's session picker.
+        context = None
+        say("🤖 Resuming AI session...")
+    elif issue:
         context = build_context(issue, repo_path=repo_path)
-        print("🤖 Starting AI session...")
-    
-    print("DEBUG: Creating PID file...", flush=True)
+        say("🤖 Starting AI session...")
+    else:
+        context = None
+        say("🤖 No current task set; starting AI session without task context. "
+            "Use 'wf start' or --prompt to give it one.")
+
+    debug("Creating PID file...")
     if issue:
         try:
             if repo_path:
@@ -3293,34 +3317,30 @@ def ai(
                     branch_name = result.stdout.strip() if result.returncode == 0 else "unknown"
                 except:
                     branch_name = "unknown"
-                
+
                 pid_file = create_ai_pid_file(repo_path, issue.key, branch_name)
-                print(f"📝 AI session tracked (PID file created)")
+                say("📝 AI session tracked (PID file created)")
         except Exception as e:
-            print(f"⚠️  Could not create PID file: {e}")
-    
-    print("DEBUG: Getting provider...", flush=True)
+            say(f"⚠️  Could not create PID file: {e}")
+
     provider = get_ai_provider()
-    print(f"DEBUG: Got provider: {provider.name}", flush=True)
-    print(f"Using AI provider: {provider.name}")
-    
+    say(f"Using AI provider: {provider.name}")
+
     try:
-        print("DEBUG: Running provider.run...", flush=True)
-        transcript = provider.run(context)
-        print(f"DEBUG: provider.run returned, transcript length: {len(transcript) if transcript else 0}", flush=True)
-        print(f"🔄 AI session completed, transcript length: {len(transcript) if transcript else 0}")
-        
+        transcript = provider.run(context, issue, args=claude_args)
+        debug(f"provider.run returned, transcript length: {len(transcript) if transcript else 0}")
+        say(f"🔄 AI session completed, transcript length: {len(transcript) if transcript else 0}")
+
         # Try to save only if there's a task issue
         if issue:
             try:
-                print("DEBUG: Saving session...", flush=True)
                 save_session(issue, transcript)
-                print("✅ Session saved")
+                say("✅ Session saved")
                 save_meta(issue, provider.name)
-                print("✅ Meta saved")
-                print("🤖 Summary will be generated in background...")
+                say("✅ Meta saved")
+                say("🤖 Summary will be generated in background...")
             except Exception as e:
-                print(f"❌ Save failed: {e}")
+                say(f"❌ Save failed: {e}")
                 import traceback
                 traceback.print_exc()
     finally:

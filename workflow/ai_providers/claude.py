@@ -75,10 +75,48 @@ description: Workflow skill - {skill['scope']} scope
         return None
 
 
+# Claude flags that pick up an existing session. With one of these the task
+# context is not piped in again: the session already has it, and a piped
+# stdin would also keep `claude -r` from showing its interactive picker.
+RESUME_FLAGS = {"-r", "--resume", "-c", "--continue", "--from-pr", "--desktop"}
+
+
+def resumes_session(args) -> bool:
+    """True when `args` (claude CLI arguments) resume or continue a session."""
+    for arg in args or ():
+        if arg == "--":
+            continue
+        if arg in RESUME_FLAGS or arg.split("=", 1)[0] in RESUME_FLAGS:
+            return True
+    return False
+
+
+def claude_command(transcript_file: Path, prompt_file=None, args=None) -> str:
+    """The shell line that runs claude under `script` for the transcript.
+
+    `args` go to the claude CLI verbatim (after wf's own --plugin-dir).
+    With a `prompt_file` its content is piped in as the first message.
+    """
+    import shlex
+    claude = shlex.join(["claude", *(args or [])])
+    if prompt_file is not None:
+        inner = f"cat {shlex.quote(str(prompt_file))} | {claude}"
+    else:
+        inner = claude
+    return f"script -q {shlex.quote(str(transcript_file))} bash -c {shlex.quote(inner)}"
+
+
 class ClaudeProvider(AIProvider):
     name = "claude"
 
-    def run(self, context: str, issue=None):
+    def run(self, context, issue=None, args=None):
+        """Run an interactive Claude session; returns the terminal transcript.
+
+        `context` is piped in as the first message; None starts Claude with
+        nothing piped (its stdin stays the terminal). `args` are passed to
+        the claude CLI as given, e.g. ["-r"] or ["--model", "opus"].
+        """
+        args = list(args or [])
         # Determine task directory - prefer issue key, fallback to current task or prompt-based name
         current_issue = None
         repo_path = None
@@ -94,7 +132,7 @@ class ClaudeProvider(AIProvider):
             else:
                 # Fallback: use a prompt-based hash for non-task prompts
                 import hashlib
-                prompt_hash = hashlib.md5(context.encode()).hexdigest()[:8]
+                prompt_hash = hashlib.md5((context or "").encode()).hexdigest()[:8]
                 task_dir = Path.home() / ".wf" / "tasks" / f"prompt_{prompt_hash}"
         
         # Get task key for plugin naming
@@ -118,7 +156,8 @@ class ClaudeProvider(AIProvider):
             pass
         
         plugin_dir = skills_plugin_dir(issue or current_issue, task_key, task_dir, repo_path)
-        plugin_arg = f"--plugin-dir {plugin_dir}" if plugin_dir else ""
+        if plugin_dir:
+            args = ["--plugin-dir", str(plugin_dir), *args]
 
         task_dir.mkdir(parents=True, exist_ok=True)
         
@@ -131,7 +170,8 @@ class ClaudeProvider(AIProvider):
         transcript_file = task_dir / f"transcript_{timestamp}.txt"
         
         try:
-            prompt_file.write_text(context)
+            if context is not None:
+                prompt_file.write_text(context)
 
             # Route this session's model traffic through the capture proxy so
             # the real conversation is recorded, rather than the ANSI terminal
@@ -141,11 +181,11 @@ class ClaudeProvider(AIProvider):
             for name, value in apply_claude_env().items():
                 print(f"DEBUG: {name}={value}", file=sys.stderr)
 
-            # Build command with optional plugin dir
-            if plugin_arg:
-                script_cmd = f'script -q {transcript_file} bash -c \'cat {prompt_file} | claude {plugin_arg}\''
-            else:
-                script_cmd = f'script -q {transcript_file} bash -c \'cat {prompt_file} | claude\''
+            script_cmd = claude_command(
+                transcript_file,
+                prompt_file if context is not None else None,
+                args,
+            )
             print(f"DEBUG: Running: {script_cmd}", file=sys.stderr)
             os.system(script_cmd)
             
