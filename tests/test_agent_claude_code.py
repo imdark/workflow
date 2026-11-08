@@ -593,7 +593,7 @@ def test_claude_code_gets_notesgraph_and_a_way_to_ask(tmp_path):
     # Steering: hooks that read the run's connection from that file, so the
     # token stays off the command line.
     hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
-    assert set(hooks) == {"PostToolUse", "Stop"}
+    assert set(hooks) == {"PostToolUse", "Stop", "PreToolUse"}
     command = hooks["PostToolUse"][0]["hooks"][0]["command"]
     assert "workflow.deploy.steer_hook" in command and str(tmp_path / "mcp.json") in command
     assert "Bearer" not in argv[argv.index("--settings") + 1]
@@ -604,7 +604,7 @@ def test_rules_reach_subagents_and_the_code_map_reaches_the_session(tmp_path):
                                rules="Tag tasks #work.", session_context="workflow/x.py: f")
 
     hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
-    assert set(hooks) == {"PostToolUse", "Stop", "SubagentStart", "SessionStart"}
+    assert set(hooks) == {"PostToolUse", "Stop", "PreToolUse", "SubagentStart", "SessionStart"}
     for event, text in (("SubagentStart", "Tag tasks #work."), ("SessionStart", "workflow/x.py: f")):
         command = hooks[event][0]["hooks"][0]["command"]
         out = json.loads(subprocess.run(command, shell=True, capture_output=True, text=True).stdout)

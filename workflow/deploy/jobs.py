@@ -575,14 +575,20 @@ def run_settings(mcp_path: Path, rules: str = "", session_context: str = "") -> 
 
     Steering, always: hooks that hand the agent what the person sends the run
     from NotesGraph while it works, after each tool call and when it is about
-    to stop (see steer_hook.py). With `rules`, a SubagentStart hook gives
-    them to every subagent. With `session_context` (a task run's code map),
-    a SessionStart hook adds it to the conversation.
+    to stop (see steer_hook.py). Also always: a PreToolUse hook that refuses
+    WebFetch to a site that already failed twice in the run (fetch_guard.py).
+    With `rules`, a SubagentStart hook gives them to every subagent. With
+    `session_context` (a task run's code map), a SessionStart hook adds it
+    to the conversation.
     """
     command = " ".join(shlex.quote(part) for part in
                        (sys.executable, "-m", "workflow.deploy.steer_hook", str(mcp_path)))
     hook = [{"hooks": [{"type": "command", "command": command, "timeout": 30}]}]
-    hooks = {"PostToolUse": hook, "Stop": hook}
+    guard = " ".join(shlex.quote(part) for part in
+                     (sys.executable, "-m", "workflow.deploy.fetch_guard"))
+    hooks = {"PostToolUse": hook, "Stop": hook,
+             "PreToolUse": [{"matcher": "WebFetch",
+                             "hooks": [{"type": "command", "command": guard, "timeout": 10}]}]}
     job_dir = mcp_path.parent
     if rules.strip():
         hooks["SubagentStart"] = _context_hook(job_dir, "SubagentStart", SUBAGENT_RULES_PROMPT.format(
