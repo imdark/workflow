@@ -38,6 +38,17 @@ def get_repo(path: Optional[str] = None):
         return GitRepo(path, search_parent_directories=True)
     return GitRepo(search_parent_directories=True)
 
+def current_branch(repo_path: Optional[str] = None) -> Optional[str]:
+    """The branch checked out at `repo_path` (the current directory when
+    none). A task worktree has its own branch, so this asks the worktree,
+    not wherever wf was run from. None when detached or not a repo."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, cwd=repo_path or None,
+    )
+    branch = result.stdout.strip()
+    return branch if result.returncode == 0 and branch and branch != "HEAD" else None
+
 def clone_repository(url: str, target_path: str) -> str:
     """Clone a repository from URL to target path"""
     try:
@@ -520,13 +531,11 @@ def create_pr(issue, reviewers: Optional[str] = None, repo_path: Optional[str] =
     
     console = Console(color_system=None)
     
-    branch_result = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True, text=True
-    )
-    current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
-    
-    if not current_branch:
+    # The branch at repo_path: from a task worktree, its own, not the one
+    # checked out wherever wf was run.
+    head_branch = current_branch(repo_path)
+
+    if not head_branch:
         console.print("❌ Could not determine current branch")
         return None
     
@@ -555,7 +564,7 @@ def create_pr(issue, reviewers: Optional[str] = None, repo_path: Optional[str] =
         "--title", pr_title,
         "--body", pr_body,
         "--base", base_branch,
-        "--head", current_branch
+        "--head", head_branch
     ]
     
 # Add reviewers if provided
@@ -566,8 +575,8 @@ def create_pr(issue, reviewers: Optional[str] = None, repo_path: Optional[str] =
     console.print(f"🚀 Checking for existing pull requests for {issue.key}...")
     
     # Check if PR already exists for this issue with a more robust approach
-    repo_path_for_cmd = repo_path or "."
-    existing_prs_cmd = ["gh", "pr", "list", "--head", current_branch, "--repo", str(Path(repo_path_for_cmd).absolute()), "--json", "number,title,url"]
+    # gh reads the repo from cwd; its --repo takes OWNER/REPO, not a path.
+    existing_prs_cmd = ["gh", "pr", "list", "--head", head_branch, "--json", "number,title,url"]
     existing_result = subprocess.run(existing_prs_cmd, capture_output=True, text=True, cwd=repo_path)
     
     if existing_result.returncode == 0:
