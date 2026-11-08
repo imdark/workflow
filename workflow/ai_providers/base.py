@@ -4,8 +4,9 @@ from abc import ABC, abstractmethod
 
 class AIProvider(ABC):
     @abstractmethod
-    def run(self, context, issue=None, args=None) -> str:
-        """Run a session on `context`; `args` are provider CLI arguments."""
+    def run(self, context, issue=None, args=None, project=None) -> str:
+        """Run a session on `context`; `args` are provider CLI arguments,
+        `project` the wf project the session belongs to (default: current)."""
         pass
 
 

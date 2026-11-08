@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# First-time setup: a working venv and the `wf` launcher, then `wf install`
+# does the rest (dependencies, /usr/local/bin/wf, completion, the claude
+# alias, Claude skills). Any flag given here goes to `wf install`, e.g.
+#   ./install.sh --system     # claude alias machine wide (asks for sudo)
+# After this, `wf install` alone keeps a checkout set up.
 set -euo pipefail
 
 PROJECT_NAME="work-flow"
@@ -6,6 +11,7 @@ PKG_NAME="workflow"
 VENV_DIR=".venv"
 PYTHON_BIN="python3"
 
+cd "$(dirname "${BASH_SOURCE[0]}")"
 echo "🔧 Installing $PROJECT_NAME (macOS)"
 
 # -----------------------------
@@ -61,24 +67,19 @@ if ! python -m pip --version >/dev/null 2>&1; then
 fi
 
 # -----------------------------
-# 3. Upgrade pip + install deps
+# 3. Install deps so `wf` can start (wf install repeats this; it's quick)
 # -----------------------------
 echo "⬆️  Installing dependencies from requirements.txt"
-python -m pip install --upgrade pip wheel
-python -m pip install -r requirements.txt
+python -m pip install -q --upgrade pip wheel
+python -m pip install -q -r requirements.txt
+python -m pip install -q -e .
 
 # -----------------------------
-# 4. Install workflow package (editable)
+# 4. The venv-pinned wf launcher (tracked in git; recreated if missing)
 # -----------------------------
-echo "📁 Installing workflow package"
-python -m pip install -e .
-
-# -----------------------------
-# 5. Create venv-pinned wf launcher
-# -----------------------------
-echo "🚀 Creating wf launcher"
-
-cat > wf <<'EOF'
+if [ ! -x wf ]; then
+  echo "🚀 Creating wf launcher"
+  cat > wf <<'LAUNCHER'
 #!/usr/bin/env bash
 set -e
 # Resolve the real path of this script, following symlinks (e.g. when
@@ -94,127 +95,11 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 # Source the virtual environment from the original install directory
 source "$SCRIPT_DIR/.venv/bin/activate"
 exec python -m workflow.cli "$@"
-EOF
-
-chmod +x wf
-
-# -----------------------------
-# 6. Create symlink to PATH
-# -----------------------------
-echo "🔗 Creating symlink to /usr/local/bin/wf"
-if sudo ln -sf "$(pwd)/wf" /usr/local/bin/wf; then
-  echo "✅ Linked wf → /usr/local/bin/wf"
-else
-  echo "❌ Failed to create symlink. You may need to:"
-  echo "   sudo ln -sf $(pwd)/wf /usr/local/bin/wf"
-  echo "   Or add to PATH manually:"
-  echo "   export PATH=\"$(pwd):\$PATH\""
+LAUNCHER
+  chmod +x wf
 fi
 
 # -----------------------------
-# 7. Enable shell completion
+# 5. Everything else
 # -----------------------------
-echo "🔧 Setting up shell completion..."
-
-# Detect current shell
-CURRENT_SHELL=$(basename "$SHELL")
-
-case "$CURRENT_SHELL" in
-  bash)
-    echo "📝 Installing bash completion..."
-    mkdir -p ~/.bash_completion.d
-    source .venv/bin/activate
-    # Typer's completion classes are named source_bash/complete_bash (Click's
-    # own bash_source/zsh_source names are not registered), and the variable
-    # name itself is derived from the program name, which cli.py pins to "wf".
-    # sed drops the leading blank line Typer emits.
-    if _WF_COMPLETE=source_bash wf | sed '/./,$!d' > ~/.bash_completion.d/wf-completion.bash && \
-       [ -s ~/.bash_completion.d/wf-completion.bash ]; then
-      echo "✅ Bash completion installed to ~/.bash_completion.d/wf-completion.bash"
-    else
-      rm -f ~/.bash_completion.d/wf-completion.bash
-      echo "⚠️  Could not generate bash completion; skipping"
-    fi
-    
-    # Add to bashrc if not already there
-    if ! grep -q "wf-completion.bash" ~/.bashrc 2>/dev/null; then
-      echo "" >> ~/.bashrc
-      echo "# wf completion" >> ~/.bashrc
-      echo "source ~/.bash_completion.d/wf-completion.bash" >> ~/.bashrc
-      echo "📝 Added completion to ~/.bashrc"
-    fi
-    ;;
-  zsh)
-    echo "📝 Installing zsh completion..."
-    mkdir -p ~/.zsh/completion
-    source .venv/bin/activate
-    # See the note above: source_zsh, and _WF_COMPLETE only works because
-    # cli.py pins prog_name="wf". An empty _wf here silently shadows every
-    # other completion for `wf` on fpath, so don't leave one behind.
-    # sed strips the leading blank line Typer emits: zsh only honors
-    # `#compdef` on the very first line of the file.
-    if _WF_COMPLETE=source_zsh wf | sed '/./,$!d' > ~/.zsh/completion/_wf && \
-       [ -s ~/.zsh/completion/_wf ]; then
-      echo "✅ Zsh completion installed to ~/.zsh/completion/_wf"
-    else
-      rm -f ~/.zsh/completion/_wf
-      echo "⚠️  Could not generate zsh completion; skipping"
-    fi
-    
-    # Add to zshrc if not already there
-    ZSHRC="$HOME/.zshrc"
-    if [ -f "$ZSHRC" ]; then
-      if ! grep -q "fpath+=~/.zsh/completion" "$ZSHRC" 2>/dev/null; then
-        echo "" >> "$ZSHRC"
-        echo "# wf completion" >> "$ZSHRC"
-        echo "fpath+=~/.zsh/completion" >> "$ZSHRC"
-        echo "autoload -U compinit && compinit" >> "$ZSHRC"
-        echo "📝 Added completion to ~/.zshrc"
-      fi
-    fi
-    ;;
-  *)
-    echo "⚠️  Unsupported shell: $CURRENT_SHELL"
-    echo "   Manual completion setup required."
-    ;;
-esac
-
-# -----------------------------
-# 7b. `claude` goes through `wf ai`: task context, the project's Claude
-# account, the capture proxy and the task's skills. Everything after `--`
-# reaches the claude CLI untouched, so `claude -r`, `claude -p ...` all
-# work. `command claude` bypasses it.
-# -----------------------------
-WF_CLAUDE_ALIAS="alias claude='wf ai --'"
-case "$CURRENT_SHELL" in
-  bash) RC_FILE="$HOME/.bashrc" ;;
-  zsh)  RC_FILE="$HOME/.zshrc" ;;
-  *)    RC_FILE="" ;;
-esac
-if [ -n "$RC_FILE" ]; then
-  if ! grep -qF "$WF_CLAUDE_ALIAS" "$RC_FILE" 2>/dev/null; then
-    echo "" >> "$RC_FILE"
-    echo "# wf: claude runs through wf ai (task context, account, capture proxy). \`command claude\` bypasses it." >> "$RC_FILE"
-    echo "$WF_CLAUDE_ALIAS" >> "$RC_FILE"
-    echo "📝 Added 'claude' alias to $RC_FILE"
-  fi
-fi
-
-# -----------------------------
-# 8. Install the Claude skills this repo ships
-# -----------------------------
-echo "🧩 Installing Claude skills into ~/.claude/skills"
-./wf skill install || echo "⚠️  Could not install Claude skills; run: wf skill install"
-
-# -----------------------------
-# 9. Done
-# -----------------------------
-echo
-echo "✅ Installation complete"
-echo
-echo "Run:"
-echo "  wf init"
-echo "  wf start PROJ-123"
-echo "  wf ai"
-echo
-
+exec ./wf install "$@"

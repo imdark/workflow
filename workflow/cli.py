@@ -3223,6 +3223,8 @@ def unshelve(repo_path: str = typer.Option(None, help="Repository path")):
 def ai(
     ctx: typer.Context,
     prompt: str = typer.Option(None, "--prompt", help="Custom prompt to use instead of current task context"),
+    here: bool = typer.Option(False, "--here", help="Use the project whose repository contains the current folder (its Claude account, provider and skills) without switching the current project"),
+    project: str = typer.Option(None, "--project", help="Use this project for the session instead of the current one"),
 ):
     """Start an AI session (Claude by default) on the current task.
 
@@ -3232,14 +3234,18 @@ def ai(
     The current task's context is piped in as the first message. With a
     resume/continue flag (-r, -c, --from-pr) it is left out: that session
     already has it. With no current task Claude starts without context.
+
+    --here infers the project from the folder you run in; --project names
+    one. A current task from another project is then left out.
     """
     # Use configurable AI provider
     from workflow.ai import get_ai_provider
-    from workflow.ai_providers.claude import resumes_session
+    from workflow.ai_providers.claude import resumes_session, prints_once
     from workflow.memory import save_session, save_summary, save_meta
     from workflow.pid_manager import create_ai_pid_file, remove_ai_pid_file
-    from workflow.projects import get_default_repo
-    from workflow.ai_context import build_context
+    from workflow.projects import (get_default_repo, get_project, get_current_project,
+                                   get_project_key, project_for_path)
+    from workflow.ai_context import build_context, no_task_context
     from pathlib import Path
     import os
     import sys
@@ -3254,6 +3260,26 @@ def ai(
 
     claude_args = [a for a in ctx.args if a != "--"]
     debug(f"claude args: {claude_args}")
+
+    # Which project the session runs as. None keeps today's behaviour: the
+    # current project, as every call below defaults to.
+    if here and project:
+        say("❌ --here and --project are alternatives; give one")
+        raise typer.Exit(2)
+    session_project = None
+    if project:
+        if not get_project(project):
+            say(f"❌ Unknown project '{project}'")
+            raise typer.Exit(2)
+        session_project = project
+        say(f"📁 Project: {session_project}")
+    elif here:
+        session_project = project_for_path(os.getcwd())
+        if session_project:
+            say(f"📁 Project: {session_project} (from {os.getcwd()})")
+        else:
+            say(f"📁 No project's repository contains {os.getcwd()}; "
+                f"using the current project ({get_current_project() or 'none'})")
 
     # Create PID file to track this AI session
     pid_file = None
@@ -3277,13 +3303,19 @@ def ai(
 
     # If not in a worktree, try to get the default repo
     if not repo_path:
-        default_repo = get_default_repo()
+        default_repo = get_default_repo(session_project)
         debug(f"default_repo: {default_repo}")
         if default_repo:
             repo_path = default_repo
 
     issue = get_current_task()
     debug(f"Got issue: {issue}")
+    dropped_task = None
+    if issue and session_project:
+        key = get_project_key(session_project)
+        if key and not issue.key.upper().startswith(key.upper() + "-"):
+            say(f"ℹ️  Current task {issue.key} belongs to another project; starting without it")
+            dropped_task, issue = issue.key, None
     if prompt:
         # Use custom prompt
         context = prompt
@@ -3296,10 +3328,13 @@ def ai(
     elif issue:
         context = build_context(issue, repo_path=repo_path)
         say("🤖 Starting AI session...")
+    elif prints_once(claude_args):
+        context = None  # one answer, no task lifecycle to explain
     else:
-        context = None
-        say("🤖 No current task set; starting AI session without task context. "
-            "Use 'wf start' or --prompt to give it one.")
+        # No task of its own: tell the agent how to make and finish one.
+        context = no_task_context(session_project or get_current_project(), dropped_task)
+        say("🤖 No task for this session; Claude is told to create one when given work. "
+            "Use 'wf start' or --prompt to set the context yourself.")
 
     debug("Creating PID file...")
     if issue:
@@ -3323,11 +3358,11 @@ def ai(
         except Exception as e:
             say(f"⚠️  Could not create PID file: {e}")
 
-    provider = get_ai_provider()
+    provider = get_ai_provider(session_project)
     say(f"Using AI provider: {provider.name}")
 
     try:
-        transcript = provider.run(context, issue, args=claude_args)
+        transcript = provider.run(context, issue, args=claude_args, project=session_project)
         debug(f"provider.run returned, transcript length: {len(transcript) if transcript else 0}")
         say(f"🔄 AI session completed, transcript length: {len(transcript) if transcript else 0}")
 
@@ -6638,6 +6673,10 @@ app.add_typer(notes_app, name="notes")
 # Persistent SSH sessions shared by every Claude session (the `ssh` MCP server).
 from workflow.cli_ssh import ssh_app
 app.add_typer(ssh_app, name="ssh")
+
+# Set this machine up: deps, launcher, completion, the claude alias, skills.
+from workflow.cli_install import install as install_cmd
+app.command("install")(install_cmd)
 
 
 # Fork the running Claude conversation into a new terminal tab (the /side skill).

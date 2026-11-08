@@ -10,19 +10,19 @@ from pathlib import Path
 from workflow.ai_providers.base import AIProvider, apply_proxy_env
 
 
-def get_skills_for_session(issue=None, repo_path=None):
+def get_skills_for_session(issue=None, repo_path=None, project=None):
     """Get skills from config and return as a dict"""
     from workflow.ai_context import get_ai_skills
-    return get_ai_skills(issue, repo_path)
+    return get_ai_skills(issue, repo_path, project)
 
 
-def skills_plugin_dir(issue, task_key, task_dir: Path, repo_path=None):
+def skills_plugin_dir(issue, task_key, task_dir: Path, repo_path=None, project=None):
     """Write the session's wf skills as a Claude plugin; returns its directory.
 
     None when there are no skills or no task to file them under. Shared with
     agent jobs (see deploy.jobs), which pass it to `claude --plugin-dir`.
     """
-    skills = get_skills_for_session(issue, repo_path)
+    skills = get_skills_for_session(issue, repo_path, project)
     if not (skills and task_key):
         return None
     try:
@@ -91,6 +91,11 @@ def resumes_session(args) -> bool:
     return False
 
 
+def prints_once(args) -> bool:
+    """True when `args` run claude in print mode: one answer, no session to track."""
+    return any(a in ("-p", "--print") or a.startswith("--print=") for a in args or ())
+
+
 def claude_command(transcript_file: Path, prompt_file=None, args=None) -> str:
     """The shell line that runs claude under `script` for the transcript.
 
@@ -109,12 +114,14 @@ def claude_command(transcript_file: Path, prompt_file=None, args=None) -> str:
 class ClaudeProvider(AIProvider):
     name = "claude"
 
-    def run(self, context, issue=None, args=None):
+    def run(self, context, issue=None, args=None, project=None):
         """Run an interactive Claude session; returns the terminal transcript.
 
         `context` is piped in as the first message; None starts Claude with
         nothing piped (its stdin stays the terminal). `args` are passed to
         the claude CLI as given, e.g. ["-r"] or ["--model", "opus"].
+        `project` picks the Claude account and skills (default: the current
+        project's).
         """
         args = list(args or [])
         # Determine task directory - prefer issue key, fallback to current task or prompt-based name
@@ -155,7 +162,7 @@ class ClaudeProvider(AIProvider):
         except:
             pass
         
-        plugin_dir = skills_plugin_dir(issue or current_issue, task_key, task_dir, repo_path)
+        plugin_dir = skills_plugin_dir(issue or current_issue, task_key, task_dir, repo_path, project)
         if plugin_dir:
             args = ["--plugin-dir", str(plugin_dir), *args]
 
@@ -178,7 +185,7 @@ class ClaudeProvider(AIProvider):
             # transcript `script` produces below; log it in as the current
             # project's Claude account.
             from workflow.session import apply_claude_env
-            for name, value in apply_claude_env().items():
+            for name, value in apply_claude_env(project=project).items():
                 print(f"DEBUG: {name}={value}", file=sys.stderr)
 
             script_cmd = claude_command(
