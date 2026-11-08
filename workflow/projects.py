@@ -67,6 +67,47 @@ def get_project_for_cwd(switch_if_needed: bool = True, verbose: bool = False) ->
     return current_project
 
 
+def project_for_path(path=None) -> Optional[str]:
+    """The project whose repositories contain `path` (default: cwd), or None.
+
+    Unlike get_project_for_cwd this never switches the current project and
+    has no fallback: None means no project claims the folder. The current
+    project wins when several do.
+    """
+    target = Path(path or os.getcwd()).resolve()
+
+    def contains(config) -> bool:
+        for repo in (config.get("repositories") or {}):
+            try:
+                repo_path = Path(repo).expanduser().resolve()
+            except OSError:
+                continue
+            if target == repo_path or repo_path in target.parents:
+                return True
+        return False
+
+    projects = list_projects()
+    current = get_current_project()
+    ordered = ([current] if current in projects else []) + [n for n in projects if n != current]
+    for name in ordered:
+        if contains(projects[name]):
+            return name
+    return None
+
+
+def get_project_key(name: Optional[str]) -> Optional[str]:
+    """The issue-key prefix a project's tasks carry: its Jira project, Linear
+    team, or (markdown backend) its own name, as in PROJ-123."""
+    config = get_project(name) if name else None
+    if not config:
+        return None
+    key = (config.get("jira", {}).get("project")
+           or config.get("linear", {}).get("team"))
+    if not key and config.get("task_backend") == "markdown":
+        key = name
+    return key.upper() if key else None
+
+
 def add_project(name: str, config: Dict[str, Any]) -> None:
     """Add a new project configuration"""
     cfg = load_config()

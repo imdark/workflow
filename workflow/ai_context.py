@@ -36,8 +36,11 @@ def get_ai_instructions(issue, repo_path=None):
     return instructions
 
 
-def get_ai_skills(issue, repo_path=None):
-    """Get AI skills based on scope (global, project, repo, task)"""
+def get_ai_skills(issue, repo_path=None, project=None):
+    """Get AI skills based on scope (global, project, repo, task).
+
+    `project` names the project whose skills apply (default: the current one).
+    """
     from workflow.projects import get_current_project
     
     cfg = load_config()
@@ -50,8 +53,8 @@ def get_ai_skills(issue, repo_path=None):
         for name, content in ai_skills["global"].items():
             skills.append({"name": name, "content": content, "scope": "global"})
     
-    # Project-specific skills (current project)
-    current_project = get_current_project()
+    # Project-specific skills (current project unless one is given)
+    current_project = project or get_current_project()
     if current_project and "projects" in ai_skills:
         if current_project in ai_skills["projects"]:
             for name, content in ai_skills["projects"][current_project].items():
@@ -184,3 +187,37 @@ def format_retrieved_context(chunks: list) -> str:
 """)
     
     return "\n".join(context_parts)
+
+
+def no_task_context(project=None, dropped_task=None) -> str:
+    """What to tell an agent that starts with no task of its own.
+
+    `dropped_task` is the key of a current task that belongs to another
+    project, so the session runs without it. The agent is told how work is
+    tracked here: a task per piece of work, `wf start` it, `wf done` it
+    before moving on.
+    """
+    project_opt = f" --project {project}" if project else ""
+    where = f"Project: {project}." if project else "No wf project is set."
+    if dropped_task:
+        why = (f"The current wf task {dropped_task} belongs to another project, "
+               f"so this session does not work on it.")
+    else:
+        why = "No wf task is in progress."
+    return f"""NO ACTIVE TASK
+{where} {why}
+
+Work here is tracked as wf tasks, one per piece of work. When the user gives
+you something to build or fix (not a question or a quick answer):
+1. Create a task for it: `wf task create "<title>" -d "<what and why>"{project_opt}`
+   prints its key.
+2. Start it: `wf start <KEY>` moves it to In Progress and creates the branch.
+3. When the work is done and verified, commit on that branch and run
+   `wf done --task <KEY> --title "<title>" --body "<description>"`: that
+   pushes, opens a PR and moves the task to Committed.
+4. Before taking on a different piece of work, finish the current one with
+   `wf done` first (or `wf switch <KEY>` to pick up an existing task).
+The title says what the change does, in under 70 characters; the body says
+what changed, why, and how you verified it. Never paste the task text or your
+session log into either.
+"""

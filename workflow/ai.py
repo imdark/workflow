@@ -9,9 +9,9 @@ from workflow.projects import get_current_project_default_repo
 from pathlib import Path
 import typer
 
-def get_ai_provider():
-    """Get the configured AI provider"""
-    config = load_effective_config()
+def get_ai_provider(project=None):
+    """Get the configured AI provider (`project`'s, default: the current one's)"""
+    config = load_effective_config(project)
     ai_config = config.get("ai", {})
     provider_name = ai_config.get("provider", "claude")
     
