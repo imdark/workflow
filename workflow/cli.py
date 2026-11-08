@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import typer
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 import subprocess
 import sys
@@ -2624,6 +2624,22 @@ def debt(
     raise typer.Exit(run_debt(path or Path.cwd(), tag, under, dry_run, echo=typer.echo))
 
 
+def ask_worktree(question: str, answer: Optional[bool], interactive: Optional[bool] = None) -> bool:
+    """Whether `wf start` makes a worktree: `answer` when given
+    (--worktree/--no-worktree), else asked. Without a terminal (an agent's
+    shell) it's the default, yes, rather than a prompt that aborts."""
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+    if answer is not None:
+        typer.echo(f"{question} {'yes' if answer else 'no'} (--{'' if answer else 'no-'}worktree)")
+        return answer
+    if not interactive:
+        typer.echo(f"{question} yes (no terminal to ask)")
+        return True
+    from rich.prompt import Confirm
+    return Confirm.ask(question, default=True)
+
+
 @app.command()
 def start(
     task: str = typer.Argument(
@@ -2634,6 +2650,10 @@ def start(
     base: str = typer.Option(None, autocompletion=autocomplete_branches, help="Base branch for new branch"),
     takeover: bool = typer.Option(False, help="Take over someone else's task"),
     repo_path: str = typer.Option(None, help="Repository path to work on"),
+    worktree: Optional[bool] = typer.Option(
+        None, "--worktree/--no-worktree",
+        help="Answer the worktree question up front (asked when another AI session is working, or the repo has uncommitted changes; without a terminal it's yes)",
+    ),
     # Dynamic custom fields will be handled via kwargs
 ):
     """
@@ -2735,10 +2755,9 @@ def start(
                     typer.echo(f"   Branch: {session.get('branch_name', 'unknown')}")
                     typer.echo(f"   Repo: {session.get('repo_path', 'unknown')}")
                     typer.echo(f"   Started: {session.get('started_at', 'unknown')}")
-                    from rich.prompt import Confirm
-                    use_worktree = Confirm.ask(
+                    use_worktree = ask_worktree(
                         f"Another AI is already working on {issue.key}. Create a worktree to work on it simultaneously?",
-                        default=True
+                        worktree,
                     )
                     break
             
@@ -2758,10 +2777,9 @@ def start(
                         typer.echo(f"🤖 AI session detected in another repository")
                     
                     # Ask user if they want to use a worktree
-                    from rich.prompt import Confirm
-                    use_worktree = Confirm.ask(
+                    use_worktree = ask_worktree(
                         "An AI agent is currently working. Create a worktree for your new branch?",
-                        default=True
+                        worktree,
                     )
         
         # Create git branch
@@ -2784,10 +2802,9 @@ def start(
             
             if not is_on_default and not use_worktree:
                 typer.echo(f"⚠️  You have uncommitted changes on branch '{current_branch}'")
-                from rich.prompt import Confirm
-                use_worktree = Confirm.ask(
+                use_worktree = ask_worktree(
                     f"You're currently on '{current_branch}' with uncommitted changes. Create a worktree instead?",
-                    default=True
+                    worktree,
                 )
         
         try:
@@ -3063,16 +3080,13 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                 # Check if there are any differences with base branch or for specified repo
                 has_diff = has_diff_with_base(current_repo_path, base_branch)
                 
-                # Check if branch has unpushed commits - use git command directly to get current worktree branch
-                from workflow.git_utils import get_repo
+                # Check if branch has unpushed commits: the branch at
+                # current_repo_path (a worktree's own), not the cwd's.
+                from workflow.git_utils import current_branch as branch_at, get_repo
                 repo = get_repo(current_repo_path)
-                
-                branch_result = subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    capture_output=True, text=True
-                )
-                current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
-                
+
+                current_branch = branch_at(current_repo_path)
+
                 if not current_branch:
                     current_branch = repo.active_branch.name
                 
