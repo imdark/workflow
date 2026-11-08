@@ -172,6 +172,35 @@ def test_it_speaks_enough_mcp_to_be_loaded():
     assert {t["name"] for t in tools["result"]["tools"]} == {"ask_user", "approve", "set_title", "upload_artifact"}
 
 
+def test_a_waiting_question_sends_progress_so_claude_code_does_not_give_up(inventory):
+    # Claude Code aborts a tool call silent for its idle timeout; progress
+    # on the call's token resets that, so a person can take hours.
+    inv = inventory(answer="My son, 7", answer_after=0.4)
+    sent = []
+    message = {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+               "params": {"name": "ask_user", "arguments": {"question": "Who is Cosmo?"},
+                          "_meta": {"progressToken": "tok-1"}}}
+    real = agent_mcp.progress_heartbeat
+    try:
+        agent_mcp.progress_heartbeat = lambda params, send: real(params, send, every=0.1)
+        response = agent_mcp.handle(inv.questions(), message, sent.append)
+    finally:
+        agent_mcp.progress_heartbeat = real
+    assert result_text(response["result"]) == "My son, 7"
+    assert len(sent) >= 2, "it keeps sending while the question waits"
+    assert all(m["method"] == "notifications/progress" and m["params"]["progressToken"] == "tok-1"
+               for m in sent)
+    counts = [m["params"]["progress"] for m in sent]
+    assert counts == sorted(counts) and len(set(counts)) == len(counts), "progress only goes up"
+    assert len(sent) < inv.polls, "throttled, not one per poll"
+
+
+def test_no_progress_without_a_token_to_send_it_on():
+    assert agent_mcp.progress_heartbeat({}, lambda m: None) is None
+    assert agent_mcp.progress_heartbeat({"_meta": {"progressToken": 0}}, None) is None
+    assert agent_mcp.progress_heartbeat({"_meta": {"progressToken": 0}}, lambda m: None) is not None
+
+
 def test_set_title_renames_the_job_without_waiting(inventory):
     inv = inventory()
     result = agent_mcp.call_tool(inv.questions(), "set_title",
@@ -554,6 +583,10 @@ def test_claude_code_gets_notesgraph_and_a_way_to_ask(tmp_path):
     assert config["notesgraph"]["url"] == "https://app.notesgraph.com/api/workspaces/ws-1/mcp"
     assert config["notesgraph"]["headers"]["Authorization"] == "Bearer pat"
     assert config["run"]["env"]["NG_JOB"] == "job-1234abcd"
+    # ask_user and approve wait as long as the person takes: the longest
+    # timeout Claude Code allows, on the run server alone.
+    assert config["run"]["timeout"] == 2**31 - 1
+    assert "timeout" not in config["notesgraph"]
     # It holds the token: owner-only.
     assert stat.S_IMODE((tmp_path / "mcp.json").stat().st_mode) == 0o600
 

@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 PROTOCOL_VERSION = "2025-06-18"
 POLL_SECONDS = 2.0
@@ -63,6 +63,9 @@ MAX_ATTACHMENTS = 6
 RETRY_STATUSES = {429, 502, 503, 504}
 RETRY_FOR_SECONDS = 120.0
 RETRY_PAUSE_SECONDS = 5.0
+# How often a waiting ask_user or approve sends MCP progress, well inside
+# Claude Code's idle timeout for a silent tool call.
+HEARTBEAT_SECONDS = 20.0
 
 
 def retry_after(header: Optional[str]) -> float:
@@ -388,9 +391,13 @@ class Questions:
             return json.loads(response.read().decode("utf-8") or "{}")["artifact"]
 
     def ask(self, kind: str, text: str, detail: Optional[str] = None,
-            options: Optional[list] = None, attachments: Optional[list] = None) -> dict:
+            options: Optional[list] = None, attachments: Optional[list] = None,
+            heartbeat: Optional[Callable[[], None]] = None) -> dict:
         """Post a question and block until it is answered; returns it.
-        `attachments` are artifact keys (see upload_artifact) shown with it."""
+        `attachments` are artifact keys (see upload_artifact) shown with it.
+        `heartbeat` is called on every poll while it waits: Claude Code
+        aborts a tool call that sends nothing for a few minutes, and a
+        person can take hours to answer."""
         question = self._request("POST", self.base,
                                  {"kind": kind, "text": text, "detail": detail,
                                   "options": options or [],
@@ -409,6 +416,8 @@ class Questions:
         asked_at = time.monotonic()
         try:
             while True:
+                if heartbeat:
+                    heartbeat()
                 if not shown and time.monotonic() - asked_at >= self.notify_after:
                     shown = True
                     notifier = show_question(question["id"], kind, heading, self.title, text,
@@ -468,8 +477,10 @@ def steer_note(steers: list) -> str:
             + "\nTake them into account from here on.")
 
 
-def call_tool(questions: Questions, name: str, args: dict) -> dict:
-    """Run one tool; returns an MCP tools/call result."""
+def call_tool(questions: Questions, name: str, args: dict,
+              heartbeat: Optional[Callable[[], None]] = None) -> dict:
+    """Run one tool; returns an MCP tools/call result. `heartbeat` keeps
+    the call alive while ask_user or approve waits for the person."""
     def text(value: str, error: bool = False) -> dict:
         return {"content": [{"type": "text", "text": value}], "isError": error}
 
@@ -489,7 +500,8 @@ def call_tool(questions: Questions, name: str, args: dict) -> dict:
             attachments = args.get("attachments")
             attachments = ([str(a).strip() for a in attachments if str(a).strip()][:MAX_ATTACHMENTS]
                            if isinstance(attachments, list) else [])
-            answer = questions.ask("question", asked, options=options, attachments=attachments)
+            answer = questions.ask("question", asked, options=options, attachments=attachments,
+                                   heartbeat=heartbeat)
             return with_steers(answer.get("answer") or "")
 
         if name == "upload_artifact":
@@ -533,6 +545,7 @@ def call_tool(questions: Questions, name: str, args: dict) -> dict:
                 # Compact and uncut up to the server's cap: NotesGraph parses it
                 # to show an edit as a diff, and clipped JSON does not parse.
                 json.dumps(tool_input, ensure_ascii=False)[:MAX_DETAIL],
+                heartbeat=heartbeat,
             )
             # The shape Claude Code expects back from a permission prompt tool.
             if answer.get("allowed"):
@@ -550,8 +563,39 @@ def call_tool(questions: Questions, name: str, args: dict) -> dict:
         return text(f"Could not reach NotesGraph to ask: {e}", error=True)
 
 
-def handle(questions: Questions, message: dict) -> Optional[dict]:
-    """Answer one JSON-RPC message; None for notifications."""
+def progress_heartbeat(params: dict, send: Optional[Callable[[dict], None]],
+                       every: float = HEARTBEAT_SECONDS) -> Optional[Callable[[], None]]:
+    """A heartbeat that sends MCP progress for this call at most every
+    `every` seconds; None when the client gave no progressToken to send it on.
+
+    Claude Code aborts a tool call that sends no response or progress for a
+    few minutes (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT). Progress resets that
+    clock, so a question can wait as long as the person takes."""
+    token = ((params.get("_meta") or {}).get("progressToken"))
+    if token is None or send is None:
+        return None
+    state = {"count": 0, "last": None}
+
+    def beat() -> None:
+        now = time.monotonic()
+        if state["last"] is not None and now - state["last"] < every:
+            return
+        state["last"] = now
+        state["count"] += 1  # progress must go up with each notification
+        try:
+            send({"jsonrpc": "2.0", "method": "notifications/progress",
+                  "params": {"progressToken": token, "progress": state["count"],
+                             "message": "Waiting for the user to answer"}})
+        except (OSError, ValueError):
+            pass  # stdout gone: the client has stopped, and the wait ends with it
+
+    return beat
+
+
+def handle(questions: Questions, message: dict,
+           send: Optional[Callable[[dict], None]] = None) -> Optional[dict]:
+    """Answer one JSON-RPC message; None for notifications. `send` writes
+    a message of our own (progress while a tool waits) to the client."""
     method, msg_id = message.get("method"), message.get("id")
     if msg_id is None:
         return None  # notifications/initialized and friends
@@ -566,7 +610,8 @@ def handle(questions: Questions, message: dict) -> Optional[dict]:
         result = {"tools": TOOLS}
     elif method == "tools/call":
         params = message.get("params") or {}
-        result = call_tool(questions, params.get("name", ""), params.get("arguments") or {})
+        result = call_tool(questions, params.get("name", ""), params.get("arguments") or {},
+                           progress_heartbeat(params, send))
     elif method == "ping":
         result = {}
     else:
@@ -581,12 +626,15 @@ def main() -> None:
                           env["NG_TOKEN"], Path(env["NG_JOB_DIR"]) if env.get("NG_JOB_DIR") else None)
     lock = threading.Lock()
 
+    def send(message: dict) -> None:
+        with lock:
+            sys.stdout.write(json.dumps(message) + "\n")
+            sys.stdout.flush()
+
     def reply(message: dict) -> None:
-        response = handle(questions, message)
+        response = handle(questions, message, send)
         if response is not None:
-            with lock:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
+            send(response)
 
     for line in sys.stdin:
         if not line.strip():
