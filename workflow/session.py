@@ -46,10 +46,26 @@ def resolve_repo(repos: dict) -> tuple:
 
 
 def task_branch_name(issue) -> str:
-    """`<key>-<title>`, with anything git refuses in a branch name dashed."""
+    """`<key>-<title>`, with anything git refuses in a branch name dashed.
+
+    Beyond the characters, git (`git check-ref-format`) refuses `//`, `..`,
+    a path part that starts with `.` or ends with `.lock`, and a trailing
+    `.`; a URL or a version number in the title hits those. Only those
+    patterns are rewritten, so a title that already made a valid name keeps
+    making the same one (deploy finds merged task branches by this name).
+    """
     name = f"{issue.key.lower()}-{issue.title.replace(' ', '-')}"
     name = re.sub(r"[^A-Za-z0-9._/-]+", "-", name)
-    return re.sub(r"-{2,}", "-", name).strip("-./")
+    name = re.sub(r"\.{2,}", ".", name)
+    parts = []
+    for part in name.split("/"):
+        part = part.lstrip(".")
+        if part.endswith(".lock"):
+            part = part[: -len(".lock")] + "-lock"
+        part = re.sub(r"-{2,}", "-", part).strip("-.")
+        if part:
+            parts.append(part)
+    return "/".join(parts)
 
 
 class BaseBranchNotConfigured(RuntimeError):

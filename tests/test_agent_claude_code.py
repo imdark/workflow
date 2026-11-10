@@ -871,6 +871,25 @@ def test_branch_names_drop_what_git_refuses():
     assert task_branch_name(issue) == "ng-7-Fix-the-board-mobile"
 
 
+def test_branch_names_survive_urls_and_dots():
+    """`//`, `..`, `/.` and `.lock` made git refuse the worktree (PERSONAL-261)."""
+    import subprocess
+
+    titles = {
+        "integrate https://github.com/headroomlabs-ai/headroom context and respo":
+            "personal-261-integrate-https/github.com/headroomlabs-ai/headroom-context-and-respo",
+        "Bump to v1..2 then .hidden/.git": "personal-261-Bump-to-v1.2-then-.hidden/git",
+        "Drop config.lock files.": "personal-261-Drop-config.lock-files",
+        "Rename refs.lock": "personal-261-Rename-refs-lock",
+    }
+    for title, expected in titles.items():
+        name = task_branch_name(Issue("PERSONAL-261", title, ""))
+        assert name == expected
+        check = subprocess.run(["git", "check-ref-format", "--branch", name],
+                               capture_output=True, text=True)
+        assert check.returncode == 0, (name, check.stderr)
+
+
 def test_wf_start_and_jobs_name_branches_the_same(monkeypatch):
     """create_branch (wf start's normal path) uses the shared name."""
     import workflow.git_utils as g
