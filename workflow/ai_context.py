@@ -143,6 +143,12 @@ your session. The title says what the change does, in under 70 characters
 why, how you verified it, and anything left undone, in a few short
 paragraphs or bullets. Never paste the task text, your instructions or your
 session log into either.
+
+If the task needs no code change (it is only a question, or the work was all
+in notes), there is nothing to commit and `wf done` leaves the task where it
+is. Answer it, then end your answer with this line, so the task isn't left
+open unnoticed:
+"{issue.key} needs no PR: close it by hand."
 """)
 
     # Add MCP tools information

@@ -138,6 +138,8 @@ def test_build_context_uses_memory_block_not_dead_rag_text(monkeypatch):
     assert '<wf-memory task="T-1">x</wf-memory>' in context
     assert "RAG system" not in context
     assert "search_past_conversations" in context
+    # A question-only task has nothing for `wf done` to ship.
+    assert "T-1 needs no PR: close it by hand." in context
 
 
 def test_injected_and_searched_facts_are_counted(store):
