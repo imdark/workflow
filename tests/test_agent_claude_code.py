@@ -124,7 +124,7 @@ REAL_SHOW_QUESTION = agent_mcp.show_question
 def no_agent_rules(monkeypatch):
     """run_job reads the "Agent rules" note from NotesGraph; these tests have
     no server for it. Its own tests are in test_notes_reader.py."""
-    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client: "")
+    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client, scope=None: "")
 
 
 @pytest.fixture(autouse=True)

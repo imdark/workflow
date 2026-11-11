@@ -50,6 +50,9 @@ MAX_PROPOSALS = 10
 # moves the overlap a lot.
 SAME_CHANGE_OVERLAP = 0.6
 TARGETS = ("agent_rules", "skill", "memory")
+# What an Agent rules change may be scoped to: it then goes under a
+# "## For <kind>: <value>" heading and reaches only the runs it matches.
+SCOPE_KINDS = ("project", "tag", "agent")
 
 # Tools that bring outside text into a run. Their output is untrusted.
 UNTRUSTED_TOOLS = ("WebFetch", "WebSearch")
@@ -326,6 +329,11 @@ Each change is ONE of:
 * "agent_rules": one short line to add to the user's Agent rules note, which
   every run reads at start. Keep it imperative and specific ("Use `grep` via
   Bash; the Grep tool is not available in agent runs"), never generic advice.
+  The note has sections headed "For project: X", "For tag: X" and "For
+  agent: X" that only runs on that project, on items with that tag, or by
+  that agent get. When the rule only matters for one project, one kind of
+  work (a tag, e.g. "mobile") or one agent, give it a "scope"; when it
+  matters for every run, leave "scope" out.
 * "skill": a reusable procedure worth a skill; give its name and what it does.
 * "memory": a fact about the user's setup that runs keep asking for.
 
@@ -343,7 +351,9 @@ Rules:
 [{{"target": "agent_rules" | "skill" | "memory",
    "change": "the exact text to add",
    "why": "one sentence: what went wrong without it",
-   "evidence": ["F-xxxxxx", ...]}}]
+   "evidence": ["F-xxxxxx", ...],
+   "scope": {{"kind": "project" | "tag" | "agent", "value": "notes-graph"}}}}]
+"scope" is optional and only for "agent_rules"; omit it for a rule every run needs.
 
 FINDINGS:
 {findings}
@@ -380,6 +390,7 @@ def propose(findings: list, rules: str = "", config: Optional[dict] = None,
             if isinstance(evidence, list) else []
         if target not in TARGETS or not change or not evidence:
             continue
+        scope = parse_scope(item.get("scope")) if target == "agent_rules" else None
         out.append({
             "id": proposal_id(target, change),
             "target": target,
@@ -390,10 +401,29 @@ def propose(findings: list, rules: str = "", config: Optional[dict] = None,
             "untrusted": any(by_id[e].untrusted for e in evidence),
             "status": "pending",
             "proposed": today,
+            **({"scope": scope} if scope else {}),
         })
         if len(out) >= limit:
             break
     return out
+
+
+def parse_scope(value) -> Optional[dict]:
+    """{"kind", "value"} from a proposal's scope, or None for no (or a bad) one."""
+    if not isinstance(value, dict):
+        return None
+    kind = str(value.get("kind") or "").strip().lower()
+    name = value.get("value")
+    name = " ".join(name.split()).lstrip("#").strip() if isinstance(name, str) else ""
+    if kind not in SCOPE_KINDS or not name or "," in name:
+        return None
+    return {"kind": kind, "value": name}
+
+
+def scope_label(entry: dict) -> str:
+    """Where an accepted rule goes: "Learned" or "For tag: mobile"."""
+    scope = entry.get("scope")
+    return f"For {scope['kind']}: {scope['value']}" if scope else "Learned"
 
 
 def proposal_id(target: str, change: str) -> str:
@@ -451,7 +481,9 @@ def decide(ledger: list, pid: str, status: str) -> dict:
 
 
 def add_learned_rule(rules: str, entry: dict) -> str:
-    """The Agent rules text with the accepted change under `## Learned`.
+    """The Agent rules text with the accepted change under `## Learned`, or,
+    for a scoped one, as the last line of its `## For <kind>: <value>`
+    section (made at the end of the note when there is none).
 
     The line carries its id and date, so a later curator pass can find
     learned lines and tell them from the ones the user wrote.
@@ -459,6 +491,8 @@ def add_learned_rule(rules: str, entry: dict) -> str:
     line = f"* {_md(entry['change'])} ({entry['id']}, learned {entry.get('decided') or time.strftime('%Y-%m-%d')})"
     if entry["id"] in rules:
         return rules
+    if entry.get("scope"):
+        return _add_scoped_rule(rules, entry["scope"], line)
     text = rules.rstrip("\n")
     heading = LEARNED_RE.search(text)
     if not heading:
@@ -471,8 +505,32 @@ def add_learned_rule(rules: str, entry: dict) -> str:
     return f"{head}{section}" + (f"\n{rest}" if rest else "") + "\n"
 
 
+def _add_scoped_rule(rules: str, scope: dict, line: str) -> str:
+    """`line` at the end of the text of the note's own section for `scope`:
+    a scope heading of its kind naming just that value (normalized), not
+    inside another scoped section. A heading naming more values is left
+    alone, so the rule doesn't reach runs it wasn't proposed for."""
+    from workflow.rules_scope import normalize, scope_sections
+
+    text = rules.rstrip("\n")
+    want = normalize(scope["value"])
+    lines = text.split("\n")
+    for section in scope_sections(text):
+        if (section["nested"] or section["kind"] != scope["kind"]
+                or [normalize(v) for v in section["values"]] != [want]):
+            continue
+        at = section["line"]
+        for i in range(section["line"] + 1, section["body_end"]):
+            if lines[i].strip():
+                at = i
+        lines.insert(at + 1, line)
+        return "\n".join(lines) + "\n"
+    return f"{text}\n\n## For {scope['kind']}: {scope['value']}\n\n{line}\n"
+
+
 def remove_learned_rule(rules: str, pid: str) -> str:
-    """The Agent rules text without the learned line carrying `pid`."""
+    """The Agent rules text without the learned line carrying `pid`, under
+    whichever heading it is (Learned or a "For …" section)."""
     lines = rules.split("\n")
     kept = [ln for ln in lines if not (ln.lstrip().startswith("* ") and f"({pid}, learned" in ln)]
     return "\n".join(kept)
@@ -491,6 +549,12 @@ def _md(text: str) -> str:
     return "`".join(p if i % 2 else escape_taglike(p) for i, p in enumerate(parts))
 
 
+def _target_label(entry: dict) -> str:
+    """"Agent rules", or "Agent rules (For tag: mobile)" for a scoped one."""
+    label = TARGET_LABEL.get(entry["target"], entry["target"])
+    return f"{label} ({_md(scope_label(entry))})" if entry.get("scope") else label
+
+
 def render_note(ledger: list) -> str:
     pending = [e for e in ledger if e.get("status") == "pending"]
     decided = [e for e in ledger if e.get("status") != "pending"][-20:]
@@ -498,7 +562,8 @@ def render_note(ledger: list) -> str:
         "Changes to how agent runs work, proposed by `wf learn` from patterns in "
         "past runs. Nothing here is applied until you accept it: "
         "`wf learn accept <id>` or `wf learn reject <id>`. An accepted Agent rules "
-        "change is added under \"Learned\" in the Agent rules note. #work #project:workflow",
+        "change is added under \"Learned\" in the Agent rules note, or under its "
+        "\"For project/tag/agent: …\" heading when it is scoped to one. #work #project:workflow",
         "",
         "## Pending",
         "",
@@ -507,7 +572,7 @@ def render_note(ledger: list) -> str:
         out.append("Nothing pending.")
     for e in pending:
         flag = " ⚠️ evidence includes a run that read web content; check it was not planted" if e.get("untrusted") else ""
-        out.append(f"- [ ] **{e['id']}** · {TARGET_LABEL.get(e['target'], e['target'])}: {_md(e['change'])}{flag}")
+        out.append(f"- [ ] **{e['id']}** · {_target_label(e)}: {_md(e['change'])}{flag}")
         if e.get("why"):
             out.append(f"  - Why: {_md(e['why'])}")
         for ev in e.get("evidence") or []:
@@ -516,7 +581,8 @@ def render_note(ledger: list) -> str:
         out += ["", "## Decided", ""]
         for e in decided:
             mark = "X" if e.get("status") == "accepted" else "-"
-            out.append(f"- [{mark}] {e['id']} · {e.get('status')} {e.get('decided', '')}: {_md(e['change'])}")
+            where = f" ({_md(scope_label(e))})" if e.get("scope") else ""
+            out.append(f"- [{mark}] {e['id']} · {e.get('status')} {e.get('decided', '')}{where}: {_md(e['change'])}")
     return "\n".join(out) + "\n"
 
 
@@ -578,7 +644,7 @@ def run_learn(store, config: dict, days: int, dry_run: bool, echo=print,
     ledger += new
     save_ledger(ledger, ledger_path)
     for p in new:
-        echo(f"💡 {p['id']} [{TARGET_LABEL[p['target']]}] {p['change']}"
+        echo(f"💡 {p['id']} [{_target_label(p)}] {p['change']}"
              + ("  ⚠️ check: evidence includes web content" if p["untrusted"] else ""))
     _sync_note(config, ledger, echo)
     echo("\nReview, then 'wf learn accept <id>' or 'wf learn reject <id>'.")
@@ -593,7 +659,7 @@ def list_proposals(echo=print, show_all: bool = False, ledger_path: Path = LEDGE
              if not show_all else "No proposals yet.")
         return 0
     for e in shown:
-        echo(f"   {e['id']} [{e.get('status')}] {TARGET_LABEL.get(e['target'], e['target'])}: {e['change']}")
+        echo(f"   {e['id']} [{e.get('status')}] {_target_label(e)}: {e['change']}")
         if e.get("why"):
             echo(f"        why: {e['why']}")
     return 0
@@ -630,7 +696,7 @@ def accept_proposal(pid: str, config: dict, echo=print, ledger_path: Path = LEDG
         except NotesGraphError as e:
             echo(f"❌ Could not update the Agent rules note: {e}")
             return 1
-        echo(f"✅ Added to \"{AGENT_RULES_TITLE}\" under Learned: {entry['change']}")
+        echo(f"✅ Added to \"{AGENT_RULES_TITLE}\" under {scope_label(entry)}: {entry['change']}")
     elif entry["target"] == "skill":
         decide(ledger, entry["id"], "accepted")
         echo(f"✅ Accepted. Write it up as a \"Skill: <name>\" note, then 'wf skill from-notes':\n   {entry['change']}")

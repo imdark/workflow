@@ -2541,10 +2541,18 @@ def bench(
     runs: int = typer.Option(3, "--runs", help="Runs of each task per arm"),
     model: str = typer.Option("sonnet", "--model", help="Claude model to run"),
     out: Path = typer.Option(None, "--out", help="Append each run's result here as JSON lines"),
+    rules_project: List[str] = typer.Option(None, "--rules-project",
+                                            help="Project the Agent rules arm is for (default: the current wf project); repeatable"),
+    rules_tag: List[str] = typer.Option(None, "--rules-tag", help="Tag the Agent rules arm is for; repeatable"),
+    rules_agent: List[str] = typer.Option(None, "--rules-agent", help="Agent the Agent rules arm is for; repeatable"),
 ):
     """Run coding tasks headless with and without a prompt (the Agent rules,
     a skill, an edit to either) and compare checks passed, cost, time and
-    lines written. Every run costs real money: start with --runs 1."""
+    lines written. Every run costs real money: start with --runs 1.
+
+    The Agent rules arm gets the note as a run would: its unscoped parts and
+    the "For project/tag/agent: …" sections matching --rules-project (else
+    the current wf project), --rules-tag and --rules-agent."""
     from workflow.rules_bench import run_bench
     arms = {}
     for spec in arm or []:
@@ -2555,14 +2563,17 @@ def bench(
         arms[name] = Path(file).read_text()
     if agent_rules or not arms:
         from workflow.config import load_effective_config
-        from workflow.deploy.jobs import AGENT_RULES_PROMPT, AGENT_RULES_TITLE, load_agent_rules
+        from workflow.deploy.jobs import AGENT_RULES_TITLE, load_agent_rules, rules_prompt
         from workflow.deploy.notes import reader_from_config
+        from workflow.projects import get_current_project
+        projects = list(rules_project or []) or [p for p in (get_current_project(),) if p]
+        scope = {"projects": projects, "tags": list(rules_tag or []), "agents": list(rules_agent or [])}
         # load_agent_rules wants a JobClient; a reader has the same url/workspace/token.
-        rules = load_agent_rules(reader_from_config(load_effective_config()))
+        rules = load_agent_rules(reader_from_config(load_effective_config()), scope)
         if not rules:
             typer.echo(f"❌ no \"{AGENT_RULES_TITLE}\" note to compare")
             raise typer.Exit(1)
-        arms["agent-rules"] = AGENT_RULES_PROMPT.format(title=AGENT_RULES_TITLE, rules=rules)
+        arms["agent-rules"] = rules_prompt(rules)
     try:
         run_bench(tasks, arms, runs, model, out, echo=typer.echo)
     except LookupError as e:

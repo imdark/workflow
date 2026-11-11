@@ -310,7 +310,7 @@ def test_an_interrupted_run_is_resumed_where_it_was(repo, tmp_path, config_dir, 
     script = tmp_path / "fake_claude.py"
     script.write_text(FAKE_CLAUDE)
     monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
-    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client: "")
+    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client, scope=None: "")
     calls = []
 
     def fake_argv(job, prompt, job_dir, client, **kw):
@@ -348,7 +348,7 @@ def test_an_interrupted_run_is_resumed_where_it_was(repo, tmp_path, config_dir, 
 
 def test_a_finished_attempt_is_not_resumed(repo, tmp_path, config_dir, monkeypatch):
     monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
-    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client: "")
+    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client, scope=None: "")
     resumes = []
 
     def fake_argv(job, prompt, job_dir, client, **kw):

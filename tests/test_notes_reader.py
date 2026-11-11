@@ -12,9 +12,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from workflow.deploy.jobs import (AGENT_RULES_MAX_CHARS, CLAUDE_CODE_SYSTEM_PROMPT, Job,
-                                  JobClient, claude_code_argv, load_agent_rules,
-                                  run_job, with_agent_rules)
+from workflow.deploy.jobs import (AGENT_RULES_MAX_CHARS, CLAUDE_CODE_SYSTEM_PROMPT,
+                                  SUBAGENT_RULES_PROMPT, Job, JobClient, claude_code_argv,
+                                  job_rules_scope, load_agent_rules, rules_prompt, run_job,
+                                  with_agent_rules)
+from workflow.rules_scope import SCOPED_SENTENCE
 from workflow.deploy.notes import NotesReader, reader_from_config, strip_mcp_stamp
 from workflow.deploy.registry.notesgraph import NotesGraphError
 
@@ -237,3 +239,76 @@ def test_run_job_reads_the_note_once_and_hands_it_to_the_agent(tmp_path, monkeyp
     spec = json.loads((tmp_path / "jobs" / "job-1234abcd" / "cmd.json").read_text())
     prompt = spec["argv"][spec["argv"].index("--append-system-prompt") + 1]
     assert prompt.startswith(CLAUDE_CODE_SYSTEM_PROMPT) and RULES in prompt
+
+
+# --- scoped sections of the rules ---------------------------------------------
+
+SCOPED = ("Always rules.\n\n## For project: notes-graph\n* Use rg.\n\n"
+          "## For tag: mobile\n* adb is not on PATH.\n\n## For agent: Researcher\n* Save sources.")
+
+
+def scoped_notes():
+    return {"d-rules": {"title": "Agent rules", "markdown": SCOPED}}
+
+
+def test_scoped_sections_go_only_to_the_runs_they_match():
+    with FakeMcp(scoped_notes()) as mcp:
+        whole = load_agent_rules(mcp.job_client())
+        none = load_agent_rules(mcp.job_client(), {})
+        mobile = load_agent_rules(mcp.job_client(), {"tags": ["Mobile"], "projects": ["Notes Graph"]})
+    assert whole == SCOPED
+    assert none == "Always rules."
+    assert mobile == ("Always rules.\n\n## For project: notes-graph\n* Use rg.\n\n"
+                      "## For tag: mobile\n* adb is not on PATH.")
+
+
+def test_a_rules_note_of_only_other_scopes_is_no_rules():
+    only = {"d-rules": {"title": "Agent rules", "markdown": "## For tag: mobile\n* adb"}}
+    with FakeMcp(only) as mcp:
+        assert load_agent_rules(mcp.job_client(), {"tags": ["web"]}) == ""
+
+
+def test_the_cap_is_applied_after_filtering():
+    long_note = {"d-rules": {"title": "Agent rules", "markdown":
+                             "## For tag: other\n" + "y" * (AGENT_RULES_MAX_CHARS + 500) + "\n## Kept\nshort"}}
+    with FakeMcp(long_note) as mcp:
+        assert load_agent_rules(mcp.job_client(), {}) == "## Kept\nshort"
+
+
+def test_the_prompt_says_why_a_scoped_section_is_there():
+    plain = with_agent_rules("Be helpful.\n", "Always rules.")
+    scoped = with_agent_rules("Be helpful.\n", "Always rules.\n## For tag: mobile\n* adb")
+    assert SCOPED_SENTENCE not in plain and "note wins. The note" in plain
+    assert f"note wins. {SCOPED_SENTENCE} The note" in scoped
+    sub = rules_prompt("## For agent: x\n* y", SUBAGENT_RULES_PROMPT)
+    assert f"part of the work. {SCOPED_SENTENCE} The note" in sub
+
+
+def test_a_jobs_scope_comes_from_its_context_home_and_agent():
+    context = ("Note: Inbox\n\nUnder: Mobile\nProject: Notes Graph (projectId: p-1)\n"
+               "Tags: mobile, bug\nProperties: project:workflow, due:2026-11-12\n\nfix it #mobile #bug\n\n"
+               "Project: Other (projectId: p-2)\nTags: web")
+    scope = job_rules_scope(job(context=context, agentId="ag-1", agentName="Researcher"),
+                            ("ng", "/Users/x/code/notes-graph"))
+    assert scope == {"projects": ["Notes Graph", "Other", "workflow", "ng", "notes-graph"],
+                     "tags": ["mobile", "bug", "web"], "agents": ["Researcher", "ag-1"]}
+    assert job_rules_scope(job()) == {"projects": [], "tags": [], "agents": ["shows", "a"]}
+
+
+def test_run_job_hands_the_agent_the_sections_for_its_item(tmp_path, monkeypatch):
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
+    monkeypatch.setattr("workflow.deploy.jobs._watch",
+                        lambda *a: {"result": "", "steps": 1, "session": None})
+    monkeypatch.setattr("workflow.deploy.jobs.job_home", lambda job: None)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    with FakeMcp(scoped_notes()) as mcp:
+        run_job(job(context="Tags: mobile\n\nfix #mobile"), config={}, use_tmux=False,
+                client=mcp.job_client(), cwd=plain)
+    spec = json.loads((tmp_path / "jobs" / "job-1234abcd" / "cmd.json").read_text())
+    prompt = spec["argv"][spec["argv"].index("--append-system-prompt") + 1]
+    assert "adb is not on PATH" in prompt and SCOPED_SENTENCE in prompt
+    assert "Use rg." not in prompt and "Save sources." not in prompt
+    hook = json.loads((tmp_path / "jobs" / "job-1234abcd" / "SubagentStart.json").read_text())
+    context = hook["hookSpecificOutput"]["additionalContext"]
+    assert "adb is not on PATH" in context and "Use rg." not in context

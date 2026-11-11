@@ -315,3 +315,102 @@ def test_a_stuck_error_is_not_also_reported_as_recurring():
             run.call("Bash", {"command": "adb devices"}, "command not found: adb", error=True)
         scans.append(learn.scan_session(sid, run.turns))
     assert [f.kind for f in learn.detect(scans)] == ["stuck"]
+
+
+# --- scoped rules: "## For project/tag/agent: …" -------------------------------
+
+def test_propose_keeps_a_valid_scope_and_drops_a_bad_one(monkeypatch):
+    f = _finding()
+    prompts = []
+    reply = json.dumps([
+        {"target": "agent_rules", "change": "adb is not on PATH; use scripts/mobile-emulator.sh",
+         "evidence": [f.id], "scope": {"kind": "tag", "value": "#mobile"}},
+        {"target": "agent_rules", "change": "Use rg", "evidence": [f.id],
+         "scope": {"kind": "folder", "value": "x"}},
+        {"target": "agent_rules", "change": "Use pytest -q", "evidence": [f.id], "scope": None},
+        {"target": "memory", "change": "Cosmo is 6", "evidence": [f.id],
+         "scope": {"kind": "agent", "value": "Researcher"}},
+    ])
+    monkeypatch.setattr("workflow.ladder._run_llm", lambda p, c: prompts.append(p) or reply)
+    out = learn.propose([f], config={})
+    assert out[0]["scope"] == {"kind": "tag", "value": "mobile"}
+    assert all("scope" not in p for p in out[1:])
+    assert '"scope"' in prompts[0] and "For tag: X" in prompts[0]
+
+
+def test_parse_scope_wants_a_known_kind_and_one_value():
+    assert learn.parse_scope({"kind": "Project", "value": " notes  graph "}) == \
+        {"kind": "project", "value": "notes graph"}
+    assert learn.parse_scope({"kind": "tag", "value": "a, b"}) is None
+    assert learn.parse_scope({"kind": "tag", "value": ""}) is None
+    assert learn.parse_scope("tag:mobile") is None
+
+
+def scoped(kind, value, pid="L-abc123", change="Do X"):
+    return {"id": pid, "change": change, "decided": "2026-11-01",
+            "scope": {"kind": kind, "value": value}}
+
+
+def test_a_scoped_rule_goes_last_in_its_own_section():
+    rules = ("* a\n\n## For tag: mobile\n\n* m1\n* m2\n\n### Details\n\n* d\n\n"
+             "## For project: notes-graph\n\n* p1\n\n## Learned\n\n* l1\n")
+    out = learn.add_learned_rule(rules, scoped("tag", "Mobile"))
+    assert "* m2\n* Do X (L-abc123, learned 2026-11-01)\n\n### Details" in out
+    out = learn.add_learned_rule(out, scoped("project", "Notes Graph", "L-def456", "Use rg"))
+    assert "* p1\n* Use rg (L-def456, learned 2026-11-01)\n\n## Learned" in out
+    assert out.endswith("* l1\n")
+    assert learn.add_learned_rule(out, scoped("tag", "mobile")) == out
+
+
+def test_a_scoped_rule_with_no_section_gets_one_at_the_end():
+    rules = "* a\n\n## For tag: mobile, android\n\n* m1\n\n## Learned\n\n* l1\n"
+    out = learn.add_learned_rule(rules, scoped("tag", "android"))
+    # Not into the shared mobile/android section: the rule was for android only.
+    assert out == rules.rstrip("\n") + "\n\n## For tag: android\n\n* Do X (L-abc123, learned 2026-11-01)\n"
+    out = learn.add_learned_rule(rules, scoped("agent", "Researcher"))
+    assert out.endswith("## For agent: Researcher\n\n* Do X (L-abc123, learned 2026-11-01)\n")
+
+
+def test_a_scoped_rule_skips_nested_and_fenced_lookalikes():
+    rules = ("## For project: wf\n\n### For tag: mobile\n\n* nested\n\n"
+             "```\n## For tag: mobile\n```\n")
+    out = learn.add_learned_rule(rules, scoped("tag", "mobile"))
+    assert out.endswith("```\n\n## For tag: mobile\n\n* Do X (L-abc123, learned 2026-11-01)\n")
+
+
+def test_an_empty_scoped_section_gets_the_rule_under_its_heading():
+    out = learn.add_learned_rule("## For agent: Researcher\n\n## Learned\n", scoped("agent", "researcher"))
+    assert out == "## For agent: Researcher\n* Do X (L-abc123, learned 2026-11-01)\n\n## Learned\n"
+
+
+def test_a_scoped_rule_is_removed_from_wherever_it_is():
+    rules = "* a\n\n## For tag: mobile\n\n* m1\n* Do X (L-abc123, learned 2026-11-01)\n\n## Learned\n\n* l1\n"
+    out = learn.remove_learned_rule(rules, "L-abc123")
+    assert "L-abc123" not in out and "* m1" in out and "* l1" in out
+
+
+def test_accepting_a_scoped_rule_files_it_under_its_heading(tmp_path, monkeypatch):
+    path = tmp_path / "proposals.json"
+    learn.save_ledger([{"id": "L-abc123", "target": "agent_rules", "change": "adb is not on PATH",
+                        "evidence": [], "status": "pending",
+                        "scope": {"kind": "tag", "value": "mobile"}}], path)
+    reader = FakeReader({"Agent rules": ("rules", "* a rule\n")})
+    monkeypatch.setattr(learn, "_reader", lambda cfg: reader)
+    said = []
+    assert learn.accept_proposal("L-abc123", {}, echo=said.append, ledger_path=path) == 0
+    content = reader.calls[0][1]["content"]
+    assert "## For tag: mobile\n\n* adb is not on PATH (L-abc123, learned" in content
+    assert "## Learned" not in content
+    assert any("under For tag: mobile" in s for s in said)
+    assert learn.load_ledger(path)[0]["scope"] == {"kind": "tag", "value": "mobile"}
+
+
+def test_render_note_shows_the_scope():
+    note = learn.render_note([
+        {"id": "L-1", "target": "agent_rules", "change": "Do X", "status": "pending",
+         "scope": {"kind": "project", "value": "notes-graph"}},
+        {"id": "L-2", "target": "agent_rules", "change": "Do Y", "status": "accepted",
+         "decided": "2026-11-02", "scope": {"kind": "tag", "value": "mobile"}},
+    ])
+    assert "- [ ] **L-1** · Agent rules (For project: notes-graph): Do X" in note
+    assert "- [X] L-2 · accepted 2026-11-02 (For tag: mobile): Do Y" in note
