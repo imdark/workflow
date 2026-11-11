@@ -36,6 +36,7 @@ from typing import Callable, Optional
 from workflow.deploy import automations, checkpoint
 from workflow.deploy.notes import NotesReader
 from workflow.deploy.registry.notesgraph import NotesGraphError, load_token
+from workflow.rules_scope import SCOPED_SENTENCE, filter_rules, has_kept_scope
 
 # How long a claim is held before another runner may take the job. Renewed
 # by a heartbeat while a run is in progress.
@@ -400,14 +401,20 @@ AGENT_RULES_MAX_CHARS = 20_000
 AGENT_RULES_PROMPT = """\
 The user keeps their own rules for agent runs in a note titled "{title}" in
 NotesGraph. Follow them. Where they disagree with the conventions above, the
-note wins. The note, as it is now:
+note wins.{scoped} The note, as it is now:
 
 {rules}
 """
 
 
-def load_agent_rules(client: "JobClient") -> str:
+def load_agent_rules(client: "JobClient", scope: Optional[dict] = None) -> str:
     """The user's "Agent rules" note, or "" when there is none.
+
+    With `scope` ({"projects", "tags", "agents"}: the run's names of each,
+    see job_rules_scope), only the parts that apply to the run: the unscoped
+    text and the "For project/tag/agent: …" sections that match it (see
+    rules_scope). Without it, the whole note, as `wf learn` wants it to
+    know every rule already written. The length cap is applied after.
 
     Never fails the run: a server without the MCP endpoint, a bad token or
     an outage just means the run goes without the note, as runs did before.
@@ -420,17 +427,63 @@ def load_agent_rules(client: "JobClient") -> str:
         rules = reader.read(note["docId"]).strip()
     except (NotesGraphError, ValueError, KeyError, TypeError):
         return ""
+    if scope is not None:
+        rules, _ = filter_rules(rules, scope.get("projects") or (), scope.get("tags") or (),
+                                scope.get("agents") or ())
+        rules = rules.strip()
     if len(rules) > AGENT_RULES_MAX_CHARS:
         rules = rules[:AGENT_RULES_MAX_CHARS].rstrip() + "\n[cut: the note goes on]"
     return rules
+
+
+def rules_prompt(rules: str, template: str = AGENT_RULES_PROMPT) -> str:
+    """`template` filled with the rules, saying why scoped sections are there
+    when one is (every scope heading left after filtering matched the run)."""
+    scoped = f" {SCOPED_SENTENCE}" if has_kept_scope(rules) else ""
+    return template.format(title=AGENT_RULES_TITLE, rules=rules.strip(), scoped=scoped)
 
 
 def with_agent_rules(system_prompt: str, rules: str) -> str:
     """The system prompt with the user's rules appended, when there are any."""
     if not rules.strip():
         return system_prompt
-    return (system_prompt.rstrip("\n") + "\n\n"
-            + AGENT_RULES_PROMPT.format(title=AGENT_RULES_TITLE, rules=rules.strip()))
+    return system_prompt.rstrip("\n") + "\n\n" + rules_prompt(rules)
+
+
+# How NotesGraph lists an item's inline tags and #key:value properties in
+# the job's context (see its AgentContextService).
+_CONTEXT_TAGS_RE = re.compile(r"^Tags: (.+)$", re.M)
+_CONTEXT_PROPERTIES_RE = re.compile(r"^Properties: (.+)$", re.M)
+
+
+def job_rules_scope(job: "Job", home: Optional[tuple] = None) -> dict:
+    """What the "For project/tag/agent: …" sections of the Agent rules are
+    matched against for a job (see rules_scope).
+
+    projects: each NotesGraph project the job's context names ("Project: X
+    (projectId: …)"), its `#project:x` properties, and the wf project and
+    repo folder it runs in (`home`, from job_home). tags: the context's
+    "Tags:" lines, the inline tags of the items the run was started on.
+    agents: the agent's name and id. Note and project tags aren't in the
+    job, so they don't count here.
+    """
+    context = job.context or ""
+    projects = [m.group(1).strip() for m in _NOTESGRAPH_PROJECT_RE.finditer(context)]
+    tags = []
+    for found in _CONTEXT_TAGS_RE.finditer(context):
+        tags += [t.strip() for t in found.group(1).split(",") if t.strip()]
+    for found in _CONTEXT_PROPERTIES_RE.finditer(context):
+        for prop in found.group(1).split(","):
+            key, _, value = prop.strip().partition(":")
+            if key == "project" and value:
+                projects.append(value)
+    if home:
+        if home[0]:
+            projects.append(home[0])
+        if home[1]:
+            projects.append(Path(home[1]).name)
+    agents = [a for a in (job.agent_name, job.agent_id) if a]
+    return {"projects": projects, "tags": tags, "agents": agents}
 
 # Added to CLAUDE_CODE_SYSTEM_PROMPT for a research job. The method follows
 # OmniSeek's own investigate skill: sweep wide, zoom in, then structure.
@@ -550,7 +603,7 @@ def profile_skills_plugin(job: Job, job_dir: Path) -> Optional[Path]:
 SUBAGENT_RULES_PROMPT = """\
 You are a subagent of an agent run started from NotesGraph. The user keeps
 their own rules for agent runs in a note titled "{title}". Follow them as
-they apply to your part of the work. The note, as it is now:
+they apply to your part of the work.{scoped} The note, as it is now:
 
 {rules}
 """
@@ -591,8 +644,8 @@ def run_settings(mcp_path: Path, rules: str = "", session_context: str = "") -> 
                              "hooks": [{"type": "command", "command": guard, "timeout": 10}]}]}
     job_dir = mcp_path.parent
     if rules.strip():
-        hooks["SubagentStart"] = _context_hook(job_dir, "SubagentStart", SUBAGENT_RULES_PROMPT.format(
-            title=AGENT_RULES_TITLE, rules=rules.strip()))
+        hooks["SubagentStart"] = _context_hook(
+            job_dir, "SubagentStart", rules_prompt(rules, SUBAGENT_RULES_PROMPT))
     if session_context.strip():
         hooks["SessionStart"] = _context_hook(job_dir, "SessionStart", session_context)
     return json.dumps({"hooks": hooks})
@@ -1044,12 +1097,15 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     automation = tools_spec = None
     profiled = is_profiled_claude_job(job)
     with _SETUP_LOCK:
-        if job.model in CLAUDE_MODELS or profiled:
+        claude_job = job.model in CLAUDE_MODELS or profiled
+        found_home = job_home(job) if claude_job else None
+        if claude_job:
             if client is None:
                 raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
             provider = job.model
-            rules = load_agent_rules(client)
-        home = job_home(job) if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL) else None
+            # Only the parts of the rules for this run's project, tags and agent.
+            rules = load_agent_rules(client, job_rules_scope(job, found_home))
+        home = found_home if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL) else None
         if job.model == CLAUDE_CODE_MODEL:
             workdir = job_workdir(job_dir, Path(home[1]) if home else cwd or Path.cwd())
             automation, tools_spec, _ = prepare_automation(job, job_dir, cwd or Path.cwd(), workdir)
