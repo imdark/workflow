@@ -235,9 +235,18 @@ def get_available_branches(repo_path: Optional[str] = None) -> List[str]:
     return sorted(list(branches))
 
 def branch_exists(branch_name: str, repo_path: Optional[str] = None) -> bool:
-    """Check if a branch exists in the repository"""
-    available_branches = get_available_branches(repo_path)
-    return branch_name in available_branches
+    """Does `branch_name` exist, as a local branch or as origin's (`origin/<name>`)?
+
+    A PR's base lives on the remote: a task worktree off `origin/jannik/gem11-main` has no local branch of that
+    name and never needs one, so the remote-tracking ref counts.
+    """
+    if branch_name in get_available_branches(repo_path):
+        return True
+    try:
+        get_repo(repo_path).git.rev_parse("--verify", "-q", f"refs/remotes/origin/{branch_name}")
+        return True
+    except Exception:
+        return False
 
 def has_origin_remote(repo_path: Optional[str] = None) -> bool:
     """Check if the repository has an 'origin' remote configured"""
@@ -248,14 +257,22 @@ def has_origin_remote(repo_path: Optional[str] = None) -> bool:
         return False
 
 def select_base_branch(preferred_branch: str, repo_path: Optional[str] = None) -> str:
-    """Select an appropriate base branch, falling back if preferred doesn't exist"""
+    """Select an appropriate base branch, falling back if preferred doesn't exist.
+
+    Without a terminal (an agent's shell, a background job) there is nobody to pick one: say what is missing and
+    how to name the branch instead of waiting on a prompt forever.
+    """
     if branch_exists(preferred_branch, repo_path):
         return preferred_branch
-    
+    import sys
+    if not sys.stdin.isatty():
+        raise RuntimeError(f"Base branch '{preferred_branch}' exists neither locally nor as origin/{preferred_branch} "
+                           f"in {repo_path or 'this repo'}; fetch it, or name the branch the PR goes into with --base")
+
     available_branches = get_available_branches(repo_path)
     if not available_branches:
         raise RuntimeError("No branches found in repository")
-    
+
     from rich.console import Console
     from rich.prompt import Prompt
     
