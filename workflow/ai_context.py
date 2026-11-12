@@ -128,6 +128,13 @@ MEMORY (from earlier sessions on this task):
 {memory}
 """)
     
+    # Runs started in the wrong repo's worktree searched, found nothing and
+    # ended with no code and a task left in-progress.
+    context_parts.append(f"""
+BEFORE YOU START:
+{_repo_check(repo_path)}
+""")
+
     # Agents used to stop once the code worked, leaving the branch unshipped.
     context_parts.append(f"""
 WHEN YOU ARE DONE:
@@ -179,6 +186,35 @@ session may already have the answer.
 """)
     
     return "\n".join(context_parts)
+
+def repo_name(repo_path: str = None):
+    """The repo's name from its origin remote, else its folder; None without a path."""
+    if not repo_path:
+        return None
+    import subprocess
+    from pathlib import Path
+    try:
+        url = subprocess.run(["git", "-C", repo_path, "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        url = ""
+    if url:
+        name = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+        return name[:-4] if name.endswith(".git") else name
+    return Path(repo_path).name
+
+
+def _repo_check(repo_path: str = None) -> str:
+    name = repo_name(repo_path)
+    where = (f"This session runs in a checkout of the {name} repo." if name else
+             "Find out which repo this checkout is (`git remote get-url origin`).")
+    return f"""{where} Before searching for
+code, check that the task's feature belongs to this repo. If it plainly
+belongs to another one (say, an app feature in a tooling repo), don't search
+here and don't run `wf done`: this branch has nothing to ship. Set the task
+to BLOCKED with a note naming the repo it needs (update_task, if you have
+the NotesGraph tools), say so in your answer, and stop."""
+
 
 def format_retrieved_context(chunks: list) -> str:
     """Format retrieved chunks for context"""
