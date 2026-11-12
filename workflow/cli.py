@@ -3003,7 +3003,9 @@ def switch(
 def done(reviewers: str = typer.Option(None, help="Comma-separated list of reviewers"), repo_path: str = typer.Option(None, help="Repository path"),
          task: str = typer.Option(None, "--task", help="Task key to finish instead of the current task (background agents don't set one)"),
          title: str = typer.Option(None, "--title", help="PR title: what the change does (the task key is put in front)"),
-         body: str = typer.Option(None, "--body", help="PR description: what changed and why")):
+         body: str = typer.Option(None, "--body", help="PR description: what changed and why"),
+         base: str = typer.Option(None, "--base", help="Branch the PR goes into (default: the repo's configured "
+                                                       "base_branch; a task worktree takes its main checkout's)")):
     cfg = load_config()
     backend = get_backend(load_effective_config())
     # A background agent runs without a terminal: take the defaults rather
@@ -3083,7 +3085,7 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                 # task worktree that's its main checkout's setting.
                 from workflow.session import BaseBranchNotConfigured, base_branch_for
                 try:
-                    base_branch = base_branch_for(current_repo_path, repos)
+                    base_branch = base_branch_for(current_repo_path, repos, base)
                 except BaseBranchNotConfigured as e:
                     typer.echo(f"❌ {e}")
                     raise typer.Exit(1)
@@ -5997,43 +5999,71 @@ def task_create(
     priority: str = typer.Option("Medium", "--priority", "-p", help="Priority (Low, Medium, High, Critical)"),
     labels: str = typer.Option(None, "--labels", "-l", help="Comma-separated labels"),
     template: str = typer.Option(None, "--template", help="Use a template (bug, feature, task)"),
-    project: str = typer.Option(None, "--project", help="Project name (defaults to current project)")
+    project: str = typer.Option(None, "--project", help="Project to create it in (default: the session's project "
+                                                          "from wf ai, else the folder's, else the current one)")
 ):
-    """Create a new task"""
-    backend = get_markdown_backend()
-    
-    # Use template if specified
+    """Create a task in the project's own backend (Linear, Jira or Markdown).
+
+    The project is --project, else the one this session was started for (`wf ai` / `claude` set WF_PROJECT), else
+    the one whose repositories contain the current folder, else the current project. The task is created where that
+    project tracks its tasks: a Linear project gets a Linear issue in its team (PAN-123), a Jira project a Jira
+    issue, a Markdown project a file under ~/.wf. It never lands in another project's store under a made-up key.
+    """
+    from workflow.projects import get_project, get_project_for_cwd, get_project_key, list_projects
+
+    if project and get_project(project) is None:
+        typer.echo(f"❌ No project named '{project}'. Projects: {', '.join(sorted(list_projects())) or '(none)'}")
+        raise typer.Exit(1)
+    target = project or get_project_for_cwd()
+    if target:
+        cfg = load_effective_config(target)
+        backend_type = cfg.get("task_backend", "jira")
+        backend = get_backend(cfg)
+    else:                                   # no project at all: the plain markdown store
+        cfg, backend_type = load_config(), "markdown"
+        backend = get_backend(cfg, force_type="markdown")
+    if backend is None:
+        raise typer.Exit(1)
+    # the key prefix that backend wants: the Linear team / Jira project for those, the project's name for markdown
+    project_key = target if backend_type == "markdown" else get_project_key(target)
+
     if template:
-        issue = backend.create_from_template(template, title, project)
+        if not hasattr(backend, "create_from_template"):
+            typer.echo(f"❌ Templates exist for markdown projects only; '{target}' tracks its tasks in {backend_type}")
+            raise typer.Exit(1)
+        issue = backend.create_from_template(template, title, target)
         if issue:
             typer.echo(f"✅ Created task: {issue.key} (from template: {template})")
             typer.echo(f"   Title: {title}")
             return
-        else:
-            typer.echo(f"❌ Template '{template}' not found")
-            return
-    
-    # Create task with custom fields
+        typer.echo(f"❌ Template '{template}' not found")
+        raise typer.Exit(1)
+
     labels_list = [l.strip() for l in labels.split(",") if l.strip()] if labels else []
-    
-    from workflow.projects import get_current_project
-    current_project = project or get_current_project()
-    
     issue = backend.create_issue(
         summary=title,
         description=description,
         issue_type=task_type,
-        project_key=current_project
+        project_key=project_key
     )
-    
-    # Update with additional fields
-    if labels_list or priority != "Medium":
-        backend.update_task(issue.key, {
-            "labels": labels_list,
-            "priority": priority
-        })
-    
+    if issue is None:
+        typer.echo(f"❌ The task was not created in {backend_type}")
+        raise typer.Exit(1)
+
+    extras = {}
+    if labels_list:
+        extras["labels"] = labels_list
+    if priority != "Medium":
+        extras["priority"] = priority
+    if extras:
+        if hasattr(backend, "update_task"):
+            backend.update_task(issue.key, extras)
+        else:
+            typer.echo(f"ℹ️  labels and priority are set on markdown tasks only; set them on {issue.key} in "
+                       f"{backend_type} by hand")
+
     typer.echo(f"✅ Created task: {issue.key}")
+    typer.echo(f"   Project: {target or '(none)'} ({backend_type})")
     typer.echo(f"   Title: {title}")
     typer.echo(f"   Type: {task_type}")
     typer.echo(f"   Priority: {priority}")
@@ -6354,10 +6384,15 @@ def task_project(
             typer.echo("❌ Project name required")
             return
         
-        from workflow.projects import set_current_project, get_project
+        from workflow.projects import PROJECT_ENV, get_project, session_project, set_current_project
         if get_project(name):
             set_current_project(name)
             typer.echo(f"✅ Switched to project: {name}")
+            pinned = session_project()
+            if pinned and pinned != name:
+                typer.echo(f"ℹ️  This session is pinned to '{pinned}' (wf ai set {PROJECT_ENV}), so commands run "
+                           f"here keep acting on it. Override one command with --project {name}, or this shell "
+                           f"with: export {PROJECT_ENV}={name}")
         else:
             # Allow switching to a markdown-only project
             projects = backend.get_projects()

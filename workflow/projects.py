@@ -10,6 +10,20 @@ from typing import Dict, List, Optional, Any
 from .config import load_config, save_config
 from .state import _load, _save
 
+#: The project a `wf ai` / `claude` session was started for. The launcher puts it in the session's environment
+#: (session.apply_claude_env), so every wf command run inside that session acts on the same project, whatever folder
+#: it runs in and whatever the global current project is. Precedence everywhere: a command's own --project, then
+#: this, then the project whose repository holds the folder, then the global current project.
+PROJECT_ENV = "WF_PROJECT"
+
+
+def session_project() -> Optional[str]:
+    """The session's project (PROJECT_ENV in the environment), when it names a configured project; else None."""
+    name = (os.environ.get(PROJECT_ENV) or "").strip()
+    if not name:
+        return None
+    return name if name in list_projects() else None
+
 
 def get_project_for_cwd(switch_if_needed: bool = True, verbose: bool = False) -> Optional[str]:
     """
@@ -27,10 +41,15 @@ def get_project_for_cwd(switch_if_needed: bool = True, verbose: bool = False) ->
     Returns:
         The project name to use
     """
+    pinned = session_project()
+    if pinned:                       # a wf ai session: its project, in any folder, and the global state untouched
+        if verbose:
+            print(f"Using the session's project: {pinned} ({PROJECT_ENV})")
+        return pinned
     cwd = os.getcwd()
     current_project = get_current_project()
     all_projects = list_projects()
-    
+
     if not all_projects:
         return current_project
     
@@ -188,7 +207,10 @@ def set_current_project(name: Optional[str]) -> None:
 
 
 def get_current_project() -> Optional[str]:
-    """Get the current active project name"""
+    """The project wf commands act on: the session's (PROJECT_ENV, set by `wf ai`), else the global current one."""
+    pinned = session_project()
+    if pinned:
+        return pinned
     state = _load()
     return state.get("current_project")
 

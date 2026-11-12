@@ -109,14 +109,17 @@ def start_in_worktree(issue, repo_path: str, base_branch: str) -> str:
 
 
 def apply_claude_env(env: Optional[dict] = None, project: Optional[str] = None) -> dict:
-    """Point a Claude launch at the project's account and the capture proxy.
+    """Point a Claude launch at the project's account, the capture proxy, and the project itself.
 
-    Sets CLAUDE_CONFIG_DIR and the proxy base URL in `env` (default: this
-    process's environment). The account is the current project's unless
-    `project` names another. Returns what it applied, for logging.
+    Sets CLAUDE_CONFIG_DIR, the proxy base URL and WF_PROJECT in `env` (default: this process's environment). The
+    project is the current one unless `project` names another; WF_PROJECT pins it for every wf command the session
+    runs (projects.session_project), so `wf task create` / `wf start` / `wf done` inside the session act on the
+    project the session was started for, not on whatever the global current project is by then. Returns what it
+    applied, for logging.
     """
     from workflow import claude_accounts
     from workflow.ai_providers.base import apply_proxy_env
+    from workflow.projects import PROJECT_ENV, get_current_project
 
     if env is None:
         env = os.environ
@@ -124,4 +127,8 @@ def apply_claude_env(env: Optional[dict] = None, project: Optional[str] = None) 
     account_dir = claude_accounts.apply(env, project)
     if account_dir:
         applied[claude_accounts.ENV_VAR] = account_dir
+    pinned = project or get_current_project()
+    if pinned:
+        env[PROJECT_ENV] = pinned
+        applied[PROJECT_ENV] = pinned
     return applied
