@@ -906,6 +906,51 @@ class LinearBackend(TaskBackend):
         return [s["name"] for s in self._states(team_key) if s["name"] != current]
 
     # ------------------------------------------------------------------
+    # The task commands' surface (wf task show / update / transition), the
+    # same methods MarkdownBackend answers; comments are below
+    # ------------------------------------------------------------------
+
+    def get_task(self, key: str) -> Optional[LinearTask]:
+        """One issue as a task, or None: not found and not visible read the same."""
+        try:
+            return LinearTask(self._fetch_issue(key))
+        except Exception:                                   # noqa: BLE001
+            return None
+
+    def update_task(self, key: str, updates: Dict[str, Any]) -> bool:
+        """The markdown backend's update vocabulary: title, description,
+        priority (a name: High, Urgent, ...) and labels (names). An unknown
+        priority raises rather than being dropped; an unknown label is skipped
+        with a warning, as on create."""
+        update: Dict[str, Any] = {}
+        for field in ("title", "description"):
+            if updates.get(field) is not None:
+                update[field] = updates[field]
+        if updates.get("priority"):
+            value = PRIORITY_VALUES.get(str(updates["priority"]).strip().lower())
+            if value is None:
+                raise ValueError(f"unknown priority {updates['priority']!r}: one of "
+                                 f"{', '.join(PRIORITY_LABELS.values())}")
+            update["priority"] = value
+        if "labels" in updates:
+            team_key = key.split("-")[0].upper() if "-" in str(key) else None
+            update["labelIds"] = self._label_ids(list(updates["labels"]), team_key)
+        if not update:
+            return False
+        self._update_issue(key, update)
+        return True
+
+    def transition_task(self, key: str, new_status: str) -> bool:
+        """Move the issue to the workflow state Linear names `new_status`
+        ("In Review", "Done"); False when the team has no such state."""
+        team_key = key.split("-")[0].upper() if "-" in str(key) else None
+        state = self._find_state_by_name(self._states(team_key), [new_status.strip().lower()])
+        if state is None:
+            return False
+        self._update_issue(key, {"stateId": state["id"]})
+        return True
+
+    # ------------------------------------------------------------------
     # Fields (Linear has none; expose its built-ins under the same API)
     # ------------------------------------------------------------------
 

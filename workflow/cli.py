@@ -6005,6 +6005,47 @@ task_app = typer.Typer(help="Task management with Markdown backend", no_args_is_
 app.add_typer(task_app, name="task")
 
 
+PROJECT_OPTION_HELP = ("Project the task is in (default: the session's project from wf ai, else the folder's, else "
+                       "the current one)")
+
+
+def _project_backend(project: Optional[str]):
+    """The project a task command acts in, and that project's own backend -> (backend, project, backend type).
+
+    The project is --project, else the session's (WF_PROJECT, set by `wf ai` / `claude`), else the one whose
+    repositories contain the current folder, else the current project; with none at all, the plain markdown store.
+    Every task command resolves it this way, so a PAN-123 that `wf task create` made in Linear is the one `wf task
+    show`, `update`, `transition` and `comment` find -- they used to look in the markdown store only.
+    """
+    from workflow.projects import get_project, get_project_for_cwd, list_projects
+
+    if project and get_project(project) is None:
+        typer.echo(f"❌ No project named '{project}'. Projects: {', '.join(sorted(list_projects())) or '(none)'}")
+        raise typer.Exit(1)
+    target = project or get_project_for_cwd()
+    if target:
+        cfg = load_effective_config(target)
+        backend_type = cfg.get("task_backend", "jira")
+        backend = get_backend(cfg)
+    else:                                   # no project at all: the plain markdown store
+        backend_type = "markdown"
+        backend = get_backend(load_config(), force_type="markdown")
+    if backend is None:
+        raise typer.Exit(1)
+    return backend, target, backend_type
+
+
+def _find_task(backend, key: str):
+    """One task by key: the backend's own lookup when it has one (Linear fetches the issue), else a scan."""
+    if hasattr(backend, "get_task"):
+        return backend.get_task(key)
+    return next((t for t in backend.list_tasks() if t.key.lower() == key.lower()), None)
+
+
+def _where(target: Optional[str], backend_type: str) -> str:
+    return f"{target or 'the markdown store'} ({backend_type})"
+
+
 @task_app.command("create")
 def task_create(
     title: str = typer.Argument(..., help="Task title"),
@@ -6023,21 +6064,9 @@ def task_create(
     project tracks its tasks: a Linear project gets a Linear issue in its team (PAN-123), a Jira project a Jira
     issue, a Markdown project a file under ~/.wf. It never lands in another project's store under a made-up key.
     """
-    from workflow.projects import get_project, get_project_for_cwd, get_project_key, list_projects
+    from workflow.projects import get_project_key
 
-    if project and get_project(project) is None:
-        typer.echo(f"❌ No project named '{project}'. Projects: {', '.join(sorted(list_projects())) or '(none)'}")
-        raise typer.Exit(1)
-    target = project or get_project_for_cwd()
-    if target:
-        cfg = load_effective_config(target)
-        backend_type = cfg.get("task_backend", "jira")
-        backend = get_backend(cfg)
-    else:                                   # no project at all: the plain markdown store
-        cfg, backend_type = load_config(), "markdown"
-        backend = get_backend(cfg, force_type="markdown")
-    if backend is None:
-        raise typer.Exit(1)
+    backend, target, backend_type = _project_backend(project)
     # the key prefix that backend wants: the Linear team / Jira project for those, the project's name for markdown
     project_key = target if backend_type == "markdown" else get_project_key(target)
 
@@ -6215,22 +6244,16 @@ def task_list(
 
 @task_app.command("show")
 def task_show(
-    key: str = typer.Argument(..., autocompletion=autocomplete_tasks, help="Task key")
+    key: str = typer.Argument(..., autocompletion=autocomplete_tasks, help="Task key"),
+    project: str = typer.Option(None, "--project", help=PROJECT_OPTION_HELP),
 ):
-    """Show task details"""
-    backend = get_markdown_backend()
-    
+    """Show a task, from its project's own backend (Linear, Jira or Markdown)"""
+    backend, target, backend_type = _project_backend(project)
+
     try:
-        # Get full task data
-        tasks = backend.list_tasks()
-        task = None
-        for t in tasks:
-            if t.key.lower() == key.lower():
-                task = t
-                break
-        
+        task = _find_task(backend, key)
         if not task:
-            typer.echo(f"❌ Task '{key}' not found")
+            typer.echo(f"❌ Task '{key}' not found in {_where(target, backend_type)}")
             return
         
         typer.echo(f"\n📋 Task: {task.key}")
@@ -6255,7 +6278,10 @@ def task_show(
         
         typer.echo(f"Created: {task.created_date}")
         typer.echo(f"Updated: {task.updated_date}")
-        typer.echo(f"File: {task.file_path}")
+        if getattr(task, "url", None):
+            typer.echo(f"URL: {task.url}")
+        if getattr(task, "file_path", None):
+            typer.echo(f"File: {task.file_path}")
         
         if task.description:
             typer.echo(f"\nDescription:")
@@ -6278,11 +6304,15 @@ def task_update(
     description: str = typer.Option(None, "--description", "-d", help="Update description"),
     priority: str = typer.Option(None, "--priority", "-p", help="Update priority"),
     add_labels: str = typer.Option(None, "--add-labels", help="Add comma-separated labels"),
-    remove_labels: str = typer.Option(None, "--remove-labels", help="Remove comma-separated labels")
+    remove_labels: str = typer.Option(None, "--remove-labels", help="Remove comma-separated labels"),
+    project: str = typer.Option(None, "--project", help=PROJECT_OPTION_HELP),
 ):
-    """Update a task"""
-    backend = get_markdown_backend()
-    
+    """Update a task, in its project's own backend"""
+    backend, target, backend_type = _project_backend(project)
+    if not hasattr(backend, "update_task"):
+        typer.echo(f"❌ {backend_type} tasks cannot be updated from wf yet")
+        raise typer.Exit(1)
+
     updates = {}
     
     if title:
@@ -6294,14 +6324,7 @@ def task_update(
     
     # Handle label updates
     if add_labels or remove_labels:
-        # Get current task
-        tasks = backend.list_tasks()
-        task = None
-        for t in tasks:
-            if t.key.lower() == key.lower():
-                task = t
-                break
-        
+        task = _find_task(backend, key)
         if task:
             current_labels = set(task.labels)
             
@@ -6313,34 +6336,48 @@ def task_update(
             
             updates["labels"] = list(current_labels)
     
-    if updates:
-        if backend.update_task(key, updates):
-            typer.echo(f"✅ Updated task: {key}")
-        else:
-            typer.echo(f"❌ Task '{key}' not found")
-    else:
+    if not updates:
         typer.echo("⚠️  No updates specified")
+        return
+    try:
+        updated = backend.update_task(key, updates)
+    except Exception as e:                                  # noqa: BLE001 -- the backend's own words
+        typer.echo(f"❌ {key}: {e}")
+        raise typer.Exit(1)
+    if not updated:
+        typer.echo(f"❌ Task '{key}' not found in {_where(target, backend_type)}")
+        raise typer.Exit(1)
+    typer.echo(f"✅ Updated task: {key}")
 
 
 @task_app.command("transition")
 def task_transition(
     key: str = typer.Argument(..., autocompletion=autocomplete_tasks, help="Task key"),
-    status: str = typer.Argument(..., help="New status")
+    status: str = typer.Argument(..., help="New status"),
+    project: str = typer.Option(None, "--project", help=PROJECT_OPTION_HELP),
 ):
-    """Transition a task to a new status"""
-    backend = get_markdown_backend()
-    
+    """Transition a task to a new status, in its project's own backend"""
+    backend, target, backend_type = _project_backend(project)
+    if not hasattr(backend, "transition_task"):
+        typer.echo(f"❌ {backend_type} tasks cannot be transitioned from wf yet")
+        raise typer.Exit(1)
+
     # Check available transitions first
     transitions = backend.get_available_transitions(key)
-    
-    if transitions and status not in transitions:
+    if transitions and status.lower() not in {t.lower() for t in transitions}:
         typer.echo(f"❌ Invalid transition. Available: {', '.join(transitions)}")
         return
-    
-    if backend.transition_task(key, status):
+
+    try:
+        moved = backend.transition_task(key, status)
+    except Exception as e:                                  # noqa: BLE001
+        typer.echo(f"❌ {key}: {e}")
+        raise typer.Exit(1)
+    if moved:
         typer.echo(f"✅ Transitioned {key} to: {status}")
     else:
-        typer.echo(f"❌ Task '{key}' not found")
+        typer.echo(f"❌ Task '{key}' not found in {_where(target, backend_type)}")
+        raise typer.Exit(1)
 
 
 @task_app.command("delete")
@@ -6605,19 +6642,13 @@ task_comment_app = typer.Typer(help="Task comment management", no_args_is_help=T
 task_app.add_typer(task_comment_app, name="comment")
 
 
-def _get_task_backend():
-    """Get the current task backend"""
-    from workflow.config import load_effective_config
-    cfg = load_effective_config()
-    return get_backend(cfg)
-
-
 @task_comment_app.command("list")
 def task_comment_list(
-    key: str = typer.Argument(..., help="Task key")
+    key: str = typer.Argument(..., help="Task key"),
+    project: str = typer.Option(None, "--project", help=PROJECT_OPTION_HELP),
 ):
-    """List comments on a task"""
-    backend = _get_task_backend()
+    """List comments on a task, from its project's own backend"""
+    backend = _project_backend(project)[0]
     
     if not hasattr(backend, 'get_comments'):
         typer.echo("❌ Comments are not supported by this backend")
@@ -6645,20 +6676,25 @@ def task_comment_list(
 @task_comment_app.command("add")
 def task_comment_add(
     key: str = typer.Argument(..., help="Task key"),
-    text: str = typer.Argument(..., help="Comment text")
+    text: str = typer.Argument(..., help="Comment text"),
+    project: str = typer.Option(None, "--project", help=PROJECT_OPTION_HELP),
 ):
-    """Add a comment to a task"""
-    backend = _get_task_backend()
-    
+    """Add a comment to a task, in its project's own backend"""
+    backend = _project_backend(project)[0]
+
     if not hasattr(backend, 'add_comment'):
         typer.echo("❌ Comments are not supported by this backend")
-        return
-    
+        raise typer.Exit(1)
+
     import os
     author = os.environ.get('USER', 'unknown')
-    
-    result = backend.add_comment(key, text, author)
-    
+
+    try:
+        result = backend.add_comment(key, text, author)
+    except Exception as e:                                  # noqa: BLE001 -- the backend's own words
+        typer.echo(f"❌ {key}: {e}")
+        raise typer.Exit(1)
+
     if result:
         typer.echo(f"✅ Added comment #{result['id']} to task {key}")
     else:
@@ -6669,10 +6705,11 @@ def task_comment_add(
 def task_comment_edit(
     key: str = typer.Argument(..., help="Task key"),
     comment_id: int = typer.Argument(..., help="Comment ID to edit"),
-    text: str = typer.Argument(..., help="New comment text")
+    text: str = typer.Argument(..., help="New comment text"),
+    project: str = typer.Option(None, "--project", help=PROJECT_OPTION_HELP),
 ):
     """Edit a comment on a task"""
-    backend = _get_task_backend()
+    backend = _project_backend(project)[0]
     
     if not hasattr(backend, 'update_comment'):
         typer.echo("❌ Comments are not supported by this backend")
@@ -6689,10 +6726,11 @@ def task_comment_edit(
 @task_comment_app.command("delete")
 def task_comment_delete(
     key: str = typer.Argument(..., help="Task key"),
-    comment_id: int = typer.Argument(..., help="Comment ID to delete")
+    comment_id: int = typer.Argument(..., help="Comment ID to delete"),
+    project: str = typer.Option(None, "--project", help=PROJECT_OPTION_HELP),
 ):
     """Delete a comment from a task"""
-    backend = _get_task_backend()
+    backend = _project_backend(project)[0]
     
     if not hasattr(backend, 'delete_comment'):
         typer.echo("❌ Comments are not supported by this backend")
