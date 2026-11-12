@@ -37,6 +37,17 @@ def test_a_base_that_exists_only_on_origin_counts(clone):
     assert git_utils.select_base_branch("jannik/trunk", str(clone)) == "jannik/trunk"
 
 
+def test_the_diff_with_a_base_that_exists_only_on_origin_is_seen(clone):
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "work", cwd=clone)
+    assert git_utils.has_diff_with_base(str(clone), "jannik/trunk") is False      # task-1 is not on origin yet
+    git("push", "-q", "-u", "origin", "task-1", cwd=clone)
+    assert git_utils.base_ref("jannik/trunk", str(clone)) == "origin/jannik/trunk"
+    assert git_utils.has_diff_with_base(str(clone), "jannik/trunk") is True
+    assert git_utils.has_diff_with_base(str(clone), "main") is True
+    with pytest.raises(RuntimeError, match="origin/nope.*--base"):
+        git_utils.has_diff_with_base(str(clone), "nope")
+
+
 def test_without_a_terminal_a_missing_base_is_an_error_that_names_the_fix(clone, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
 

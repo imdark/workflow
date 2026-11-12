@@ -3091,7 +3091,11 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                     raise typer.Exit(1)
 
                 # Check if there are any differences with base branch or for specified repo
-                has_diff = has_diff_with_base(current_repo_path, base_branch)
+                try:
+                    has_diff = has_diff_with_base(current_repo_path, base_branch)
+                except RuntimeError as e:          # the base exists nowhere: say so rather than "no differences"
+                    typer.echo(f"❌ {e}")
+                    raise typer.Exit(1)
                 
                 # Check if branch has unpushed commits: the branch at
                 # current_repo_path (a worktree's own), not the cwd's.

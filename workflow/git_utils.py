@@ -461,26 +461,37 @@ def push_branch(repo_path: Optional[str] = None):
     repo = get_repo(repo_path)
     repo.git.push("--set-upstream", "origin", repo.active_branch.name)
 
+def base_ref(base_branch: str, repo_path: Optional[str] = None) -> str:
+    """The ref a branch is compared against for its PR: origin's `base_branch` when the remote has it (that is what
+    the PR is opened against), else the local branch of that name. Raises when neither exists, with the fix."""
+    repo = get_repo(repo_path)
+    for ref, name in ((f"refs/remotes/origin/{base_branch}", f"origin/{base_branch}"),
+                      (f"refs/heads/{base_branch}", base_branch)):
+        try:
+            repo.git.rev_parse("--verify", "-q", ref)
+            return name
+        except Exception:
+            continue
+    raise RuntimeError(f"Base branch '{base_branch}' exists neither as origin/{base_branch} nor locally in "
+                       f"{repo_path or 'this repo'}; fetch it, or name the branch the PR goes into with --base")
+
+
 def has_diff_with_base(repo_path: Optional[str] = None, base_branch: Optional[str] = None):
-    """Check if current branch has differences with base branch that are pushed to remote"""
+    """Does the current branch, as pushed to origin, carry commits the base does not?
+
+    False when the branch is not on origin yet (nothing a PR could show). A base that exists nowhere is an error
+    that says so (base_ref), never "no differences": wf done used to skip the PR on exactly that.
+    """
     if not repo_path:
         return False
-        
     repo = get_repo(repo_path)
-    
-    # Get current branch
     current_branch = repo.active_branch.name
-    
-    # First check if branch exists on remote
     try:
         repo.git.fetch("origin", current_branch)
-        remote_branch = f"origin/{current_branch}"
-        # Check if commits exist on remote that aren't on base
-        diff_commits = list(repo.iter_commits(f'{base_branch}..{remote_branch}'))
-        return len(diff_commits) > 0
     except Exception:
-        # Branch doesn't exist on remote yet
-        return False
+        return False                               # not pushed yet
+    base = base_ref(base_branch, repo_path)
+    return len(list(repo.iter_commits(f"{base}..origin/{current_branch}"))) > 0
 
 # How an agent job's ticket description starts: the whole prompt the agent
 # was given (see deploy/jobs.py `_prompt` and the cloud runner's run-job.ts).
