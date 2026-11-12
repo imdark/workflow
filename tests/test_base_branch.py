@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 from workflow.git_utils import main_checkout
-from workflow.session import BaseBranchNotConfigured, base_branch_for
+from workflow.session import BaseBranchNotConfigured, base_branch_for, recorded_base, remember_base
 
 
 def git(*args, cwd):
@@ -53,3 +53,18 @@ def test_an_explicit_base_wins(repo):
     clone, worktree = repo
     repos = {str(clone): {"base_branch": "stage"}}
     assert base_branch_for(str(worktree), repos, base="hotfix") == "hotfix"
+    assert base_branch_for(str(worktree), repos, base="origin/hotfix") == "hotfix"   # named as on the remote
+
+
+def test_a_base_given_at_start_sticks_to_the_branch_so_done_needs_no_flag(repo):
+    """`wf start --base jannik/trunk` records the base on the task branch; `wf done` finds it there, over the
+    repo's configured default, without the config changing; its own --base still wins."""
+    clone, worktree = repo
+    repos = {str(clone): {"base_branch": "stage"}}
+    assert recorded_base(str(worktree)) is None
+    remember_base(str(worktree), "origin/jannik/trunk")
+    assert recorded_base(str(worktree)) == "jannik/trunk"
+    assert base_branch_for(str(worktree), repos) == "jannik/trunk"
+    assert base_branch_for(str(worktree), repos, base="hotfix") == "hotfix"
+    assert base_branch_for(str(clone), repos) == "stage"           # another branch of the repo: the default
+    assert recorded_base(str(clone)) is None

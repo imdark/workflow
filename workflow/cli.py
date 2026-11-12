@@ -2828,9 +2828,12 @@ def start(
                 # Update repo_path to the worktree for subsequent operations
                 working_repo_path = worktree_path
             else:
-                # Normal branch creation in the main repository
+                # Normal branch creation in the main repository, from the base as origin has it (a base that
+                # exists only as origin/<name> is the common case for a trunk nobody checks out locally)
                 # Skip uncommitted changes check if AI is active or we're using worktree for changes
-                create_branch(issue, branch_base, repo_path, skip_uncommitted_check=ai_active or same_issue_active or any_ai_active or use_worktree)
+                from workflow.git_utils import base_ref
+                create_branch(issue, base_ref(branch_base, repo_path), repo_path,
+                              skip_uncommitted_check=ai_active or same_issue_active or any_ai_active or use_worktree)
                 # Set commit prefix only if branch creation succeeded
                 set_commit_prefix(issue.key, repo_path if repo_path else None)
                 working_repo_path = repo_path
@@ -2842,6 +2845,13 @@ def start(
                 typer.echo(f"❌ Failed to create branch: {e}")
                 typer.echo("💡 Task is still set to in progress.")
             return
+        # The branch remembers its own base (git config branch.<name>.wf-base): `wf done` PRs into it without
+        # --base being repeated, and the repo's configured default stays what it is. A --base always records;
+        # without one only a branch with nothing recorded yet takes the default (a reused worktree keeps its own).
+        from workflow.session import recorded_base, remember_base
+        if base or not recorded_base(working_repo_path):
+            remember_base(working_repo_path, branch_base)
+            typer.echo(f"🌿 Base branch for {issue.key}: {branch_base}")
     else:
         if repos and not repo_path:
             typer.echo("Note: Git integration is disabled but repositories are configured.")
