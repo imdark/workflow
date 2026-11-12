@@ -847,6 +847,37 @@ def get_worktree_path(repo_path: str, branch_name: str) -> str:
     return str(worktree_path)
 
 
+WORKTREE_SETUP_SCRIPT = "scripts/worktree-setup.sh"
+
+
+def run_worktree_setup(worktree_path: str, console=None) -> Optional[bool]:
+    """Run the repo's own scripts/worktree-setup.sh in a new worktree, if it has one.
+
+    A fresh worktree has none of the checkout's untracked state (installed dependencies, build outputs, local
+    config), and only the repo knows how to supply it, so the recipe lives in the repo. Returns None when there
+    is no script, else whether it succeeded; a failure is reported but does not stop the start.
+    """
+    script = Path(worktree_path) / WORKTREE_SETUP_SCRIPT
+    if not script.is_file():
+        return None
+    if console:
+        console.print(f"🔗 Running {WORKTREE_SETUP_SCRIPT}...")
+    try:
+        result = subprocess.run(["bash", str(script)], cwd=worktree_path, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        if console:
+            console.print(f"⚠️  {WORKTREE_SETUP_SCRIPT} failed: {e}")
+        return False
+    if result.returncode != 0:
+        if console:
+            detail = (result.stderr or result.stdout).strip().splitlines()[-5:]
+            console.print(f"⚠️  {WORKTREE_SETUP_SCRIPT} exited {result.returncode}; run it by hand in the worktree")
+            for line in detail:
+                console.print(f"   {line}")
+        return False
+    return True
+
+
 def create_worktree(repo_path: str, branch_name: str, base_branch: str = None) -> str:
     """Create a git worktree for a new branch.
     
@@ -903,6 +934,7 @@ def create_worktree(repo_path: str, branch_name: str, base_branch: str = None) -
         repo.git.worktree("add", "-b", branch_name, worktree_path, base_branch)
         console.print(f"✅ Worktree created successfully")
         add_claude_trust(worktree_path)
+        run_worktree_setup(worktree_path, console)
         return worktree_path
     except Exception as e:
         # If branch already exists, try to create worktree from existing branch
@@ -911,6 +943,7 @@ def create_worktree(repo_path: str, branch_name: str, base_branch: str = None) -
                 repo.git.worktree("add", worktree_path, branch_name)
                 console.print(f"✅ Worktree created from existing branch")
                 add_claude_trust(worktree_path)
+                run_worktree_setup(worktree_path, console)
                 return worktree_path
             except Exception as e2:
                 raise RuntimeError(f"Failed to create worktree: {e2}")
