@@ -142,6 +142,30 @@ def test_build_context_uses_memory_block_not_dead_rag_text(monkeypatch):
     assert "T-1 needs no PR: close it by hand." in context
 
 
+def test_build_context_asks_to_check_the_repo_first(monkeypatch, tmp_path):
+    import subprocess
+    from workflow import ai_context
+
+    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None: "")
+    monkeypatch.setattr(ai_context, "get_rag", lambda: None)
+    monkeypatch.setattr(ai_context, "get_ai_instructions", lambda issue, repo: [])
+    repo = tmp_path / "workflow-personal-9-x"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                    "git@github.com:someone/notes-graph.git"], check=True)
+    issue = SimpleNamespace(key="T-1", title="t", description="d")
+
+    context = ai_context.build_context(issue, repo_path=str(repo))
+
+    assert "checkout of the notes-graph repo" in context
+    assert "BLOCKED" in context
+    # Without a remote the folder name stands in.
+    subprocess.run(["git", "-C", str(repo), "remote", "remove", "origin"], check=True)
+    assert ai_context.repo_name(str(repo)) == "workflow-personal-9-x"
+    assert ai_context.repo_name(None) is None
+
+
 def test_injected_and_searched_facts_are_counted(store):
     _facts(store, "T-1", "Deploy runs on the Mac agent", "Tests use a fake upstream")
 
