@@ -608,6 +608,23 @@ they apply to your part of the work.{scoped} The note, as it is now:
 {rules}
 """
 
+# Every subagent gets this, rules or not: two build subagents lost all their
+# uncommitted work when a usage limit cut them off mid-build.
+SUBAGENT_COMMIT_PROMPT = """\
+If you are changing code in a git checkout, commit as you go: a small
+commit after each step that builds and passes its tests, so the work
+survives if you are interrupted (a usage limit, a crash). Don't push, and
+don't leave a long build uncommitted until the end.
+"""
+
+
+def subagent_prompt(rules: str) -> str:
+    """What the SubagentStart hook hands every subagent: the commit-as-you-go
+    brief, then the user's rules when there are any."""
+    if not rules.strip():
+        return SUBAGENT_COMMIT_PROMPT
+    return SUBAGENT_COMMIT_PROMPT + "\n" + rules_prompt(rules, SUBAGENT_RULES_PROMPT)
+
 
 def _context_hook(job_dir: Path, event: str, context: str) -> list:
     """A hook for `event` that hands the model `context`.
@@ -630,7 +647,8 @@ def run_settings(mcp_path: Path, rules: str = "", session_context: str = "") -> 
     from NotesGraph while it works, after each tool call and when it is about
     to stop (see steer_hook.py). Also always: a PreToolUse hook that refuses
     WebFetch to a site that already failed twice in the run (fetch_guard.py).
-    With `rules`, a SubagentStart hook gives them to every subagent. With
+    Always, a SubagentStart hook tells every subagent to commit as it goes,
+    and with `rules` gives it them too (see subagent_prompt). With
     `session_context` (a task run's code map), a SessionStart hook adds it
     to the conversation.
     """
@@ -643,9 +661,7 @@ def run_settings(mcp_path: Path, rules: str = "", session_context: str = "") -> 
              "PreToolUse": [{"matcher": "WebFetch",
                              "hooks": [{"type": "command", "command": guard, "timeout": 10}]}]}
     job_dir = mcp_path.parent
-    if rules.strip():
-        hooks["SubagentStart"] = _context_hook(
-            job_dir, "SubagentStart", rules_prompt(rules, SUBAGENT_RULES_PROMPT))
+    hooks["SubagentStart"] = _context_hook(job_dir, "SubagentStart", subagent_prompt(rules))
     if session_context.strip():
         hooks["SessionStart"] = _context_hook(job_dir, "SessionStart", session_context)
     return json.dumps({"hooks": hooks})
