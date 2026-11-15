@@ -3188,6 +3188,8 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
         if ship.advance(backend, issue, ship.COMMITTED):
             typer.echo(f"📋 Task {issue.key} → {ship.COMMITTED} (PR open). It becomes "
                        f"{ship.DONE} once merged and deployed with 'wf deploy cloud'.")
+        # Not removed here: `wf done` usually runs from inside the worktree, with a session still in it.
+        typer.echo("🧹 Its worktree goes once the session ends (agent jobs) or with 'wf prune'; the branch stays.")
     else:
         typer.echo(f"⚠️  Nothing was committed for {issue.key}, so it stays where it is. "
                    f"A task is {ship.DONE} only once committed, merged and deployed.")
@@ -3217,6 +3219,31 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                     typer.echo("📢 Posted task completion to Slack")
             else:
                 typer.echo("❌ Invalid webhook URL. Slack notification skipped.")
+
+@app.command()
+def prune(dry_run: bool = typer.Option(False, "--dry-run", help="List what would be removed, remove nothing"),
+          repo_path: str = typer.Option(None, "--repo-path", help="Only this repository (default: every configured one)"),
+          verbose: bool = typer.Option(False, "-v", "--verbose", help="Also list the worktrees kept, and why"),
+          all_worktrees: bool = typer.Option(False, "--all", help="Include worktrees not made by wf start "
+                                                                  "(their ignored files, e.g. .env, are lost)")):
+    """Remove task worktrees whose branch is pushed and has a PR up.
+
+    A worktree stays if it has uncommitted or unpushed work, has no open or
+    merged PR, or an AI session is running in it. Branches are kept; `wf start`
+    recreates the worktree if the task is picked up again. Safe to run from a
+    nightly job.
+    """
+    from workflow import worktree_prune
+    results = worktree_prune.prune([repo_path] if repo_path else None, dry_run=dry_run,
+                                   any_worktree=all_worktrees)
+    removed = [r for r in results if r[2] is None]
+    for path, branch, reason in results:
+        if reason is None:
+            typer.echo(f"{'Would remove' if dry_run else '🧹 Removed'} {path} ({branch})")
+        elif verbose:
+            typer.echo(f"   Kept {path} ({branch or 'no branch'}): {reason}")
+    typer.echo(f"{len(removed)} worktree(s) {'to remove' if dry_run else 'removed'}, "
+               f"{len(results) - len(removed)} kept.")
 
 @app.command()
 def shelve(repo_path: str = typer.Option(None, help="Repository path")):

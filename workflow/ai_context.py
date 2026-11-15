@@ -144,6 +144,12 @@ changes on this branch, then run
 That pushes the branch, opens a PR and moves the task to Committed. Don't
 stop before this.
 
+Make `wf done` your last step in this checkout. Once the PR is up and the
+branch has no uncommitted or unpushed work, the worktree is removed: by the
+job runner when a background session ends, or by `wf prune` (run by hand
+from the main checkout, or on a schedule). The branch stays. Don't
+leave anything you need in the worktree that isn't committed and pushed.
+
 The title and description are for a reviewer who hasn't seen this task or
 your session. The title says what the change does, in under 70 characters
 (the task key is added in front). The description says what changed and

@@ -813,6 +813,11 @@ def unshelve_changes(repo_path: Optional[str] = None) -> bool:
         return False
 
 
+def safe_branch_dirname(branch_name: str) -> str:
+    """The branch name as a worktree directory suffix: special characters to "_", at most 50 long."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in branch_name)[:50]
+
+
 def get_worktree_path(repo_path: str, branch_name: str) -> str:
     """Generate a worktree path for a branch in a neighboring directory.
     
@@ -829,12 +834,7 @@ def get_worktree_path(repo_path: str, branch_name: str) -> str:
     parent_dir = repo_path.parent
     repo_name = repo_path.name
     
-    # Create a sanitized branch name for the directory
-    # Remove special characters and limit length
-    safe_branch = "".join(c if c.isalnum() or c in "-_" else "_" for c in branch_name)
-    safe_branch = safe_branch[:50]  # Limit length
-    
-    worktree_name = f"{repo_name}-{safe_branch}"
+    worktree_name = f"{repo_name}-{safe_branch_dirname(branch_name)}"
     worktree_path = parent_dir / worktree_name
     
     # If path exists, add a number suffix

@@ -862,6 +862,21 @@ def _drop_worktree_if_empty(job_dir: Path) -> None:
     _git("-C", str(tree), "worktree", "remove", str(tree))
 
 
+def _drop_task_worktree(workdir: Path) -> None:
+    """Remove a workflow job's task worktree once its PR is up.
+
+    Only after the session has ended (the agent runs `wf done` from inside
+    it), and only when nothing would be lost: see worktree_prune. The branch
+    stays, so a later run on the task gets the worktree back.
+    """
+    from workflow.worktree_prune import prune_task_worktree
+
+    try:
+        prune_task_worktree(str(workdir))
+    except Exception:
+        pass
+
+
 def _task_title(job: Job) -> str:
     """A ticket title for a job: the note item it is about, as the server
     names it, else the first line of its instructions.
@@ -1186,6 +1201,8 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             if repo_path:
                 from workflow.pid_manager import remove_ai_pid_file
                 remove_ai_pid_file(repo_path)
+            if job.model == WORKFLOW_MODEL and workdir is not None and workdir != job_dir:
+                _drop_task_worktree(workdir)
 
 
 def _watch(job: Job, job_dir: Path, timeout: Optional[int],
