@@ -3465,6 +3465,7 @@ def ai_mcp_config():
         ("list_git_branches", "List available git branches"),
         ("get_current_git_branch", "Get the current git branch"),
         ("list_assigned_tasks", "List Jira tasks assigned to you"),
+        ("create_task", "Create a task in a project's backend"),
         ("list_hooks", "List all configured hooks"),
         ("add_hook", "Add a new hook"),
         ("remove_hook", "Remove a hook"),
@@ -6055,7 +6056,10 @@ def task_create(
     labels: str = typer.Option(None, "--labels", "-l", help="Comma-separated labels"),
     template: str = typer.Option(None, "--template", help="Use a template (bug, feature, task)"),
     project: str = typer.Option(None, "--project", help="Project to create it in (default: the session's project "
-                                                          "from wf ai, else the folder's, else the current one)")
+                                                          "from wf ai, else the folder's, else the current one)"),
+    journal: Optional[bool] = typer.Option(None, "--journal/--no-journal",
+                                           help="Also add it under the project in today's NotesGraph journal "
+                                                "(default: yes inside a wf ai session)"),
 ):
     """Create a task in the project's own backend (Linear, Jira or Markdown).
 
@@ -6063,6 +6067,9 @@ def task_create(
     the one whose repositories contain the current folder, else the current project. The task is created where that
     project tracks its tasks: a Linear project gets a Linear issue in its team (PAN-123), a Jira project a Jira
     issue, a Markdown project a file under ~/.wf. It never lands in another project's store under a made-up key.
+
+    Inside a wf ai session (or with --journal) it is also listed in today's journal note in NotesGraph, under the
+    project's heading, so the day's note shows the tasks agents filed.
     """
     from workflow.projects import get_project_key
 
@@ -6078,6 +6085,7 @@ def task_create(
         if issue:
             typer.echo(f"✅ Created task: {issue.key} (from template: {template})")
             typer.echo(f"   Title: {title}")
+            _journal_task(journal, target, backend, issue, title)
             return
         typer.echo(f"❌ Template '{template}' not found")
         raise typer.Exit(1)
@@ -6110,6 +6118,24 @@ def task_create(
     typer.echo(f"   Title: {title}")
     typer.echo(f"   Type: {task_type}")
     typer.echo(f"   Priority: {priority}")
+    _journal_task(journal, target, backend, issue, title)
+
+
+def _journal_task(journal: Optional[bool], project: Optional[str], backend, issue, title: str) -> None:
+    """List a task just created in today's NotesGraph journal, when asked or inside a wf ai session.
+
+    The task exists either way, so a NotesGraph that can't be reached is a warning, not a failure."""
+    from workflow import journal as journal_notes
+
+    if not (journal if journal is not None else journal_notes.in_wf_session()):
+        return
+    try:
+        link = _issue_link(backend, issue, load_effective_config(project) if project else None)
+        done = journal_notes.record_created_task(project, issue.key, getattr(issue, "title", None) or title, link)
+    except Exception as e:
+        typer.echo(f"⚠️  Not added to today's journal: {e}", err=True)
+        return
+    typer.echo(f"   Journal: under '{done['heading']}' in {done['title']}")
 
 
 @task_app.command("list")
