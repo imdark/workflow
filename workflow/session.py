@@ -45,6 +45,65 @@ def resolve_repo(repos: dict) -> tuple:
     return (on_disk[0], "first") if on_disk else (None, "")
 
 
+class RepoNotHere(RuntimeError):
+    """The task names the repo it needs (`#repo:<name>`) and no configured repo is that one."""
+
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(
+            f"this task needs the {name} repo (#repo:{name}), which isn't configured here; "
+            f"add it with `wf config repo-add <path to {name}>` or start the task where it is")
+
+
+# The field a task carries the repo it belongs to in: `#repo:<name>` in the
+# task's own text (NotesGraph also lists it as "Properties: repo:<name>"),
+# or a "Needs repo: <name>" line. A run that finds itself in the wrong repo
+# adds it when it sets the task BLOCKED, so the next start goes there.
+_REPO_FIELD_RES = (
+    re.compile(r"(?<![\w#])#repo:([\w.-]+)", re.I),
+    re.compile(r"^Properties:.*?\brepo:([\w.-]+)", re.I | re.M),
+    re.compile(r"^\W*Needs repo:\s*([\w.-]+)", re.I | re.M),
+)
+
+# How NotesGraph names the project of the item a run was started on, in
+# the job's context (one line per item; the first is the run's own).
+NOTESGRAPH_PROJECT_RE = re.compile(r"^Project: (.+) \(projectId: ([^)\s]+)\)\s*$", re.M)
+
+
+def needed_repo(*texts: Optional[str]) -> Optional[str]:
+    """The repo name a task's text says it needs (see _REPO_FIELD_RES), else None."""
+    for text in texts:
+        for pattern in _REPO_FIELD_RES:
+            found = pattern.search(text or "")
+            if found:
+                return found.group(1).rstrip(".")
+    return None
+
+
+def task_home(*texts: Optional[str]) -> Optional[tuple]:
+    """The (wf project, repo path) a task's text routes it to, or None.
+
+    A `#repo:<name>` field wins: it is matched like a NotesGraph project
+    name (a repo's `notesgraph_project:`, its folder, a wf project's default
+    repo), and raises RepoNotHere when nothing matches, so the task is
+    refused rather than started in a repo that isn't its own. Otherwise the
+    item's "Project: <name> (projectId: <id>)" line, when a repo matches it.
+    """
+    from workflow.projects import repo_for_notesgraph_project
+
+    name = needed_repo(*texts)
+    if name:
+        home = repo_for_notesgraph_project(name, "")
+        if not home:
+            raise RepoNotHere(name)
+        return home
+    for text in texts:
+        found = NOTESGRAPH_PROJECT_RE.search(text or "")
+        if found:
+            return repo_for_notesgraph_project(found.group(1).strip(), found.group(2))
+    return None
+
+
 def task_branch_name(issue) -> str:
     """`<key>-<title>`, with anything git refuses in a branch name dashed.
 

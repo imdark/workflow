@@ -2712,23 +2712,37 @@ def start(
         # Let user select interactively
         issue = backend.select_interactively(takeover)
 
-    # Move task to in progress with custom fields
-    if issue:
-        backend.move_to_in_progress(issue, custom_fields=custom_fields)
-    else:
+    if not issue:
         typer.echo("❌ No issue selected. Exiting.")
         raise typer.Exit(1)
+
+    # The repo the task says it belongs in (#repo:<name>, or its NotesGraph
+    # project), before the task moves: tasks for one repo kept being started,
+    # and stopped, in another. A repo that isn't here refuses the start.
+    from workflow.session import RepoNotHere, configured_repos, resolve_repo, task_home
+    home = None
+    if is_git_enabled() and not repo_path:
+        try:
+            home = task_home(issue.description, issue.title)
+        except RepoNotHere as e:
+            typer.echo(f"❌ Not starting {issue.key}: {e}")
+            raise typer.Exit(1)
+
+    # Move task to in progress with custom fields
+    backend.move_to_in_progress(issue, custom_fields=custom_fields)
 
     # Remember current task locally
     set_current_task(issue)
 
     # Get repository info if git is enabled
     # Check both global repositories AND project-specific repositories
-    from workflow.session import configured_repos, resolve_repo
-    repos = configured_repos()
+    repos = configured_repos(home[0] if home else None)
 
     if is_git_enabled():
-        if not repo_path and repos:
+        if home:
+            repo_path = home[1]
+            typer.echo(f"📁 Using repository (the task's own): {repo_path}")
+        elif not repo_path and repos:
             repo_path, how = resolve_repo(repos)
             if how == "cwd match":
                 typer.echo(f"📁 Using repository (cwd match): {repo_path}")
