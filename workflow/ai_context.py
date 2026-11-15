@@ -135,6 +135,19 @@ BEFORE YOU START:
 {_repo_check(repo_path)}
 """)
 
+    # A title-only Jira ticket (PAN-1194) ran four sessions that each ended at
+    # orientation with no code: there was nothing to build from.
+    if not has_description(issue.description):
+        context_parts.append(f"""
+THIS TASK HAS NO DESCRIPTION:
+The title alone is not a spec. Unless the memory above says what to build,
+don't guess from the title and don't search for code. Set the task to
+BLOCKED (`wf task transition {issue.key} Blocked`, or update_task if this
+task lives in NotesGraph) with a comment asking for a spec: what should
+change, and how to tell it is done (`wf task comment add {issue.key} "..."`).
+Say so in your answer and stop. There is nothing for `wf done` to ship.
+""")
+
     # Agents used to stop once the code worked, leaving the branch unshipped.
     context_parts.append(f"""
 WHEN YOU ARE DONE:
@@ -202,6 +215,15 @@ def repo_name(repo_path: str = None):
         name = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
         return name[:-4] if name.endswith(".git") else name
     return Path(repo_path).name
+
+
+def has_description(description) -> bool:
+    """True when the text says something beyond whitespace and bare markdown headings.
+
+    Task templates seed an empty "## Description\\n\\n## Notes" skeleton.
+    """
+    return any(line.strip() and not line.lstrip().startswith("#")
+               for line in (description or "").splitlines())
 
 
 def _repo_check(repo_path: str = None) -> str:

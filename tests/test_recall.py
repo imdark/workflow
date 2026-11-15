@@ -166,6 +166,28 @@ def test_build_context_asks_to_check_the_repo_first(monkeypatch, tmp_path):
     assert ai_context.repo_name(None) is None
 
 
+@pytest.mark.parametrize("description, blocked", [
+    ("", True),
+    (None, True),
+    ("  \n\t", True),
+    ("## Description\n\n## Notes\n", True),
+    ("Add a ratchet so the no-copy check can't regress.", False),
+])
+def test_build_context_blocks_tasks_without_a_description(monkeypatch, description, blocked):
+    from workflow import ai_context
+
+    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None: "")
+    monkeypatch.setattr(ai_context, "get_rag", lambda: None)
+    monkeypatch.setattr(ai_context, "get_ai_instructions", lambda issue, repo: [])
+    issue = SimpleNamespace(key="PAN-1", title="no-copy check ratchet", description=description)
+
+    context = ai_context.build_context(issue)
+
+    assert ("THIS TASK HAS NO DESCRIPTION" in context) is blocked
+    if blocked:
+        assert "wf task transition PAN-1 Blocked" in context
+
+
 def test_injected_and_searched_facts_are_counted(store):
     _facts(store, "T-1", "Deploy runs on the Mac agent", "Tests use a fake upstream")
 
