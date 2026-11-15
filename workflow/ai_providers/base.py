@@ -9,6 +9,10 @@ class AIProvider(ABC):
         `project` the wf project the session belongs to (default: current)."""
         pass
 
+    def loads_wf_tools(self, args=None) -> bool:
+        """Whether run() with `args` gives the session the wf-tools MCP server."""
+        return False
+
 
 def apply_proxy_env(env=None) -> dict:
     """Route an agent launch through the capture proxy.

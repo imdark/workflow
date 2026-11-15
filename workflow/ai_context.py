@@ -1,3 +1,6 @@
+import sys
+from typing import Optional
+
 from workflow.recall import memory_block
 from workflow.git_utils import get_repo
 from workflow.rag import get_rag
@@ -75,8 +78,12 @@ def get_ai_skills(issue, repo_path=None, project=None):
     return skills
 
 
-def build_context(issue, query: str = None, repo_path: str = None):
-    """Build context using RAG for project information"""
+def build_context(issue, query: str = None, repo_path: str = None, wf_tools: bool = False):
+    """Build context using RAG for project information.
+
+    `wf_tools` says the session has the wf-tools MCP server loaded (see
+    wf_tools_server); only then does the prompt mention its tools.
+    """
     rag = get_rag()
     
     # Get AI instructions
@@ -121,7 +128,7 @@ RELEVANT PROJECT CONTEXT:
     # Small, stable memory goes in the prompt; transcripts and the full fact
     # set stay behind the search_* MCP tools listed below.
     from workflow.projects import get_current_project
-    memory = memory_block(issue.key, project=get_current_project())
+    memory = memory_block(issue.key, project=get_current_project(), wf_tools=wf_tools)
     if memory:
         context_parts.append(f"""
 MEMORY (from earlier sessions on this task):
@@ -158,10 +165,32 @@ open unnoticed:
 "{issue.key} needs no PR: close it by hand."
 """)
 
-    # Add MCP tools information
-    context_parts.append("""
+    # Only when the launcher loaded the server: sessions told about tools
+    # they did not have fell back to greps and missed the task's spec.
+    if wf_tools:
+        context_parts.append(wf_tools_section(issue.key))
+
+    return "\n".join(context_parts)
+
+
+WF_TOOLS = "wf-tools"
+
+
+def wf_tools_server() -> Optional[dict]:
+    """The wf-tools MCP server as an mcpServers entry, run by this Python;
+    None when it cannot load here (its MCP library is missing, say)."""
+    try:
+        import workflow.mcp  # noqa: F401  (same interpreter the server runs on)
+    except Exception:
+        return None
+    return {"type": "stdio", "command": sys.executable, "args": ["-m", "workflow.mcp"]}
+
+
+def wf_tools_section(task_key: str) -> str:
+    return f"""
 AVAILABLE MCP TOOLS:
-You have access to wf-tools MCP server. If Claude Desktop is configured with the wf-tools MCP server, you can use these tools:
+The wf-tools MCP server is loaded in this session (tools named
+mcp__wf-tools__<name>). Pass task_key="{task_key}" to the search tools.
 - search_task_facts: Search durable facts (decisions, constraints, preferences) recorded for this task
 - search_past_conversations: Full-text search over earlier captured agent sessions
 - get_current_task_info: Get the current active task
@@ -183,9 +212,7 @@ You have access to wf-tools MCP server. If Claude Desktop is configured with the
 
 Before redoing an investigation, search past conversations: an earlier
 session may already have the answer.
-""")
-    
-    return "\n".join(context_parts)
+"""
 
 def repo_name(repo_path: str = None):
     """The repo's name from its origin remote, else its folder; None without a path."""

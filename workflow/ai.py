@@ -42,10 +42,11 @@ def launch_ai_session(issue):
         
         # Build context with RAG
         initial_query = f"project overview structure commands for {issue.title}"
-        context = build_context(issue, initial_query, repo_path)
-        
-        print("🔄 Starting AI provider...")
         provider = get_ai_provider()
+        context = build_context(issue, initial_query, repo_path,
+                                wf_tools=provider.loads_wf_tools())
+
+        print("🔄 Starting AI provider...")
         transcript = provider.run(context, issue)
         print("💬 AI session completed")
         save_session(issue, transcript)
