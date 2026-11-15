@@ -371,9 +371,12 @@ def create_branch(issue, base, repo_path: Optional[str] = None, skip_uncommitted
         current_branch = repo.active_branch.name
         changes_summary = get_uncommitted_changes_summary(repo_path)
         
+        if not sys.stdin.isatty():
+            raise RuntimeError(f"{repo_path or 'This checkout'} has uncommitted changes ({changes_summary}) on "
+                               f"'{current_branch}'; start with --worktree, or commit them first")
         console.print(f"⚠️  You have {changes_summary} changes on branch '{current_branch}'")
         console.print("📝 Switching branches will lose these changes if not committed.")
-        
+
         proceed = Prompt.ask(
             "Do you want to continue anyway, shelve changes, or cancel?",
             choices=["y", "s", "n"],
@@ -474,6 +477,26 @@ def base_ref(base_branch: str, repo_path: Optional[str] = None) -> str:
             continue
     raise RuntimeError(f"Base branch '{base_branch}' exists neither as origin/{base_branch} nor locally in "
                        f"{repo_path or 'this repo'}; fetch it, or name the branch the PR goes into with --base")
+
+
+def fetch_base(base_branch: str, repo_path: Optional[str] = None) -> Optional[str]:
+    """Bring origin/<base> up to date before a task branches from it, and the local <base> with it
+    (`git fetch origin stage:stage`) when that branch exists and can fast-forward; a local base that is
+    checked out somewhere or has diverged is left alone. Returns why the fetch failed, else None."""
+    if not has_origin_remote(repo_path):
+        return None
+    repo = get_repo(repo_path)
+    if base_branch in get_available_branches(repo_path):
+        try:
+            repo.git.fetch("origin", f"{base_branch}:{base_branch}")
+            return None
+        except Exception:
+            pass
+    try:
+        repo.git.fetch("origin", base_branch)
+        return None
+    except Exception as e:
+        return str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
 
 
 def has_diff_with_base(repo_path: Optional[str] = None, base_branch: Optional[str] = None):

@@ -2651,6 +2651,24 @@ def ask_worktree(question: str, answer: Optional[bool], interactive: Optional[bo
     return Confirm.ask(question, default=True)
 
 
+def run_by_agent() -> bool:
+    """`wf start` from an agent's shell: no terminal to ask on, or a Claude Code session (it sets CLAUDECODE)."""
+    return not sys.stdin.isatty() or bool(os.environ.get("CLAUDECODE"))
+
+
+def worktree_for_checkout(repo_path: str, dirty: bool, answer: Optional[bool], agent: bool) -> bool:
+    """Whether `wf start` puts the task in a worktree rather than switching the branch of the checkout at
+    `repo_path`. A dirty checkout asks (yes without a terminal); an agent gets one either way, so it never
+    checks out in the main checkout. --no-worktree (`answer` False) still keeps it in the checkout."""
+    if dirty:
+        return ask_worktree(f"{repo_path} has uncommitted changes. Create a worktree instead of switching its branch?",
+                            answer, interactive=not agent)
+    if agent and answer is not False:
+        typer.echo("Create a worktree? yes (run by an agent)")
+        return True
+    return bool(answer)
+
+
 @app.command()
 def start(
     task: str = typer.Argument(
@@ -2663,7 +2681,7 @@ def start(
     repo_path: str = typer.Option(None, help="Repository path to work on"),
     worktree: Optional[bool] = typer.Option(
         None, "--worktree/--no-worktree",
-        help="Answer the worktree question up front (asked when another AI session is working, or the repo has uncommitted changes; without a terminal it's yes)",
+        help="Answer the worktree question up front (asked when another AI session is working, or the repo has uncommitted changes; run by an agent it's yes)",
     ),
     # Dynamic custom fields will be handled via kwargs
 ):
@@ -2751,7 +2769,7 @@ def start(
         ai_active = False
         ai_session_info = None
         worktree_path = None
-        use_worktree = False
+        use_worktree = None      # not asked yet
         same_issue_active = False
         any_ai_active = False
         
@@ -2801,25 +2819,22 @@ def start(
             typer.echo(f"❌ {e}")
             raise typer.Exit(1)
         
-        # Check for uncommitted changes on non-default branch (someone is working)
+        # Branch from the base as origin has it now (and the local base too, when that can fast-forward)
+        from workflow.git_utils import fetch_base
+        fetch_problem = fetch_base(branch_base, repo_path) if repo_path else None
+        if fetch_problem:
+            typer.echo(f"⚠️  Could not fetch {branch_base} from origin; branching from what is here. {fetch_problem}")
+
+        # Uncommitted changes in the checkout, on any branch, stay where they are: switching its branch
+        # would carry them along or stop at a prompt
         has_changes = has_uncommitted_changes(repo_path) if repo_path else False
-        current_branch = None
-        if has_changes and repo_path:
-            from workflow.git_utils import get_repo
-            repo = get_repo(repo_path)
-            current_branch = repo.active_branch.name
-            default_branches = ["main", "master", "develop", "dev"]
-            is_on_default = any(current_branch.lower() == b.lower() for b in default_branches) or current_branch == branch_base
-            
-            if not is_on_default and not use_worktree:
-                typer.echo(f"⚠️  You have uncommitted changes on branch '{current_branch}'")
-                use_worktree = ask_worktree(
-                    f"You're currently on '{current_branch}' with uncommitted changes. Create a worktree instead?",
-                    worktree,
-                )
-        
+        if has_changes:
+            typer.echo(f"⚠️  Uncommitted changes in {repo_path}: {get_uncommitted_changes_summary(repo_path)}")
+        if use_worktree is None and repo_path:
+            use_worktree = worktree_for_checkout(repo_path, has_changes, worktree, run_by_agent())
+
         try:
-            if use_worktree and (ai_active or same_issue_active or any_ai_active or (has_changes and current_branch and current_branch != branch_base)):
+            if use_worktree:
                 # Create a worktree for the task's branch, with its commit prefix
                 from workflow.session import start_in_worktree
                 worktree_path = start_in_worktree(issue, repo_path, branch_base)
