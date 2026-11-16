@@ -2503,18 +2503,19 @@ def skill_install_cmd(
     names: List[str] = typer.Argument(None, help="Skills to install (default: all in claude/skills)"),
     force: bool = typer.Option(False, "--force", help="Replace a same-named skill that isn't ours"),
 ):
-    """Link the skills this repo ships into ~/.claude/skills for every Claude session"""
+    """Link the skills this repo ships into ~/.claude/skills, and each project's Claude account, for every session"""
     from workflow import skill_install
 
-    result = skill_install.install(force=force, names=names or None)
-    for name in result.linked:
-        typer.echo(f"✅ Linked {name} → {skill_install.USER_SKILLS / name}")
-    for name in result.current:
-        typer.echo(f"   {name} already installed")
-    for name in result.skipped:
-        typer.echo(f"⚠️  {name}: {skill_install.USER_SKILLS / name} exists and isn't ours "
-                   "(--force to replace it)")
-    if not (result.linked or result.current or result.skipped):
+    any_skill = False
+    for dest, result in skill_install.install_everywhere(force=force, names=names or None):
+        any_skill = any_skill or bool(result.linked or result.current or result.skipped)
+        for name in result.linked:
+            typer.echo(f"✅ Linked {name} → {dest / name}")
+        if result.current:
+            typer.echo(f"   {len(result.current)} already installed in {dest}")
+        for name in result.skipped:
+            typer.echo(f"⚠️  {name}: {dest / name} exists and isn't ours (--force to replace it)")
+    if not any_skill:
         typer.echo("ℹ️  No skills to install")
 
 
