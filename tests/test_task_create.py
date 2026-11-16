@@ -181,3 +181,43 @@ def test_a_template_on_a_linear_project_is_refused(world):
     assert r.exit_code == 1 and "Templates exist for markdown projects only" in r.output
     r = _create("--project", "personal", "--template", "bug")
     assert r.exit_code == 0 and "personal-T" in r.output
+
+
+@pytest.fixture
+def two_repos(world):
+    """personal owns notes-graph and workflow, like the real config: one wf project, two journal headings."""
+    for name in ("notes-graph", "workflow"):
+        (world.root / name).mkdir()
+    cfg = yaml.safe_load((world.root / "config.yaml").read_text())
+    cfg["projects"]["personal"]["repositories"] = {str(world.root / "notes-graph"): {},
+                                                   str(world.root / "workflow"): {}}
+    (world.root / "config.yaml").write_text(yaml.dump(cfg))
+    return world
+
+
+def test_repo_files_the_task_under_that_repos_heading_and_tags_it_to_start_there(two_repos, notes, monkeypatch):
+    # Filed from a notes-graph session, for the workflow repo of the same project.
+    monkeypatch.chdir(two_repos.root / "notes-graph")
+    monkeypatch.setenv(projects.PROJECT_ENV, "personal")
+    r = _create("--repo", "workflow")
+    assert r.exit_code == 0, r.output
+    day = notes.notes[date.today().isoformat()]
+    assert "## workflow\n\n- [ ] older\n- [ ] PERSONAL-7 E2E harness #repo:workflow\n" in day
+    assert "Journal: under 'workflow'" in r.output
+    created = two_repos.made[-1][1].created[0]
+    assert created["description"] == "why\n\n#repo:workflow"     # so `wf start` goes to that repo too
+
+
+def test_repo_alone_picks_the_project_that_owns_it(two_repos, notes, monkeypatch):
+    monkeypatch.chdir(two_repos.root / "robots")                  # a work-project folder
+    r = _create("--repo", "workflow", "--journal")
+    assert r.exit_code == 0, r.output
+    assert two_repos.made[-1][0] == "markdown" and "PERSONAL-7" in r.output
+
+
+def test_a_repo_that_isnt_configured_or_isnt_the_projects_is_refused_before_anything_is_created(two_repos):
+    r = _create("--repo", "nope")
+    assert r.exit_code == 1 and "No configured repo named 'nope'" in r.output
+    r = _create("--repo", "workflow", "--project", "work")
+    assert r.exit_code == 1 and "'workflow' belongs to project 'personal', not 'work'" in r.output
+    assert two_repos.made == []

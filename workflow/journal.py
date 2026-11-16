@@ -97,17 +97,18 @@ def _session_repo(repos: dict) -> Optional[str]:
     return None
 
 
-def journal_heading(project: Optional[str]) -> str:
+def journal_heading(project: Optional[str], repo: Optional[str] = None) -> str:
     """The journal heading for a task in `project`: the NotesGraph project of
-    the repo the session is in (`notesgraph_project:` in its config, else the
-    repo's folder name), else of the project's default repo, else the
-    project's name."""
+    `repo` when given (a task filed for another repo), else of the repo the
+    session is in (`notesgraph_project:` in its config, else the repo's
+    folder name), else of the project's default repo, else the project's
+    name."""
     from workflow.config import get_repositories
     from workflow.projects import get_project
 
     conf = get_project(project) if project else None
     repos = dict((conf or {}).get("repositories") or {}) if project else dict(get_repositories() or {})
-    repo = _session_repo(repos) or (conf or {}).get("default_repo") or next(iter(repos), None)
+    repo = repo or _session_repo(repos) or (conf or {}).get("default_repo") or next(iter(repos), None)
     if repo:
         repo_conf = repos.get(repo) if isinstance(repos.get(repo), dict) else {}
         return str(repo_conf.get("notesgraph_project") or "") or Path(repo).name
@@ -127,12 +128,19 @@ def record_task(reader, heading: str, line: str, day: Optional[date] = None) -> 
 
 
 def record_created_task(project: Optional[str], key: str, title: str, url: Optional[str] = None,
-                        reader=None) -> dict:
-    """record_task for a task wf just created, with the heading from journal_heading."""
+                        reader=None, repo: Optional[str] = None, repo_tag: Optional[str] = None) -> dict:
+    """record_task for a task wf just created, with the heading from journal_heading.
+
+    `repo` (a path) files it under that repo's heading; `repo_tag` ends the
+    line with `#repo:<name>`, which starting the task reads to go to that repo.
+    """
     if reader is None:
         from workflow.cli_notes import reader_from_env
 
         reader = reader_from_env()
-    heading = journal_heading(project)
-    result = record_task(reader, heading, task_line(key, title, url))
+    heading = journal_heading(project, repo)
+    line = task_line(key, title, url)
+    if repo_tag:
+        line = f"{line} #repo:{repo_tag}"
+    result = record_task(reader, heading, line)
     return {**result, "heading": heading}
