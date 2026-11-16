@@ -717,7 +717,7 @@ def started(tmp_path, monkeypatch):
     calls = {"saved": 0}
     monkeypatch.setattr("workflow.deploy.jobs.start_job_task",
                         lambda j, d, c: (issue, d, None))
-    monkeypatch.setattr("workflow.deploy.jobs._job_context", lambda i, j, w: "go")
+    monkeypatch.setattr("workflow.deploy.jobs._job_context", lambda i, j, w, wf_tools=False: "go")
     monkeypatch.setattr("workflow.deploy.jobs._save_session",
                         lambda i, d, w: calls.__setitem__("saved", calls["saved"] + 1))
     monkeypatch.setattr("workflow.ai_providers.claude.skills_plugin_dir", lambda *a: None)
@@ -762,6 +762,37 @@ def test_without_a_question_the_limit_still_applies(tmp_path, monkeypatch, start
     with pytest.raises(RuntimeError, match="exceeded 1s"):
         run_job(job(model="workflow"), config={}, timeout=1, use_tmux=False, client=client(),
                 tick_seconds=0.1)
+
+
+def test_a_workflow_job_loads_wf_tools_and_its_prompt_says_so(tmp_path, monkeypatch, started):
+    seen = {}
+    monkeypatch.setattr("workflow.deploy.jobs._job_context",
+                        lambda i, j, w, wf_tools=False: seen.setdefault("prompt_tools", wf_tools) and "go")
+    def fake_argv(j, prompt, job_dir, c, plugin_dir=None, **kw):
+        seen["argv"] = claude_code_argv(j, prompt or "go", job_dir, c, plugin_dir, **kw)[0]
+        return [sys.executable, "-c", "print('done')"], {}
+    monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv", fake_argv)
+
+    run_job(job(model="workflow"), config={}, use_tmux=False, client=client(), tick_seconds=0.05)
+
+    assert seen["prompt_tools"] is True
+    allowed = next(a for a in seen["argv"] if a.startswith("--allowedTools="))
+    assert "mcp__wf-tools__search_task_facts" in allowed
+    assert "mcp__wf-tools__search_past_conversations" in allowed
+
+
+def test_without_wf_tools_the_job_prompt_leaves_them_out(tmp_path, monkeypatch, started):
+    seen = {}
+    monkeypatch.setattr("workflow.ai_context.wf_tools_server", lambda: None)
+    monkeypatch.setattr("workflow.deploy.jobs._job_context",
+                        lambda i, j, w, wf_tools=False: seen.setdefault("prompt_tools", wf_tools) or "go")
+    monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv",
+                        lambda *a, **kw: seen.setdefault("mcp", kw.get("extra_mcp"))
+                        or ([sys.executable, "-c", "print('done')"], {}))
+
+    run_job(job(model="workflow"), config={}, use_tmux=False, client=client(), tick_seconds=0.05)
+
+    assert seen == {"prompt_tools": False, "mcp": None}
 
 
 def test_claude_code_has_no_turn_limit(tmp_path):
@@ -1018,7 +1049,7 @@ def test_prepare_task_hands_a_cloud_runner_the_task_its_agent_works_in(repo, wf,
     from workflow.cli_agent import agent_app
 
     monkeypatch.setattr("workflow.deploy.jobs._job_context",
-                        lambda issue, job, workdir: f"wf ai context for {issue.key}")
+                        lambda issue, job, workdir, wf_tools=False: f"wf ai context for {issue.key}")
     monkeypatch.setattr("workflow.ai_providers.claude.skills_plugin_dir",
                         lambda issue, key, task_dir, repo_path: tmp_path / "plugin")
     job_dir = tmp_path / "jobs" / "job-1234"

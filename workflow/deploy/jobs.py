@@ -653,6 +653,20 @@ def run_settings(mcp_path: Path, rules: str = "", session_context: str = "") -> 
     return json.dumps({"hooks": hooks})
 
 
+WF_TOOLS = "wf-tools"
+# Read-only, so allowed without asking; the rest still go through approve.
+WF_TOOLS_ALLOWED = [f"mcp__{WF_TOOLS}__{name}" for name in
+                    ("search_task_facts", "search_past_conversations")]
+
+
+def wf_tools_mcp() -> Optional[dict]:
+    """{"wf-tools": server} for a task run's MCP config, or None when the
+    server cannot load on this runner (the prompt then leaves it out)."""
+    from workflow.ai_context import wf_tools_server
+    server = wf_tools_server()
+    return {WF_TOOLS: server} if server else None
+
+
 def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                      client: "JobClient", plugin_dir: Optional[Path] = None,
                      extra_mcp: Optional[dict] = None,
@@ -717,6 +731,10 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     system_prompt = with_agent_rules(profile.get("systemPrompt") or (
         CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else "")), rules)
     allowed = list(profile.get("allowedTools") or [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])])
+    # wf-tools' read-only searches, whatever the profile allows: the task
+    # prompt tells the agent to start with them.
+    if WF_TOOLS in (extra_mcp or {}):
+        allowed += [tool for tool in WF_TOOLS_ALLOWED if tool not in allowed]
     # The automation's tools are the profile owner's own commands: allowed
     # without asking, like NotesGraph's (the cloud runner does the same).
     if tools_spec and "mcp__automation" not in allowed:
@@ -955,11 +973,12 @@ def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
     return issue, job_dir, repo_path
 
 
-def _job_context(issue, job: Job, workdir: Path) -> str:
-    """The prompt `wf ai` would build for the task, or the job's own."""
+def _job_context(issue, job: Job, workdir: Path, wf_tools: bool = False) -> str:
+    """The prompt `wf ai` would build for the task, or the job's own.
+    `wf_tools` says the agent has the wf-tools server (see wf_tools_mcp)."""
     try:
         from workflow.ai_context import build_context
-        return build_context(issue, repo_path=str(workdir))
+        return build_context(issue, repo_path=str(workdir), wf_tools=wf_tools)
     except Exception:
         return _prompt(job)
 
@@ -1149,10 +1168,12 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             claude_env = apply_claude_env(dict(os.environ), home[0] if home else None)
             automation, tools_spec, _ = prepare_automation(job, job_dir, cwd or Path.cwd(), workdir)
             resume = checkpoint.resumable(interrupted, job_dir, workdir, claude_env)
+            wf_tools = wf_tools_mcp()
             argv, env = claude_code_argv(
-                job, checkpoint.RESUME_PROMPT if resume else _job_context(issue, job, workdir),
+                job, checkpoint.RESUME_PROMPT if resume
+                else _job_context(issue, job, workdir, wf_tools=bool(wf_tools)),
                 job_dir, client, plugin_dir, rules=rules,
-                session_context=map_context(workdir), resume=resume, tools_spec=tools_spec)
+                extra_mcp=wf_tools, session_context=map_context(workdir), resume=resume, tools_spec=tools_spec)
             env.update(claude_env)
         else:
             provider, argv = _provider_argv(job, config)

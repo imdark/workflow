@@ -3381,7 +3381,8 @@ def ai(
         context = None
         say("🤖 Resuming AI session...")
     elif issue:
-        context = build_context(issue, repo_path=repo_path)
+        wf_tools = get_ai_provider(session_project).loads_wf_tools(claude_args)
+        context = build_context(issue, repo_path=repo_path, wf_tools=wf_tools)
         say("🤖 Starting AI session...")
     elif prints_once(claude_args):
         context = None  # one answer, no task lifecycle to explain
