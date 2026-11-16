@@ -53,3 +53,26 @@ def test_leaves_someone_elses_skill_unless_forced(source, dest):
 def test_installs_only_named_skills(source, dest):
     assert skill_install.install(source, dest, names=["beta"]).linked == ["beta"]
     assert not (dest / "alpha").exists()
+
+
+def test_skill_dirs_cover_every_projects_claude_profile(tmp_path, monkeypatch):
+    # A project with its own Claude account reads skills from <config dir>/skills, not ~/.claude/skills.
+    monkeypatch.setattr(skill_install, "USER_SKILLS", tmp_path / ".claude" / "skills")
+    cfg = {"projects": {"personal": {"claude_config_dir": str(tmp_path / ".claude-personal")},
+                        "work": {"claude_config_dir": str(tmp_path / ".claude-work")},
+                        "plain": {},
+                        "again": {"claude_config_dir": str(tmp_path / ".claude-personal")}}}
+    assert skill_install.skill_dirs(cfg) == [tmp_path / ".claude" / "skills",
+                                             tmp_path / ".claude-personal" / "skills",
+                                             tmp_path / ".claude-work" / "skills"]
+
+
+def test_install_everywhere_links_into_each_profile(source, tmp_path, monkeypatch):
+    monkeypatch.setattr(skill_install, "USER_SKILLS", tmp_path / ".claude" / "skills")
+    cfg = {"projects": {"personal": {"claude_config_dir": str(tmp_path / ".claude-personal")}}}
+    results = skill_install.install_everywhere(source, cfg=cfg)
+    assert [(dest, r.linked) for dest, r in results] == [
+        (tmp_path / ".claude" / "skills", ["alpha", "beta"]),
+        (tmp_path / ".claude-personal" / "skills", ["alpha", "beta"]),
+    ]
+    assert (tmp_path / ".claude-personal" / "skills" / "alpha").resolve() == (source / "alpha").resolve()
