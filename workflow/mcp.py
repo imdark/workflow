@@ -141,6 +141,30 @@ def list_assigned_tasks() -> str:
 
 
 @mcp.tool()
+def create_task(
+    title: Annotated[str, "Task title"],
+    description: Annotated[str, "What and why"] = "",
+    project: Annotated[str, "wf project to file it in (optional, defaults to the session's)"] = None,
+) -> str:
+    """Create a task in the project's own backend, as `wf task create` does, and list it under the project in
+    today's NotesGraph journal when called from a wf ai session"""
+    import shutil
+    import sys
+
+    wf = shutil.which("wf")
+    command = [wf] if wf else [sys.executable, "-m", "workflow.cli"]
+    command += ["task", "create", title, "--description", description]
+    if project:
+        command += ["--project", project]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"Error: {e}"
+    output = (result.stdout + result.stderr).strip()
+    return output if result.returncode == 0 else f"Error: {output}"
+
+
+@mcp.tool()
 def list_hooks() -> str:
     """List all configured hooks"""
     try:

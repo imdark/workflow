@@ -170,6 +170,7 @@ You have access to wf-tools MCP server. If Claude Desktop is configured with the
 - list_git_branches: List available git branches
 - get_current_git_branch: Get the current git branch
 - list_assigned_tasks: List Jira tasks assigned to you
+- create_task: Create a task in a project's backend (title, description?, project?), as `wf task create` does
 - list_hooks: List all configured hooks
 - add_hook: Add a new hook (name, trigger, action, success_hook?, fail_hook?, condition?)
 - remove_hook: Remove a hook

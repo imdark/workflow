@@ -5,6 +5,9 @@ name. The project comes from --project, else the session's (WF_PROJECT), else th
 """
 from __future__ import annotations
 
+import json
+from datetime import date
+
 import pytest
 import yaml
 from typer.testing import CliRunner
@@ -53,6 +56,8 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr("workflow.state.STATE", state)
     state.write_text(yaml.dump({"current_project": "personal"}))
     monkeypatch.delenv(projects.PROJECT_ENV, raising=False)
+    for name in ("NOTESGRAPH_WORKSPACE", "NOTESGRAPH_URL", "NOTESGRAPH_TOKEN"):   # never the real workspace
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path / "elsewhere")
     made = []
 
@@ -110,6 +115,65 @@ def test_labels_on_a_linear_project_are_said_to_be_unsupported_not_dropped_silen
 def test_an_unknown_project_is_refused_before_anything_is_created(world):
     r = _create("--project", "nope")
     assert r.exit_code == 1 and "No project named 'nope'" in r.output and world.made == []
+
+
+class FakeNotes:
+    """A NotesGraph workspace of notes keyed by title, enough for upsert_note."""
+
+    def __init__(self, notes=None):
+        self.notes = dict(notes or {})
+        self.calls = []
+
+    def find(self, title):
+        return {"docId": title, "title": title} if title in self.notes else None
+
+    def read(self, doc_id):
+        return self.notes[doc_id]
+
+    def call(self, tool, args):
+        self.calls.append(tool)
+        if tool == "create_document":
+            self.notes[args["title"]] = args["content"]
+            return json.dumps({"docId": args["title"]})
+        self.notes[args["docId"]] = args["content"]
+        return "{}"
+
+
+@pytest.fixture
+def notes(monkeypatch):
+    fake = FakeNotes({date.today().isoformat(): "## Work\n\n- [ ] \n\n## workflow\n\n- [ ] older\n\n### todos:\n"})
+    monkeypatch.setattr("workflow.cli_notes.reader_from_env", lambda: fake)
+    return fake
+
+
+def test_a_task_made_in_a_wf_ai_session_is_listed_in_todays_journal_under_its_repo(world, notes, monkeypatch):
+    workflow_repo = world.root / "workflow"
+    workflow_repo.mkdir()
+    cfg = yaml.safe_load((world.root / "config.yaml").read_text())
+    cfg["projects"]["personal"]["repositories"] = {str(workflow_repo): {}}
+    (world.root / "config.yaml").write_text(yaml.dump(cfg))
+    monkeypatch.chdir(workflow_repo)
+    monkeypatch.setenv(projects.PROJECT_ENV, "personal")
+    r = _create()
+    assert r.exit_code == 0, r.output
+    assert notes.notes[date.today().isoformat()] == (
+        "## Work\n\n- [ ] \n\n## workflow\n\n- [ ] older\n- [ ] PERSONAL-7 E2E harness\n\n### todos:\n")
+    assert "Journal: under 'workflow'" in r.output
+
+
+def test_outside_a_session_the_journal_is_left_alone_unless_asked(world, notes):
+    assert _create("--project", "personal").exit_code == 0
+    assert notes.calls == []
+    r = _create("--project", "personal", "--journal")
+    assert r.exit_code == 0, r.output
+    assert "- [ ] PERSONAL-7 E2E harness" in notes.notes[date.today().isoformat()]
+
+
+def test_a_session_task_with_no_reachable_notesgraph_is_still_created(world, monkeypatch):
+    monkeypatch.setenv(projects.PROJECT_ENV, "personal")
+    r = _create()
+    assert r.exit_code == 0 and "Created task: PERSONAL-7" in r.output
+    assert "Not added to today's journal" in r.output
 
 
 def test_a_template_on_a_linear_project_is_refused(world):
