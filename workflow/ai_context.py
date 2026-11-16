@@ -214,7 +214,9 @@ code, check that the task's feature belongs to this repo. If it plainly
 belongs to another one (say, an app feature in a tooling repo), don't search
 here and don't run `wf done`: this branch has nothing to ship. Set the task
 to BLOCKED with a note naming the repo it needs (update_task, if you have
-the NotesGraph tools), say so in your answer, and stop."""
+the NotesGraph tools), and add `#repo:<name>` (the repo's folder name) to the
+end of the task's own text with update_block: the next start reads it and
+goes to that repo. Say so in your answer, and stop."""
 
 
 def format_retrieved_context(chunks: list) -> str:

@@ -467,8 +467,10 @@ def job_rules_scope(job: "Job", home: Optional[tuple] = None) -> dict:
     agents: the agent's name and id. Note and project tags aren't in the
     job, so they don't count here.
     """
+    from workflow.session import NOTESGRAPH_PROJECT_RE
+
     context = job.context or ""
-    projects = [m.group(1).strip() for m in _NOTESGRAPH_PROJECT_RE.finditer(context)]
+    projects = [m.group(1).strip() for m in NOTESGRAPH_PROJECT_RE.finditer(context)]
     tags = []
     for found in _CONTEXT_TAGS_RE.finditer(context):
         tags += [t.strip() for t in found.group(1).split(",") if t.strip()]
@@ -876,28 +878,27 @@ def _task_title(job: Job) -> str:
     return job.agent_name or f"Agent job {job.id[:8]}"
 
 
-# How NotesGraph names the project of the item a run was started on, in
-# the job's context (one line per item; the first is the run's own).
-_NOTESGRAPH_PROJECT_RE = re.compile(r"^Project: (.+) \(projectId: ([^)\s]+)\)\s*$", re.M)
-
-
-def job_home(job: Job) -> Optional[tuple]:
-    """The (wf project, repo) for the NotesGraph project the job's item is
-    in, or None when it names none or no configured repo matches.
+def job_home(job: Job, strict: bool = False) -> Optional[tuple]:
+    """The (wf project, repo) the job's item belongs in (`session.task_home`):
+    the repo its `#repo:<name>` field names, else the one matching its
+    NotesGraph project; None when neither matches.
 
     Without it a job ran in whichever repo the runner was started in, so a
     NotesGraph task filed under "notes graph" was worked on in wf's repo.
+    `strict` (a job that works in a repo) raises session.RepoNotHere when
+    the item names a repo this machine doesn't have, so the job fails
+    saying which repo instead of running, and stopping, in the wrong one.
     """
-    from workflow.projects import repo_for_notesgraph_project
+    from workflow.session import RepoNotHere, task_home
 
-    for text in (job.context, job.instructions):
-        found = _NOTESGRAPH_PROJECT_RE.search(text or "")
-        if found:
-            try:
-                return repo_for_notesgraph_project(found.group(1).strip(), found.group(2))
-            except Exception:
-                return None
-    return None
+    try:
+        return task_home(job.context, job.instructions)
+    except RepoNotHere:
+        if strict:
+            raise
+        return None
+    except Exception:
+        return None
 
 
 def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
@@ -924,7 +925,7 @@ def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
     from workflow.session import (base_branch_for, configured_repos,
                                   resolve_repo, start_in_worktree)
 
-    project, home_repo = job_home(job) or (None, None)
+    project, home_repo = job_home(job, strict=True) or (None, None)
     backend = get_backend(load_effective_config(project))
     task_file = job_dir / "task.json"
     issue = None
@@ -1098,7 +1099,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     profiled = is_profiled_claude_job(job)
     with _SETUP_LOCK:
         claude_job = job.model in CLAUDE_MODELS or profiled
-        found_home = job_home(job) if claude_job else None
+        found_home = job_home(job, strict=job.model == CLAUDE_CODE_MODEL) if claude_job else None
         if claude_job:
             if client is None:
                 raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")

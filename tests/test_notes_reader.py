@@ -299,7 +299,7 @@ def test_run_job_hands_the_agent_the_sections_for_its_item(tmp_path, monkeypatch
     monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
     monkeypatch.setattr("workflow.deploy.jobs._watch",
                         lambda *a: {"result": "", "steps": 1, "session": None})
-    monkeypatch.setattr("workflow.deploy.jobs.job_home", lambda job: None)
+    monkeypatch.setattr("workflow.deploy.jobs.job_home", lambda job, strict=False: None)
     plain = tmp_path / "plain"
     plain.mkdir()
     with FakeMcp(scoped_notes()) as mcp:
