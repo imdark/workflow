@@ -593,7 +593,7 @@ def test_claude_code_gets_notesgraph_and_a_way_to_ask(tmp_path):
     # Steering: hooks that read the run's connection from that file, so the
     # token stays off the command line.
     hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
-    assert set(hooks) == {"PostToolUse", "Stop", "PreToolUse"}
+    assert set(hooks) == {"PostToolUse", "Stop", "PreToolUse", "SubagentStart"}
     command = hooks["PostToolUse"][0]["hooks"][0]["command"]
     assert "workflow.deploy.steer_hook" in command and str(tmp_path / "mcp.json") in command
     assert "Bearer" not in argv[argv.index("--settings") + 1]
@@ -612,9 +612,22 @@ def test_rules_reach_subagents_and_the_code_map_reaches_the_session(tmp_path):
         assert text in out["hookSpecificOutput"]["additionalContext"]
 
 
-def test_no_rules_no_subagent_hook(tmp_path):
-    argv, _ = claude_code_argv(job(), "Do it", tmp_path, client())
-    assert "SubagentStart" not in json.loads(argv[argv.index("--settings") + 1])["hooks"]
+def subagent_context(argv):
+    hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
+    command = hooks["SubagentStart"][0]["hooks"][0]["command"]
+    out = json.loads(subprocess.run(command, shell=True, capture_output=True, text=True).stdout)
+    return out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_subagents_are_told_to_commit_as_they_go_with_or_without_rules(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    bare = subagent_context(claude_code_argv(job(), "Do it", tmp_path / "a", client())[0])
+    assert "commit as you go" in bare and "Agent rules" not in bare
+
+    ruled = subagent_context(claude_code_argv(job(), "Do it", tmp_path / "b", client(),
+                                              rules="Tag tasks #work.")[0])
+    assert "commit as you go" in ruled and "Tag tasks #work." in ruled
 
 
 class FakeOmniSeek:
