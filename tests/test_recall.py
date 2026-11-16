@@ -197,7 +197,8 @@ def test_build_context_asks_to_check_the_repo_first(monkeypatch, tmp_path):
     context = ai_context.build_context(issue, repo_path=str(repo))
 
     assert "checkout of the notes-graph repo" in context
-    assert "BLOCKED" in context
+    # Work for another repo or project is filed there via the skill, after asking the user.
+    assert "file-task-elsewhere skill" in context and "wf task create --repo" in context
     # Without a remote the folder name stands in.
     subprocess.run(["git", "-C", str(repo), "remote", "remove", "origin"], check=True)
     assert ai_context.repo_name(str(repo)) == "workflow-personal-9-x"

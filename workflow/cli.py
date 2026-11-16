@@ -6117,18 +6117,41 @@ def task_create(
     journal: Optional[bool] = typer.Option(None, "--journal/--no-journal",
                                            help="Also add it under the project in today's NotesGraph journal "
                                                 "(default: yes inside a wf ai session)"),
+    repo: str = typer.Option(None, "--repo", help="The repo the task's work belongs in (its folder or NotesGraph "
+                                                  "project name), when it isn't this session's: picks the project "
+                                                  "that owns it and the journal heading, and tags the task "
+                                                  "#repo:<name> so starting it goes there"),
 ):
     """Create a task in the project's own backend (Linear, Jira or Markdown).
 
-    The project is --project, else the one this session was started for (`wf ai` / `claude` set WF_PROJECT), else
-    the one whose repositories contain the current folder, else the current project. The task is created where that
-    project tracks its tasks: a Linear project gets a Linear issue in its team (PAN-123), a Jira project a Jira
-    issue, a Markdown project a file under ~/.wf. It never lands in another project's store under a made-up key.
+    The project is --project, else the one that owns --repo, else the one this session was started for (`wf ai` /
+    `claude` set WF_PROJECT), else the one whose repositories contain the current folder, else the current project.
+    The task is created where that project tracks its tasks: a Linear project gets a Linear issue in its team
+    (PAN-123), a Jira project a Jira issue, a Markdown project a file under ~/.wf. It never lands in another
+    project's store under a made-up key.
 
     Inside a wf ai session (or with --journal) it is also listed in today's journal note in NotesGraph, under the
-    project's heading, so the day's note shows the tasks agents filed.
+    heading of its repo (--repo, else the session's), so the day's note shows the tasks agents filed.
     """
     from workflow.projects import get_project_key
+
+    repo_path = None
+    if repo:
+        from workflow.projects import repo_for_notesgraph_project
+
+        home = repo_for_notesgraph_project(repo, "")
+        if not home:
+            typer.echo(f"❌ No configured repo named '{repo}' (see `wf project list`)")
+            raise typer.Exit(1)
+        owner, repo_path = home
+        if project and owner and owner != project:
+            typer.echo(f"❌ '{repo}' belongs to project '{owner}', not '{project}'")
+            raise typer.Exit(1)
+        project = project or owner
+        # Starting the task reads this from its text, so `wf start` goes to the repo as the journal line does.
+        tag = f"#repo:{repo}"
+        if tag not in (description or ""):
+            description = f"{description}\n\n{tag}" if description else tag
 
     backend, target, backend_type = _project_backend(project)
     # the key prefix that backend wants: the Linear team / Jira project for those, the project's name for markdown
@@ -6142,7 +6165,7 @@ def task_create(
         if issue:
             typer.echo(f"✅ Created task: {issue.key} (from template: {template})")
             typer.echo(f"   Title: {title}")
-            _journal_task(journal, target, backend, issue, title)
+            _journal_task(journal, target, backend, issue, title, repo_path, repo)
             return
         typer.echo(f"❌ Template '{template}' not found")
         raise typer.Exit(1)
@@ -6175,10 +6198,11 @@ def task_create(
     typer.echo(f"   Title: {title}")
     typer.echo(f"   Type: {task_type}")
     typer.echo(f"   Priority: {priority}")
-    _journal_task(journal, target, backend, issue, title)
+    _journal_task(journal, target, backend, issue, title, repo_path, repo)
 
 
-def _journal_task(journal: Optional[bool], project: Optional[str], backend, issue, title: str) -> None:
+def _journal_task(journal: Optional[bool], project: Optional[str], backend, issue, title: str,
+                  repo_path: Optional[str] = None, repo_tag: Optional[str] = None) -> None:
     """List a task just created in today's NotesGraph journal, when asked or inside a wf ai session.
 
     The task exists either way, so a NotesGraph that can't be reached is a warning, not a failure."""
@@ -6188,7 +6212,8 @@ def _journal_task(journal: Optional[bool], project: Optional[str], backend, issu
         return
     try:
         link = _issue_link(backend, issue, load_effective_config(project) if project else None)
-        done = journal_notes.record_created_task(project, issue.key, getattr(issue, "title", None) or title, link)
+        done = journal_notes.record_created_task(project, issue.key, getattr(issue, "title", None) or title, link,
+                                                 repo=repo_path, repo_tag=repo_tag)
     except Exception as e:
         typer.echo(f"⚠️  Not added to today's journal: {e}", err=True)
         return

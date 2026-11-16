@@ -243,13 +243,12 @@ def _repo_check(repo_path: str = None) -> str:
     where = (f"This session runs in a checkout of the {name} repo." if name else
              "Find out which repo this checkout is (`git remote get-url origin`).")
     return f"""{where} Before searching for
-code, check that the task's feature belongs to this repo. If it plainly
-belongs to another one (say, an app feature in a tooling repo), don't search
-here and don't run `wf done`: this branch has nothing to ship. Set the task
-to BLOCKED with a note naming the repo it needs (update_task, if you have
-the NotesGraph tools), and add `#repo:<name>` (the repo's folder name) to the
-end of the task's own text with update_block: the next start reads it and
-goes to that repo. Say so in your answer, and stop."""
+code, check that the task's feature belongs to this repo. If it, or a
+subtask it needs, plainly belongs to another repo or project (say, an app
+feature in a tooling repo), use the file-task-elsewhere skill: it asks the
+user, files the task there with `wf task create --repo <name>` and lists it
+in today's journal. When the whole task was elsewhere, this branch has
+nothing to ship: skip `wf done`, say so in your answer, and stop."""
 
 
 def format_retrieved_context(chunks: list) -> str:
