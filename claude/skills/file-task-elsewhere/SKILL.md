@@ -17,7 +17,7 @@ A task belongs **elsewhere** when its work lives in another repo (a `wf` CLI cha
    ```
    `--repo` picks the owning project, puts the task under that repo's heading in today's journal note, and tags it `#repo:<repo>` so starting it runs in that repo. The description is for someone who hasn't seen this run: what to do and why, the source task's key, and what you already found. Done when the command prints `Created task: <KEY>` and `Journal: under '<repo heading>'`.
 4. **Close the loop on the source task** with `update_task`, naming the new key and repo.
-   - Whole task elsewhere: set the source task to BLOCKED pointing at the new key, and stop. This branch has nothing to ship, so skip `wf done`.
+   - Whole task elsewhere: set the source task to BLOCKED pointing at the new key, and stop. This branch has nothing to ship, so skip `wf done`, and end your answer with "<KEY> is blocked: do not close it." and the new key, not with a "needs no PR" line.
    - Subtask only: carry on with the rest of the work here.
 
 ## When it doesn't go through

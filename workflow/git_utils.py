@@ -901,6 +901,40 @@ def run_worktree_setup(worktree_path: str, console=None) -> Optional[bool]:
     return True
 
 
+VENV_DIR = ".venv"
+
+
+def link_venv(worktree_path: str, console=None) -> Optional[str]:
+    """Point a new worktree's `.venv` at its main checkout's, when that has one and the worktree doesn't.
+
+    Runs in fresh worktrees had no `.venv` and borrowed the main checkout's python by hand, with a hand-set
+    PYTHONPATH. The linked python still imports the worktree's own code when run from the worktree
+    (`python -m pytest`), but an editable install's entry points (`.venv/bin/wf`) run the main checkout's.
+    A symlink isn't matched by an ignore rule for the `.venv/` folder, so `/.venv` goes in the repo's
+    info/exclude, or every such worktree would look dirty. Returns the venv linked to, else None.
+    """
+    checkout = main_checkout(worktree_path)
+    if not checkout or Path(checkout).resolve() == Path(worktree_path).resolve():
+        return None
+    source, link = Path(checkout) / VENV_DIR, Path(worktree_path) / VENV_DIR
+    if not (source / "bin" / "python").exists() or link.exists() or link.is_symlink():
+        return None
+    try:
+        exclude = Path(checkout) / ".git" / "info" / "exclude"
+        lines = exclude.read_text().splitlines() if exclude.exists() else []
+        if f"/{VENV_DIR}" not in lines:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            exclude.write_text("\n".join([*lines, f"/{VENV_DIR}"]) + "\n")
+        link.symlink_to(source)
+    except OSError as e:
+        if console:
+            console.print(f"⚠️  Could not link {VENV_DIR}: {e}")
+        return None
+    if console:
+        console.print(f"🐍 Linked {VENV_DIR} to {source}")
+    return str(source)
+
+
 def create_worktree(repo_path: str, branch_name: str, base_branch: str = None) -> str:
     """Create a git worktree for a new branch.
     
@@ -958,6 +992,7 @@ def create_worktree(repo_path: str, branch_name: str, base_branch: str = None) -
         console.print(f"✅ Worktree created successfully")
         add_claude_trust(worktree_path)
         run_worktree_setup(worktree_path, console)
+        link_venv(worktree_path, console)
         return worktree_path
     except Exception as e:
         # If branch already exists, try to create worktree from existing branch
@@ -967,6 +1002,7 @@ def create_worktree(repo_path: str, branch_name: str, base_branch: str = None) -
                 console.print(f"✅ Worktree created from existing branch")
                 add_claude_trust(worktree_path)
                 run_worktree_setup(worktree_path, console)
+                link_venv(worktree_path, console)
                 return worktree_path
             except Exception as e2:
                 raise RuntimeError(f"Failed to create worktree: {e2}")
