@@ -141,6 +141,8 @@ def test_build_context_uses_memory_block_not_dead_rag_text(monkeypatch):
     assert 'task_key="T-1"' in context
     # A question-only task has nothing for `wf done` to ship.
     assert "T-1 needs no PR: close it by hand." in context
+    # A BLOCKED task is still owed, so it doesn't end with "close it".
+    assert "T-1 is blocked: do not close it." in context
 
 
 def test_build_context_names_wf_tools_only_when_loaded(monkeypatch):
