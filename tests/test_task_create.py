@@ -118,11 +118,17 @@ def test_an_unknown_project_is_refused_before_anything_is_created(world):
 
 
 class FakeNotes:
-    """A NotesGraph workspace of notes keyed by title, enough for upsert_note."""
+    """A NotesGraph workspace of notes keyed by title, enough for upsert_note.
 
-    def __init__(self, notes=None):
+    With `journals`, it has the server's ensure_journal, which makes a missing
+    day with the app's outline; without it, the tool is unknown, as on a
+    server from before it.
+    """
+
+    def __init__(self, notes=None, journals=False, outline="## Work\n\n- [ ] \n\n## Inbox\n\n- [ ] \n"):
         self.notes = dict(notes or {})
         self.calls = []
+        self.journals, self.outline = journals, outline
 
     def find(self, title):
         return {"docId": title, "title": title} if title in self.notes else None
@@ -132,6 +138,14 @@ class FakeNotes:
 
     def call(self, tool, args):
         self.calls.append(tool)
+        if tool == "ensure_journal":
+            if not self.journals:
+                from workflow.deploy.notes import NotesGraphError
+                raise NotesGraphError("Unknown tool: ensure_journal")
+            created = args["date"] not in self.notes
+            if created:
+                self.notes[args["date"]] = self.outline
+            return json.dumps({"docId": args["date"], "title": args["date"], "created": created})
         if tool == "create_document":
             self.notes[args["title"]] = args["content"]
             return json.dumps({"docId": args["title"]})
@@ -221,3 +235,21 @@ def test_a_repo_that_isnt_configured_or_isnt_the_projects_is_refused_before_anyt
     r = _create("--repo", "workflow", "--project", "work")
     assert r.exit_code == 1 and "'workflow' belongs to project 'personal', not 'work'" in r.output
     assert two_repos.made == []
+
+
+def test_a_day_with_no_journal_gets_its_page_made_first(world, monkeypatch):
+    fake = FakeNotes(journals=True, outline="## Work\n\n- [ ] \n\n## workflow\n\n- [ ] \n\n## Inbox\n\n- [ ] \n")
+    monkeypatch.setattr("workflow.cli_notes.reader_from_env", lambda: fake)
+    workflow_repo = world.root / "workflow"
+    workflow_repo.mkdir()
+    cfg = yaml.safe_load((world.root / "config.yaml").read_text())
+    cfg["projects"]["personal"]["repositories"] = {str(workflow_repo): {}}
+    (world.root / "config.yaml").write_text(yaml.dump(cfg))
+
+    r = _create("--project", "personal", "--journal")
+
+    assert r.exit_code == 0, r.output
+    # Made by ensure_journal with the day's outline, not as a bare page holding the line.
+    assert fake.calls[:2] == ["ensure_journal", "update_document"] and "create_document" not in fake.calls
+    assert fake.notes[date.today().isoformat()] == (
+        "## Work\n\n- [ ] \n\n## workflow\n\n- [ ] PERSONAL-7 E2E harness\n\n## Inbox\n\n- [ ] \n")

@@ -12,6 +12,7 @@ writing it back: NotesGraph's update_document diffs the blocks, so every
 other block in the note stays as it was.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -118,12 +119,31 @@ def journal_heading(project: Optional[str], repo: Optional[str] = None) -> str:
 def record_task(reader, heading: str, line: str, day: Optional[date] = None) -> dict:
     """Add `line` under `heading` in the journal note for `day` (today), made if missing.
 
+    The day's page is made first, by the server's ensure_journal, with the
+    outline the app gives a new day (a heading and empty to-do per project,
+    then Inbox), so the line lands in a real journal page; the app adopts it
+    as that day's journal and adds its todos: lists. A server without that
+    tool gets the old way: a page titled with the date, holding the line.
+
     Returns {"docId", "title", "created"}.
     """
-    from workflow.deploy.notes import upsert_note
+    from workflow.deploy.notes import NotesGraphError, upsert_note
 
     title = (day or date.today()).isoformat()
-    result = upsert_note(reader, title, lambda current: insert_task(current, heading, line), AGENT)
+
+    def edit(current):
+        return insert_task(current, heading, line)
+
+    try:
+        made = json.loads(reader.call("ensure_journal", {"date": title, "agent": AGENT}))
+    except (NotesGraphError, ValueError, TypeError):
+        made = None
+    doc_id = (made or {}).get("docId") if isinstance(made, dict) else None
+    if doc_id:
+        reader.call("update_document", {"docId": doc_id, "content": edit(reader.read(doc_id)), "agent": AGENT})
+        return {"docId": doc_id, "title": title, "created": bool(made.get("created"))}
+
+    result = upsert_note(reader, title, edit, AGENT)
     return {"docId": result.get("docId"), "title": title, "created": result.get("created")}
 
 
