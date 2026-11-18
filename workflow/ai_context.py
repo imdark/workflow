@@ -78,6 +78,23 @@ def get_ai_skills(issue, repo_path=None, project=None):
     return skills
 
 
+MEASURE_FIRST = """
+MEASURE BEFORE CALLING IT DONE:
+A change that claims to make something faster, smaller, cheaper or more
+reliable is finished only when it is measured. Before changing anything,
+record the baseline with a method you can repeat (the same command, test or
+CI job; several runs when the numbers vary). After the change, measure the
+same way. Put both sets of numbers, and how you took them, in the PR
+description and in the task's note. A result inside the old range is
+inconclusive: say so rather than calling it an improvement.
+
+When it can't be measured here (no docker, no device, no access), ship the PR
+as usual, write "Not measured" and the exact measurement still needed in its
+description, then set the task to BLOCKED naming that measurement, so it
+isn't counted as done until someone records the numbers.
+"""
+
+
 def build_context(issue, query: str = None, repo_path: str = None, wf_tools: bool = False):
     """Build context using RAG for project information.
 
@@ -141,6 +158,9 @@ MEMORY (from earlier sessions on this task):
 BEFORE YOU START:
 {_repo_check(repo_path)}
 """)
+
+    # An unmeasured "faster build" PR was merged and its task treated as done.
+    context_parts.append(MEASURE_FIRST)
 
     # Agents used to stop once the code worked, leaving the branch unshipped.
     context_parts.append(f"""
