@@ -3110,20 +3110,36 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
             existing_prs = check_existing_prs_for_issue(issue, repo_paths)
             if existing_prs:
                 typer.echo(f"🔍 Found existing PRs in {len(existing_prs)} repositories: {list(existing_prs.keys())}")
-                pr_created = True
             
             for current_repo_path in repo_paths:
                 typer.echo(f"Processing repository: {current_repo_path}")
                 
-                # Skip if PR already exists for this repository
+                from workflow.session import BaseBranchNotConfigured, base_branch_for
+
+                # This branch already has its PR: push what it does not have yet (the PR shows it), nothing more
                 if current_repo_path in existing_prs:
-                    typer.echo(f"⚠️  PR already exists for {current_repo_path}, skipping...")
+                    from workflow.git_utils import current_branch as branch_at, push_branch, unpushed_commits
                     pr_created = True  # Count existing PR as successful for task status
+                    branch = branch_at(current_repo_path)
+                    try:                       # only a branch never pushed needs it, and a PR means it was
+                        pr_base = base_branch_for(current_repo_path, repos, base)
+                    except BaseBranchNotConfigured:
+                        pr_base = None
+                    ahead = unpushed_commits(current_repo_path, branch, pr_base) if branch else 0
+                    url = existing_prs[current_repo_path].get("url", "")
+                    if ahead:
+                        try:
+                            push_branch(current_repo_path)
+                            typer.echo(f"✅ Pushed {ahead} commit(s) of '{branch}' to its PR {url}")
+                        except Exception as e:
+                            typer.echo(f"❌ Failed to push '{branch}' to its PR {url}: {e}")
+                            pr_created = False
+                    else:
+                        typer.echo(f"⚠️  '{branch}' already has its PR, nothing to push: {url}")
                     continue
-                
+
                 # The PR goes into the repo's configured base branch; from a
                 # task worktree that's its main checkout's setting.
-                from workflow.session import BaseBranchNotConfigured, base_branch_for
                 try:
                     base_branch = base_branch_for(current_repo_path, repos, base)
                 except BaseBranchNotConfigured as e:
@@ -3147,25 +3163,16 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                 if not current_branch:
                     current_branch = repo.active_branch.name
                 
-                has_unpushed = False
-                commits_ahead = 0
-                try:
-                    remote_branch = f"origin/{current_branch}"
-                    # Check if branch exists on remote first
-                    repo.git.fetch("origin", current_branch)
-                    commits_ahead = len(list(repo.iter_commits(f"{remote_branch}..{current_branch}")))
-                    has_unpushed = commits_ahead > 0
-                except Exception:
-                    # Branch doesn't exist on remote - check for local commits not yet pushed
-                    try:
-                        base_remote = f"origin/{base_branch}"
-                        commits_ahead = len(list(repo.iter_commits(f"{base_remote}..{current_branch}")))
-                        has_unpushed = commits_ahead > 0
-                    except:
-                        has_unpushed = False
+                from workflow.git_utils import unpushed_commits
+                commits_ahead = unpushed_commits(current_repo_path, current_branch, base_branch)
+                has_unpushed = commits_ahead > 0
                 
                 if has_diff:
                     try:
+                        if has_unpushed:               # on origin already, with newer commits: the PR gets them too
+                            from workflow.git_utils import push_branch
+                            push_branch(current_repo_path)
+                            typer.echo(f"✅ Pushed {commits_ahead} commit(s) of '{current_branch}'")
                         pr = create_pr(issue, reviewers, current_repo_path, base_branch, title=title, body=body)
                         if pr and pr.get("url") and not pr.get("url").startswith("existing"):
                             typer.echo(f"✅ Created PR for {current_repo_path}")

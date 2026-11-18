@@ -464,6 +464,20 @@ def push_branch(repo_path: Optional[str] = None):
     repo = get_repo(repo_path)
     repo.git.push("--set-upstream", "origin", repo.active_branch.name)
 
+
+def unpushed_commits(repo_path: Optional[str], branch: str, base_branch: str) -> int:
+    """Commits on `branch` that origin does not have: past origin/<branch> when it is on origin, else past
+    origin/<base_branch> (a branch never pushed). 0 when neither can be read."""
+    repo = get_repo(repo_path)
+    try:
+        repo.git.fetch("origin", branch)
+        return len(list(repo.iter_commits(f"origin/{branch}..{branch}")))
+    except Exception:
+        try:
+            return len(list(repo.iter_commits(f"origin/{base_branch}..{branch}")))
+        except Exception:
+            return 0
+
 def base_ref(base_branch: str, repo_path: Optional[str] = None) -> str:
     """The ref a branch is compared against for its PR: origin's `base_branch` when the remote has it (that is what
     the PR is opened against), else the local branch of that name. Raises when neither exists, with the fix."""
@@ -721,7 +735,9 @@ def create_pr(issue, reviewers: Optional[str] = None, repo_path: Optional[str] =
             return None
 
 def check_existing_prs_for_issue(issue, repo_paths: list) -> dict:
-    """Check if PRs already exist for a given issue across multiple repositories"""
+    """The open PR of each repo's CURRENT branch that names the issue -> {repo_path: pr}. Only that branch's: a task
+    can have several branches, and another branch's PR (a merge PR whose title quotes the task's branch name, say)
+    is not this branch's; counting it made `wf done` skip a new branch without pushing it."""
     import subprocess
     import json
     from pathlib import Path
@@ -741,8 +757,9 @@ def check_existing_prs_for_issue(issue, repo_paths: list) -> dict:
             continue
         current_branch = current_branch_result.stdout.strip()
         
-        # Search for PRs by issue key
-        search_cmd = ["gh", "pr", "list", "--search", f"{issue.key}", "--json", "number,title,url,headRefName"]
+        # This branch's open PRs, then the one that names the issue
+        search_cmd = ["gh", "pr", "list", "--head", current_branch, "--state", "open",
+                      "--json", "number,title,url,headRefName"]
         search_result = subprocess.run(search_cmd, capture_output=True, text=True, cwd=git_repo_path)
         
         found_pr = None
@@ -751,7 +768,7 @@ def check_existing_prs_for_issue(issue, repo_paths: list) -> dict:
                 prs = json.loads(search_result.stdout.strip())
                 for pr in prs:
                     pr_title = pr.get("title", "")
-                    if issue.key.upper() in pr_title.upper():
+                    if pr.get("headRefName") == current_branch and issue.key.upper() in pr_title.upper():
                         found_pr = pr
                         break
             except json.JSONDecodeError:
