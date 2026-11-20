@@ -6907,7 +6907,7 @@ from workflow.cli_install import install as install_cmd
 app.command("install")(install_cmd)
 
 
-# Fork the running Claude conversation into a new terminal tab (the /side skill).
+# Fork the running Claude conversation into a new terminal tab (the /side mod's command).
 @app.command("side")
 def side(
     session: str = typer.Option(None, "--session", "-s",
