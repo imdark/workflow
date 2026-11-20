@@ -1,0 +1,5 @@
+{
+  "name": "side",
+  "version": "0.1.0",
+  "description": "/side forks this conversation into a new terminal tab, without a model turn"
+}

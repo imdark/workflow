@@ -28,10 +28,13 @@ class Result:
 
 
 def bundled(source: Path = REPO_SKILLS) -> List[Path]:
-    """The repo's skills: directories holding a SKILL.md."""
+    """The repo's skills: directories holding a SKILL.md, or a mod's
+    .claude-plugin/plugin.json (Claude Code loads a mod from ~/.claude/skills/<name>
+    too, which is how /side runs without a model turn)."""
     if not source.is_dir():
         return []
-    return sorted(p for p in source.iterdir() if (p / "SKILL.md").is_file())
+    return sorted(p for p in source.iterdir()
+                  if (p / "SKILL.md").is_file() or (p / ".claude-plugin" / "plugin.json").is_file())
 
 
 def skill_dirs(cfg=None) -> List[Path]:

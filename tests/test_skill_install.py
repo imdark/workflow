@@ -15,6 +15,13 @@ def source(tmp_path):
     return src
 
 
+def test_links_a_mod_folder_too(source, dest):
+    # A mod (no SKILL.md, just .claude-plugin/plugin.json) is loaded from ~/.claude/skills as well.
+    (source / "gamma" / ".claude-plugin").mkdir(parents=True)
+    (source / "gamma" / ".claude-plugin" / "plugin.json").write_text('{"name": "gamma"}')
+    assert skill_install.install(source, dest).linked == ["alpha", "beta", "gamma"]
+
+
 @pytest.fixture
 def dest(tmp_path):
     return tmp_path / "home" / ".claude" / "skills"
