@@ -146,6 +146,30 @@ def test_queued_jobs_run_side_by_side(monkeypatch):
     assert sorted(r["job"] for r in client.reports if r["status"] == "done") == ["j1", "j2"]
 
 
+def test_a_job_claimed_again_while_it_runs_here_is_not_started_twice(monkeypatch):
+    """A lapsed lease hands a live job back to the same runner. A second copy
+    would kill the first's tmux session and delete its mcp.json."""
+    import threading
+
+    started, done, other_done = [], threading.Event(), threading.Event()
+
+    def run(job, cfg=None, **kw):
+        started.append(job.id)
+        if job.id == "j1":
+            # Still running when its re-claim, and then j2, come in.
+            assert other_done.wait(5)
+            done.set()
+        else:
+            other_done.set()
+        return {"result": job.id, "steps": 1, "session": None}
+
+    monkeypatch.setattr("workflow.deploy.jobs.run_job", run)
+    client = FakeClient([payload("j1"), payload("j1"), payload("j2")])
+
+    serve_until(client, done)
+    assert sorted(started) == ["j1", "j2"]
+
+
 def test_no_more_than_max_jobs_run_at_once(monkeypatch):
     import threading
     import time
