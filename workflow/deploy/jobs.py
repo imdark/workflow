@@ -1449,6 +1449,10 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
     completed = 0
     # Slots taken: jobs running, and a claim in flight.
     running = 0
+    # Ids of the jobs running here. A missed heartbeat can lapse a live job's
+    # lease and the server hands it back to this runner; a second copy would
+    # kill the first's tmux session and delete its mcp.json on the way out.
+    live: set = set()
     slots = threading.Condition()
 
     def limit() -> int:
@@ -1467,6 +1471,8 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
                 with slots:
                     completed += 1
         finally:
+            with slots:
+                live.discard(job.id)
             release()
 
     while True:
@@ -1510,6 +1516,15 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
             time.sleep(poll_seconds)
             continue
 
+        with slots:
+            duplicate = job.id in live
+            if not duplicate:
+                live.add(job.id)
+        if duplicate:
+            # The copy already running keeps reporting, which renews the lease.
+            release()
+            emit("error", f"{job.id[:8]} was claimed again while running here; left running")
+            continue
         if once:
             work(job)
             return completed
