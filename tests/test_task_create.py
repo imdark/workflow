@@ -149,8 +149,35 @@ class FakeNotes:
         if tool == "create_document":
             self.notes[args["title"]] = args["content"]
             return json.dumps({"docId": args["title"]})
-        self.notes[args["docId"]] = args["content"]
-        return "{}"
+        if tool == "update_document":
+            self.notes[args["docId"]] = args["content"]
+            return "{}"
+        from workflow.deploy.notes import NotesGraphError
+        raise NotesGraphError(f"Unknown tool: {tool}")
+
+
+class FakeBlockNotes(FakeNotes):
+    """FakeNotes with list_blocks and update_block over the to-do lines of its
+    notes, each block named <doc>:<line number>, its trail the heading above."""
+
+    def call(self, tool, args):
+        if tool == "list_blocks":
+            self.calls.append(tool)
+            tasks, trail = [], None
+            for n, text in enumerate(self.notes[args["docId"]].split("\n")):
+                if text.startswith("#"):
+                    trail = text.lstrip("#").strip()
+                elif text.startswith("- [ ]"):
+                    tasks.append({"blockId": f"{args['docId']}:{n}", "text": text[5:].strip(), "trail": trail})
+            return json.dumps({"tasks": tasks})
+        if tool == "update_block":
+            self.calls.append(tool)
+            doc, n = args["blockId"].rsplit(":", 1)
+            lines = self.notes[doc].split("\n")
+            lines[int(n)] = f"- [ ] {args['text']}"
+            self.notes[doc] = "\n".join(lines)
+            return "{}"
+        return super().call(tool, args)
 
 
 @pytest.fixture
@@ -250,6 +277,47 @@ def test_a_day_with_no_journal_gets_its_page_made_first(world, monkeypatch):
 
     assert r.exit_code == 0, r.output
     # Made by ensure_journal with the day's outline, not as a bare page holding the line.
-    assert fake.calls[:2] == ["ensure_journal", "update_document"] and "create_document" not in fake.calls
+    assert fake.calls[:2] == ["ensure_journal", "list_blocks"] and "create_document" not in fake.calls
     assert fake.notes[date.today().isoformat()] == (
         "## Work\n\n- [ ] \n\n## workflow\n\n- [ ] PERSONAL-7 E2E harness\n\n## Inbox\n\n- [ ] \n")
+
+
+# A journal page as read_document renders it: each todos: list is a database block, shown as a table.
+JOURNAL_WITH_LISTS = ("## Work\n\n- [ ] \n\n### todos:\n|Status|Deadline|Scheduled|\n|---|---|---|\n\n"
+                      "## workflow\n\n- [ ] \n\n### todos:\n|Status|Deadline|Scheduled|\n|---|---|---|\n")
+
+
+def _workflow_world(world):
+    workflow_repo = world.root / "workflow"
+    workflow_repo.mkdir()
+    cfg = yaml.safe_load((world.root / "config.yaml").read_text())
+    cfg["projects"]["personal"]["repositories"] = {str(workflow_repo): {}}
+    (world.root / "config.yaml").write_text(yaml.dump(cfg))
+
+
+def test_a_journal_with_todos_lists_gets_the_headings_empty_item_filled_not_rewritten(world, monkeypatch):
+    fake = FakeBlockNotes({date.today().isoformat(): JOURNAL_WITH_LISTS}, journals=True)
+    monkeypatch.setattr("workflow.cli_notes.reader_from_env", lambda: fake)
+    _workflow_world(world)
+
+    r = _create("--project", "personal", "--journal")
+
+    assert r.exit_code == 0, r.output
+    assert "update_document" not in fake.calls and fake.calls.count("update_block") == 1
+    assert fake.notes[date.today().isoformat()] == JOURNAL_WITH_LISTS.replace(
+        "## workflow\n\n- [ ] \n", "## workflow\n\n- [ ] PERSONAL-7 E2E harness\n")
+    assert "Journal: under 'workflow'" in r.output
+
+
+def test_a_journal_with_todos_lists_and_no_empty_item_is_left_alone(world, monkeypatch):
+    full = JOURNAL_WITH_LISTS.replace("## workflow\n\n- [ ] \n", "## workflow\n\n- [ ] older\n")
+    fake = FakeBlockNotes({date.today().isoformat(): full}, journals=True)
+    monkeypatch.setattr("workflow.cli_notes.reader_from_env", lambda: fake)
+    _workflow_world(world)
+
+    r = _create("--project", "personal", "--journal")
+
+    assert r.exit_code == 0 and "Created task: PERSONAL-7" in r.output
+    assert fake.notes[date.today().isoformat()] == full
+    assert "update_document" not in fake.calls and "update_block" not in fake.calls
+    assert "Not added to today's journal" in r.output and "no empty to-do under 'workflow'" in r.output

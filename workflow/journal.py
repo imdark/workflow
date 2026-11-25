@@ -7,9 +7,12 @@ tool) from a `wf ai` session lands in Linear, Jira or the markdown store,
 where the user doesn't see it while reading their day; this adds it to the
 journal too, as `- [ ] PERSONAL-290 Title` under the project's heading.
 
-The note is changed by reading its markdown, inserting the one line and
-writing it back: NotesGraph's update_document diffs the blocks, so every
-other block in the note stays as it was.
+A journal page holds database blocks (each section's "todos:" list), which
+read_document renders as markdown tables and update_document can't write
+back: rewriting the note with them turns them into plain tables and appends
+a second copy of the page. So the line goes into the heading's empty to-do
+with update_block, which touches that one block. Only a note with no
+database blocks is rewritten whole, the line inserted into its markdown.
 """
 
 import json
@@ -77,6 +80,46 @@ def insert_task(markdown: Optional[str], heading: str, line: str) -> str:
     return "\n".join(lines[:last + 1] + insert + lines[last + 1:]) + "\n"
 
 
+# read_document's rendering of a database block: a markdown table's divider row.
+_TABLE_DIVIDER = re.compile(r"^\s*\|(\s*:?-+:?\s*\|)+\s*$", re.M)
+
+
+def empty_item_under(reader, doc_id: str, heading: str) -> Optional[str]:
+    """The blockId of an empty to-do in the section headed like `heading`, or None.
+
+    Uses list_blocks, whose `trail` names the heading a task sits under; None
+    too when the server has no list_blocks.
+    """
+    from workflow.deploy.notes import NotesGraphError
+
+    key, cursor = _name_key(heading), None
+    for _ in range(20):
+        args = {"docId": doc_id, "status": "todo", "limit": 200}
+        if cursor:
+            args["cursor"] = cursor
+        try:
+            page = json.loads(reader.call("list_blocks", args))
+        except (NotesGraphError, ValueError, TypeError):
+            return None
+        if not isinstance(page, dict):
+            return None
+        for task in page.get("tasks") or []:
+            if (isinstance(task, dict) and task.get("blockId") and not str(task.get("text") or "").strip()
+                    and task.get("trail") and _name_key(str(task["trail"])) == key):
+                return task["blockId"]
+        cursor = page.get("nextCursor")
+        if not cursor:
+            return None
+    return None
+
+
+def _item_text(line: str) -> str:
+    """A `- [ ] ...` line as the plain text of an existing to-do block."""
+    text = re.sub(r"^\s*[-*]\s+\[ \]\s*", "", line)
+    # update_block writes plain text, where link markup would show as typed.
+    return re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+
+
 def _session_repo(repos: dict) -> Optional[str]:
     """The configured repo the current folder is in; a worktree counts as its main checkout."""
     candidates = []
@@ -124,6 +167,9 @@ def record_task(reader, heading: str, line: str, day: Optional[date] = None) -> 
     then Inbox), so the line lands in a real journal page; the app adopts it
     as that day's journal and adds its todos: lists. A server without that
     tool gets the old way: a page titled with the date, holding the line.
+    The line fills the heading's empty to-do when it has one; otherwise a
+    note holding database blocks is refused (NotesGraphError) rather than
+    rewritten.
 
     Returns {"docId", "title", "created"}.
     """
@@ -139,9 +185,22 @@ def record_task(reader, heading: str, line: str, day: Optional[date] = None) -> 
     except (NotesGraphError, ValueError, TypeError):
         made = None
     doc_id = (made or {}).get("docId") if isinstance(made, dict) else None
+    if not doc_id:
+        doc_id = (reader.find(title) or {}).get("docId")
     if doc_id:
-        reader.call("update_document", {"docId": doc_id, "content": edit(reader.read(doc_id)), "agent": AGENT})
-        return {"docId": doc_id, "title": title, "created": bool(made.get("created"))}
+        created = bool(made.get("created")) if isinstance(made, dict) else False
+        block_id = empty_item_under(reader, doc_id, heading)
+        if block_id:
+            reader.call("update_block", {"docId": doc_id, "blockId": block_id,
+                                         "text": _item_text(line), "agent": AGENT})
+            return {"docId": doc_id, "title": title, "created": created}
+        current = reader.read(doc_id)
+        if _TABLE_DIVIDER.search(current or ""):
+            raise NotesGraphError(
+                f"{title} has no empty to-do under '{heading}' to fill, and rewriting the note "
+                "would break its todos: lists; add the line by hand")
+        reader.call("update_document", {"docId": doc_id, "content": edit(current), "agent": AGENT})
+        return {"docId": doc_id, "title": title, "created": created}
 
     result = upsert_note(reader, title, edit, AGENT)
     return {"docId": result.get("docId"), "title": title, "created": result.get("created")}
