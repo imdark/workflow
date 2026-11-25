@@ -673,6 +673,22 @@ WF_TOOLS = "wf-tools"
 # Read-only, so allowed without asking; the rest still go through approve.
 WF_TOOLS_ALLOWED = [f"mcp__{WF_TOOLS}__{name}" for name in
                     ("search_task_facts", "search_past_conversations")]
+# wf commands that only read and print, allowed without asking in any run.
+# Claude Code matches each part of a chained command on its own, so
+# `wf project list && rm x` still asks for the rm. Left out on purpose:
+# `wf config list/get` (can print tokens) and anything that writes, pushes
+# or starts work (`wf done`, `wf task create`, ...).
+WF_READONLY_COMMANDS = [
+    "wf status", "wf project list", "wf project current",
+    "wf task list", "wf task show", "wf task comment list",
+    "wf notes find", "wf notes ls", "wf notes read", "wf notes links",
+    "wf doc list", "wf doc search", "wf doc view", "wf explore list",
+    "wf skill list", "wf learn list", "wf instruct list", "wf action list",
+    "wf variables list", "wf monitor list", "wf monitor status",
+    "wf agent status", "wf agent jobs", "wf deploy list", "wf deploy show",
+    "wf deploy status", "wf auth status", "wf terminal status",
+]
+WF_READONLY_ALLOWED = [f"Bash({cmd}:*)" for cmd in WF_READONLY_COMMANDS]
 
 
 def wf_tools_mcp() -> Optional[dict]:
@@ -751,6 +767,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     # prompt tells the agent to start with them.
     if WF_TOOLS in (extra_mcp or {}):
         allowed += [tool for tool in WF_TOOLS_ALLOWED if tool not in allowed]
+    allowed += [tool for tool in WF_READONLY_ALLOWED if tool not in allowed]
     # The automation's tools are the profile owner's own commands: allowed
     # without asking, like NotesGraph's (the cloud runner does the same).
     if tools_spec and "mcp__automation" not in allowed:

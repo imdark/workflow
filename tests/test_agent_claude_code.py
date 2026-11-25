@@ -19,7 +19,8 @@ import pytest
 from workflow.deploy import agent_mcp
 from workflow.backends.base import Issue
 from workflow.deploy.jobs import (CLAUDE_CODE_SYSTEM_PROMPT, RESEARCH_SYSTEM_PROMPT,
-                                  Job, JobClient, claude_code_argv, research_argv,
+                                  WF_READONLY_ALLOWED, Job, JobClient,
+                                  claude_code_argv, research_argv,
                                   run_job, start_job_task)
 from workflow.session import task_branch_name
 
@@ -576,7 +577,8 @@ def test_claude_code_gets_notesgraph_and_a_way_to_ask(tmp_path):
     assert argv[argv.index("--append-system-prompt") + 1] == CLAUDE_CODE_SYSTEM_PROMPT
     allowed = next(a for a in argv if a.startswith("--allowedTools="))
     assert "mcp__notesgraph" in allowed and "mcp__run__ask_user" in allowed
-    assert "Bash" not in allowed, "the shell must go through the permission prompt"
+    assert "Bash" not in allowed.split("=", 1)[1].split(","), \
+        "the shell must go through the permission prompt"
     assert int(env["MCP_TOOL_TIMEOUT"]) >= 60 * 60 * 1000
 
     config = json.loads((tmp_path / "mcp.json").read_text())["mcpServers"]
@@ -671,7 +673,7 @@ def test_research_gets_omniseek_on_top_of_claude_code(tmp_path, omniseek_token):
     assert prompt.startswith(CLAUDE_CODE_SYSTEM_PROMPT) and RESEARCH_SYSTEM_PROMPT in prompt
     allowed = next(a for a in argv if a.startswith("--allowedTools="))
     assert "mcp__omniseek" in allowed and "mcp__notesgraph" in allowed
-    assert "Bash" not in allowed
+    assert "Bash" not in allowed.split("=", 1)[1].split(",")
     assert argv[-1] == "Survey X"
 
     servers = json.loads((job_dir / "mcp.json").read_text())["mcpServers"]
@@ -1036,8 +1038,21 @@ def test_the_servers_profile_is_the_agent_when_it_sends_one(tmp_path):
 
     assert argv[argv.index("--append-system-prompt") + 1] == "Be the agent the server says."
     assert next(a for a in argv if a.startswith("--allowedTools=")) == \
-        "--allowedTools=mcp__notesgraph,mcp__run__ask_user,WebSearch"
+        "--allowedTools=" + ",".join(["mcp__notesgraph", "mcp__run__ask_user", "WebSearch",
+                                      *WF_READONLY_ALLOWED])
     assert env["MCP_TOOL_TIMEOUT"] == "1234"
+
+
+def test_read_only_wf_commands_run_without_asking(tmp_path):
+    argv, _ = claude_code_argv(job(), "go", tmp_path, client())
+    allowed = next(a for a in argv if a.startswith("--allowedTools=")).split("=", 1)[1].split(",")
+
+    assert "Bash(wf project list:*)" in allowed
+    assert "Bash(wf task show:*)" in allowed
+    # Commands that push, write or can print a token still ask.
+    assert not any(a.startswith(("Bash(wf done", "Bash(wf config", "Bash(wf task create"))
+                   for a in allowed)
+    assert "Bash" not in allowed
 
 
 def test_research_takes_the_whole_prompt_and_tools_from_the_profile(tmp_path, omniseek_token):
@@ -1052,7 +1067,7 @@ def test_research_takes_the_whole_prompt_and_tools_from_the_profile(tmp_path, om
     # Not the built-in research prompt added on top: the server's already has it.
     assert argv[argv.index("--append-system-prompt") + 1] == "notes part\nresearch part"
     assert next(a for a in argv if a.startswith("--allowedTools=")) == \
-        "--allowedTools=mcp__notesgraph,mcp__omniseek"
+        "--allowedTools=" + ",".join(["mcp__notesgraph", "mcp__omniseek", *WF_READONLY_ALLOWED])
     assert "omniseek" in json.loads((job_dir / "mcp.json").read_text())["mcpServers"]
 
 
