@@ -381,6 +381,10 @@ CLAUDE_CODE_ALLOWED_TOOLS = [
     "WebSearch", "WebFetch", "Read", "Glob", "Grep",
 ]
 
+# Read-only GitHub PR commands, allowed whatever the profile says: an agent
+# checking its own PR or CI shouldn't stop to ask for a lookup.
+GH_READ_ALLOWED = [f"Bash(gh pr {cmd}:*)" for cmd in ("view", "list", "checks", "diff")]
+
 # Claude Code gives an MCP tool call this long (ms) before giving up. A
 # question waits for a person, who may be at dinner.
 ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000
@@ -751,6 +755,7 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     # prompt tells the agent to start with them.
     if WF_TOOLS in (extra_mcp or {}):
         allowed += [tool for tool in WF_TOOLS_ALLOWED if tool not in allowed]
+    allowed += [tool for tool in GH_READ_ALLOWED if tool not in allowed]
     # The automation's tools are the profile owner's own commands: allowed
     # without asking, like NotesGraph's (the cloud runner does the same).
     if tools_spec and "mcp__automation" not in allowed:
