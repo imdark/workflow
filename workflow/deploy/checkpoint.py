@@ -473,8 +473,58 @@ def discard(job_dir: Path) -> None:
             pass
     for name in ("checkpoint", "checkpoint.new", "checkpoint.old"):
         shutil.rmtree(job_dir / name, ignore_errors=True)
-    for name in ("session.json", "ckpt.index"):
-        (job_dir / name).unlink(missing_ok=True)
+    # Not picked up again as an interrupted attempt, but kept for a
+    # follow-up run to carry the conversation on from (see ended_session).
+    try:
+        os.replace(job_dir / "session.json", job_dir / ENDED_SESSION)
+    except OSError:
+        pass
+    (job_dir / "ckpt.index").unlink(missing_ok=True)
+
+
+# --- following up on a run that ended ------------------------------------------
+
+# The session of a run that finished or was stopped, kept by `discard`.
+ENDED_SESSION = "ended-session.json"
+
+
+def ended_session(job_dir: Path) -> Optional[dict]:
+    """The session a run left when it ended, for a follow-up to resume.
+
+    A run that finished or was stopped left it in ended-session.json; one
+    that failed still has its session.json.
+    """
+    for name in (ENDED_SESSION, "session.json"):
+        info = _read_json(job_dir / name)
+        if info and info.get("id"):
+            return info
+    return None
+
+
+def follow_up_prompt(request: str, resumed: bool = True) -> str:
+    """What a follow-up run is told first: under the earlier run's
+    conversation when it was `resumed`, else on its own."""
+    opening = (
+        "Your run above has ended." if resumed else
+        "An earlier run of yours on this has ended, and its conversation could "
+        "not be restored: read the working directory, its git log and the "
+        "task to see what it did.")
+    return f"""\
+{opening} The user read how it went and, from the run's chat
+in NotesGraph, asks:
+
+<request>
+{request.strip()}
+</request>
+
+You have the same tools and permissions as before, in the working directory
+the run left (if it had to be made again, check out the run's branch first).
+If they want more changes, build on that work rather than starting over:
+commit them on a new branch made from the run's branch, and open a new pull
+request based on the earlier one's branch, so it stacks on top of it. If the
+earlier PR has been merged, base the new one on the default branch instead.
+If they only ask a question, answer it and change nothing.
+"""
 
 
 def prune(job_root: Path, days: float = KEEP_DAYS, now: Optional[float] = None) -> int:

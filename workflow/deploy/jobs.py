@@ -81,6 +81,10 @@ class Job:
     payload: Optional[dict] = None
     # For an automation: the workspace secrets its code names. Claims only.
     secrets: Optional[dict] = None
+    # The id of an ended run this one follows up (a request from that run's
+    # chat): it resumes that run's session in that run's working directory,
+    # with this job's instructions as the request. See follow_up.
+    continues: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict) -> "Job":
@@ -99,6 +103,7 @@ class Job:
             kind=payload.get("kind") or "agent",
             payload=payload.get("payload") or None,
             secrets=payload.get("secrets") or None,
+            continues=payload.get("continues") or None,
         )
 
 
@@ -852,6 +857,33 @@ def _resume_workdir(job_dir: Path, workdir: Path, interrupted, automation) -> Pa
     return Path(moved) if moved else workdir
 
 
+def follow_up(job: Job) -> Optional[tuple]:
+    """(the earlier run's job directory, the session it ended with) for a job
+    that follows one up; None for any other job.
+
+    The follow-up runs where that run did, with its session resumed, so it
+    has the run's tools and permissions and its work to build on. That is
+    only here on the device the run ran on; elsewhere the job fails saying so.
+    """
+    if not job.continues:
+        return None
+    if Path(job.continues).name != job.continues or job.continues in (".", ".."):
+        raise RuntimeError(f"not a run id: {job.continues!r}")
+    source = JOB_ROOT / job.continues
+    if not source.is_dir():
+        raise RuntimeError(
+            "the run this follows up didn't run on this device, or its files are "
+            "gone: follow it up on the device it ran on")
+    return source, checkpoint.ended_session(source)
+
+
+def _follow_up_prompt(job: Job, resume: Optional[str]) -> str:
+    """The follow-up's request (the item it is about, else its instructions),
+    as the run whose session it carries on is told it."""
+    return checkpoint.follow_up_prompt(job.context.strip() or job.instructions,
+                                       resumed=bool(resume))
+
+
 def _git(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], capture_output=True, text=True)
 
@@ -871,10 +903,28 @@ def job_workdir(job_dir: Path, cwd: Path) -> Path:
     tree = job_dir / "repo"
     # A re-claimed job carries on in the worktree its first attempt left.
     if not tree.exists():
-        added = _git("-C", str(root), "worktree", "add", "--detach", str(tree), "HEAD")
+        # Made again for a follow-up: on the branch the run left it on, when
+        # that branch is free (no other worktree has it checked out).
+        added = None
+        left = _left_branch(job_dir)
+        if left:
+            added = _git("-C", str(root), "worktree", "add", str(tree), left)
+        if added is None or added.returncode != 0:
+            added = _git("-C", str(root), "worktree", "add", "--detach", str(tree), "HEAD")
         if added.returncode != 0:
             raise RuntimeError(f"could not make a worktree: {added.stderr.strip()[:300]}")
     return tree / cwd.resolve().relative_to(root.resolve())
+
+
+# The branch a job's worktree was on when it was removed (see job_workdir).
+LEFT_BRANCH = "worktree.json"
+
+
+def _left_branch(job_dir: Path) -> Optional[str]:
+    try:
+        return json.loads((job_dir / LEFT_BRANCH).read_text()).get("branch") or None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _drop_worktree_if_empty(job_dir: Path) -> None:
@@ -889,13 +939,16 @@ def _drop_worktree_if_empty(job_dir: Path) -> None:
     status = _git("-C", str(tree), "status", "--porcelain")
     if status.returncode != 0 or status.stdout.strip():
         return
-    on_branch = _git("-C", str(tree), "symbolic-ref", "-q", "HEAD").returncode == 0
+    branch = _git("-C", str(tree), "symbolic-ref", "-q", "--short", "HEAD")
+    on_branch = branch.returncode == 0
     if not on_branch:
         held = _git("-C", str(tree), "branch", "-a", "--contains", "HEAD")
         if not held.stdout.strip():
             # Commits made on the detached HEAD: nothing else points at them.
             return
-    _git("-C", str(tree), "worktree", "remove", str(tree))
+    if _git("-C", str(tree), "worktree", "remove", str(tree)).returncode == 0 and on_branch:
+        # So a follow-up gets the worktree back on the same branch.
+        (job_dir / LEFT_BRANCH).write_text(json.dumps({"branch": branch.stdout.strip()}))
 
 
 def _drop_task_worktree(workdir: Path) -> None:
@@ -1147,6 +1200,23 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     # and its tools, served to the agent (see prepare_automation).
     automation = tools_spec = None
     profiled = is_profiled_claude_job(job)
+    followed = None
+    # Where a claude-code job's worktree is: a follow-up's is the earlier run's.
+    tree_dir = job_dir
+
+    def first_turn(workdir: Optional[Path], default,
+                   claude_env: Optional[dict] = None) -> tuple:
+        """(session to resume, prompt): this job's own interrupted attempt
+        first, then the run it follows up, else a fresh start on `default`
+        (the prompt, or what makes it)."""
+        own = checkpoint.resumable(interrupted, job_dir, workdir, claude_env)
+        if own:
+            return own, checkpoint.RESUME_PROMPT
+        if followed:
+            prior = checkpoint.resumable(followed[1], followed[0], workdir, claude_env)
+            return prior, _follow_up_prompt(job, prior)
+        return None, default() if callable(default) else default
+
     with _SETUP_LOCK:
         claude_job = job.model in CLAUDE_MODELS or profiled
         found_home = job_home(job, strict=job.model == CLAUDE_CODE_MODEL) if claude_job else None
@@ -1156,21 +1226,24 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             provider = job.model
             # Only the parts of the rules for this run's project, tags and agent.
             rules = load_agent_rules(client, job_rules_scope(job, found_home))
+            followed = follow_up(job)
         home = found_home if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL) else None
         if job.model == CLAUDE_CODE_MODEL:
-            workdir = job_workdir(job_dir, Path(home[1]) if home else cwd or Path.cwd())
+            if followed:
+                tree_dir = followed[0]
+            workdir = job_workdir(tree_dir, Path(home[1]) if home else cwd or Path.cwd())
             automation, tools_spec, _ = prepare_automation(job, job_dir, cwd or Path.cwd(), workdir)
-            resume = checkpoint.resumable(interrupted, job_dir, workdir)
+            resume, prompt = first_turn(workdir, _prompt(job))
             argv, env = claude_code_argv(
-                job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
+                job, prompt, job_dir, client,
                 rules=rules, resume=resume, tools_spec=tools_spec)
         elif job.model == RESEARCH_MODEL:
             # Research reads the world, not a repo: the job directory, no worktree.
             automation, tools_spec, workdir = prepare_automation(job, job_dir, cwd or Path.cwd())
             workdir = _resume_workdir(job_dir, workdir or job_dir, interrupted, automation)
-            resume = checkpoint.resumable(interrupted, job_dir, workdir)
+            resume, prompt = first_turn(workdir, _prompt(job))
             argv, env = research_argv(
-                job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
+                job, prompt, job_dir, client,
                 config, rules=rules, resume=resume, tools_spec=tools_spec)
         elif profiled:
             # The server's profile is the whole agent (prompt, tools, skills,
@@ -1178,9 +1251,9 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             # automation says. Setup may be what creates that directory.
             automation, tools_spec, workdir = prepare_automation(job, job_dir, cwd or Path.cwd())
             workdir = _resume_workdir(job_dir, workdir or job_dir, interrupted, automation)
-            resume = checkpoint.resumable(interrupted, job_dir, workdir)
+            resume, prompt = first_turn(workdir, _prompt(job))
             argv, env = claude_code_argv(
-                job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
+                job, prompt, job_dir, client,
                 rules=rules, resume=resume, tools_spec=tools_spec)
         elif job.model == COMMAND_MODEL:
             provider, argv = COMMAND_MODEL, command_argv(job, config)
@@ -1188,6 +1261,10 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             if timeout is None:
                 timeout = COMMAND_TIMEOUT_SECONDS
         elif job.model == WORKFLOW_MODEL:
+            if followed and not (job_dir / "task.json").exists() \
+                    and (followed[0] / "task.json").exists():
+                # The earlier run's ticket, so its branch and worktree too.
+                shutil.copyfile(followed[0] / "task.json", job_dir / "task.json")
             issue, workdir, repo_path = start_job_task(job, job_dir, cwd or Path.cwd())
             from workflow.ai_providers.claude import skills_plugin_dir
             from workflow.session import apply_claude_env
@@ -1198,11 +1275,12 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             # Same Claude account and capture proxy as `wf ai`.
             claude_env = apply_claude_env(dict(os.environ), home[0] if home else None)
             automation, tools_spec, _ = prepare_automation(job, job_dir, cwd or Path.cwd(), workdir)
-            resume = checkpoint.resumable(interrupted, job_dir, workdir, claude_env)
             wf_tools = wf_tools_mcp()
+            resume, prompt = first_turn(
+                workdir, lambda: _job_context(issue, job, workdir, wf_tools=bool(wf_tools)),
+                claude_env)
             argv, env = claude_code_argv(
-                job, checkpoint.RESUME_PROMPT if resume
-                else _job_context(issue, job, workdir, wf_tools=bool(wf_tools)),
+                job, prompt,
                 job_dir, client, plugin_dir, rules=rules,
                 extra_mcp=wf_tools, session_context=map_context(workdir), resume=resume, tools_spec=tools_spec)
             env.update(claude_env)
@@ -1216,6 +1294,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
              **({"claude": True} if job.model in CLAUDE_MODELS or profiled else {}),
              **({"automation": automation} if automation else {}),
              **({"resumed": True} if resume else {}),
+             **({"followsUp": job.continues} if followed else {}),
              **({"caffeinate": True} if keep_awake(config, job_dir) else {}),
              # What its checkpoints name it by.
              "job": {"id": job.id, "agentId": job.agent_id, "agentName": job.agent_name,
@@ -1233,7 +1312,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
         (job_dir / "mcp.json").unlink(missing_ok=True)
         with _SETUP_LOCK:
             if job.model == CLAUDE_CODE_MODEL:
-                _drop_worktree_if_empty(job_dir)
+                _drop_worktree_if_empty(tree_dir)
             if issue is not None:
                 _save_session(issue, job_dir, workdir)
             if repo_path:
