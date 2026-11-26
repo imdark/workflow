@@ -16,8 +16,8 @@ from workflow.deploy.checkpoint import (REF_PREFIX, Checkpointer, discard,
                                         interrupted_session, prune, resumable, run_base,
                                         snapshot)
 from workflow.deploy.job_exec import Narrator
-from workflow.deploy.jobs import (Job, JobCancelled, JobClient, claude_code_argv,
-                                  run_job)
+from workflow.deploy.jobs import (LEFT_BRANCH, Job, JobCancelled, JobClient,
+                                  claude_code_argv, run_job)
 
 
 def git(cwd, *args):
@@ -366,3 +366,116 @@ def test_a_finished_attempt_is_not_resumed(repo, tmp_path, config_dir, monkeypat
 
     run_job(job, config={}, use_tmux=False, client=client, cwd=repo, tick_seconds=0.05)
     assert resumes == [None]
+
+
+# --- following up on a run that ended -------------------------------------------
+
+def test_an_ended_runs_session_is_kept_for_a_follow_up(tmp_path):
+    (tmp_path / "session.json").write_text(json.dumps({"id": "s-1", "cwd": "/w"}))
+    discard(tmp_path)
+    assert not (tmp_path / "session.json").exists()
+    # Not an interrupted attempt to pick up again...
+    assert interrupted_session(tmp_path) is None
+    # ...but there for a follow-up.
+    assert checkpoint.ended_session(tmp_path)["id"] == "s-1"
+
+
+def test_a_failed_runs_session_can_be_followed_up(tmp_path):
+    (tmp_path / "session.json").write_text(json.dumps({"id": "s-1", "cwd": "/w"}))
+    assert checkpoint.ended_session(tmp_path)["id"] == "s-1"
+    assert checkpoint.ended_session(tmp_path / "nothing") is None
+
+
+FOLLOW_CLAUDE = r"""
+import json, os, subprocess, sys
+from pathlib import Path
+def emit(e): print(json.dumps(e), flush=True)
+def git(*a): subprocess.run(["git", *a], check=True, capture_output=True)
+resumed = "--resume" in sys.argv
+sid = sys.argv[sys.argv.index("--resume") + 1] if resumed else "s-first"
+emit({"type": "system", "subtype": "init", "model": "m", "cwd": os.getcwd(),
+      "session_id": sid})
+t = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / "slug" / f"{sid}.jsonl"
+t.parent.mkdir(parents=True, exist_ok=True)
+t.write_text("{}\n")
+if not resumed:
+    git("checkout", "-q", "-b", "feature")
+    Path("work.txt").write_text("done")
+    git("add", "-A")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "work")
+branch = subprocess.run(["git", "branch", "--show-current"], capture_output=True,
+                        text=True).stdout.strip()
+emit({"type": "result", "subtype": "success", "num_turns": 1,
+      "result": json.dumps({"sid": sid, "cwd": os.getcwd(), "branch": branch})})
+"""
+
+
+def test_a_follow_up_resumes_the_ended_run_where_it_left_off(repo, tmp_path, config_dir,
+                                                              monkeypatch):
+    script = tmp_path / "fake_claude.py"
+    script.write_text(FOLLOW_CLAUDE)
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
+    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client, scope=None: "")
+    calls = []
+
+    def fake_argv(job, prompt, job_dir, client, **kw):
+        calls.append({"prompt": prompt, "resume": kw.get("resume"),
+                      "tools": kw.get("tools_spec")})
+        resume = ["--resume", kw["resume"]] if kw.get("resume") else []
+        return [sys.executable, str(script), *resume, prompt], {}
+    monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv", fake_argv)
+    client = JobClient("http://ng", "ws", token="t")
+
+    first = Job.from_payload({"id": "job1", "model": "claude-code", "instructions": "Do it"})
+    ran = json.loads(run_job(first, config={}, use_tmux=False, client=client, cwd=repo,
+                             tick_seconds=0.05)["result"])
+    discard(tmp_path / "jobs" / "job1")  # as the runner does once it is reported done
+    # Its work is on a branch, so its worktree was removed.
+    assert not (tmp_path / "jobs" / "job1" / "repo").exists()
+
+    follow = Job.from_payload({"id": "job2", "model": "claude-code", "instructions": "Do it",
+                               "context": "Now add tests, in a new PR",
+                               "continues": "job1"})
+    out = json.loads(run_job(follow, config={}, use_tmux=False, client=client, cwd=repo,
+                             tick_seconds=0.05)["result"])
+
+    assert calls[1]["resume"] == "s-first"
+    assert "Your run above has ended" in calls[1]["prompt"]
+    assert "Now add tests, in a new PR" in calls[1]["prompt"]
+    # The same directory, made again on the branch the run left, with its work.
+    assert out == {"sid": "s-first", "cwd": ran["cwd"], "branch": "feature"}
+    assert (tmp_path / "jobs" / "job1" / LEFT_BRANCH).exists()
+    assert not (tmp_path / "jobs" / "job2" / "repo").exists()
+
+
+def test_a_follow_up_without_the_session_starts_fresh_in_the_same_place(
+        repo, tmp_path, config_dir, monkeypatch):
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
+    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client, scope=None: "")
+    calls = []
+
+    def fake_argv(job, prompt, job_dir, client, **kw):
+        calls.append({"prompt": prompt, "resume": kw.get("resume")})
+        return [sys.executable, "-c", "import os; print(os.getcwd())"], {}
+    monkeypatch.setattr("workflow.deploy.jobs.claude_code_argv", fake_argv)
+    (tmp_path / "jobs" / "job1").mkdir(parents=True)
+    job = Job.from_payload({"id": "job2", "model": "claude-code", "instructions": "More",
+                            "continues": "job1"})
+    run_job(job, config={}, use_tmux=False, client=client_for(), cwd=repo, tick_seconds=0.05)
+    assert calls[0]["resume"] is None
+    assert "could not be restored" in calls[0]["prompt"]
+    assert "More" in calls[0]["prompt"]
+
+
+def client_for():
+    return JobClient("http://ng", "ws", token="t")
+
+
+@pytest.mark.parametrize("continues", ["../job1", "elsewhere"])
+def test_a_follow_up_of_a_run_not_here_fails_saying_so(repo, tmp_path, monkeypatch, continues):
+    monkeypatch.setattr("workflow.deploy.jobs.JOB_ROOT", tmp_path / "jobs")
+    monkeypatch.setattr("workflow.deploy.jobs.load_agent_rules", lambda client, scope=None: "")
+    job = Job.from_payload({"id": "job2", "model": "claude-code", "instructions": "x",
+                            "continues": continues})
+    with pytest.raises(RuntimeError, match="run id|this device"):
+        run_job(job, config={}, use_tmux=False, client=client_for(), cwd=repo)
