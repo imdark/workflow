@@ -7671,6 +7671,39 @@ def plan():
     tui_app.run()
 
 
+@app.command()
+def lint(
+    all_files: bool = typer.Option(False, "--all", help="Lint the whole repository, not just the changed files"),
+    fix: bool = typer.Option(False, "--fix", help="Run each step's fix command where it has one"),
+    base: str = typer.Option(None, "--base", help="Branch to diff against (default: the remote's default branch)"),
+    repo_path: str = typer.Option(".", "--repo-path", help="Repository to lint"),
+    as_json: bool = typer.Option(False, "--json", help="Print the results as JSON"),
+):
+    """Run the repository's lint (wf.yaml `lint`, else package.json) on the files the branch changed."""
+    import json as _json
+    from workflow.lint import LintError, lint_repo
+
+    try:
+        results = lint_repo(repo_path, base=base, all_files=all_files, fix=fix)
+    except LintError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(2)
+
+    if as_json:
+        typer.echo(_json.dumps(results, indent=2))
+    else:
+        for r in results:
+            if r["skipped"]:
+                typer.echo(f"– {r['name']}: skipped (no matching changed files)")
+            elif r["ok"]:
+                typer.echo(f"✓ {r['name']}")
+            else:
+                typer.echo(f"✗ {r['name']} (exit {r['exit_code']})")
+                typer.echo(r["output"])
+    if not all(r["ok"] for r in results):
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     import sys
     from pathlib import Path

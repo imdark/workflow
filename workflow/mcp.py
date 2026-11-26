@@ -323,6 +323,27 @@ def set_config_value(
         return f"Error: {str(e)}"
 
 
+@mcp.tool()
+def lint(
+    repo_path: Annotated[str, "Path inside the git repository to lint"],
+    all_files: Annotated[bool, "Lint the whole repository instead of the files the branch changed"] = False,
+    fix: Annotated[bool, "Run each step's fix command where it has one"] = False,
+    base: Annotated[str, "Branch to diff against (default: the remote's default branch)"] = None,
+) -> str:
+    """Run the repository's lint on the files the branch changed, before committing.
+
+    The steps come from wf.yaml `lint:` at the repository root (else a `lint`
+    script in package.json). Returns JSON: `ok` overall, and per step its
+    name, ok, skipped, exit_code, files and the tail of its output.
+    """
+    from workflow.lint import LintError, lint_repo
+    try:
+        results = lint_repo(repo_path, base=base, all_files=all_files, fix=fix)
+    except LintError as e:
+        return f"Error: {e}"
+    return json.dumps({"ok": all(r["ok"] for r in results), "steps": results}, indent=2)
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "install":
