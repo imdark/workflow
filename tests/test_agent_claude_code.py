@@ -630,6 +630,14 @@ def test_subagents_are_told_to_commit_as_they_go_with_or_without_rules(tmp_path)
     assert "commit as you go" in ruled and "Tag tasks #work." in ruled
 
 
+def test_the_run_and_its_subagents_are_told_to_lint_before_committing(tmp_path):
+    argv = claude_code_argv(job(), "Do it", tmp_path, client())[0]
+    system_prompt = argv[argv.index("--append-system-prompt") + 1]
+
+    assert "wf lint --fix" in system_prompt
+    assert "wf lint --fix" in subagent_context(argv)
+
+
 class FakeOmniSeek:
     """OmniSeek's open liveness route, on a real local port."""
 

@@ -338,6 +338,16 @@ def keep_awake(config: dict, job_dir: Path) -> bool:
 # Appended to Claude Code's own system prompt for a claude-code job. The
 # point is that the agent asks rather than guesses, and that each answer is
 # written into NotesGraph so the next run finds it instead of asking again.
+# Lint failures a run commits come back as a red CI check on its pull request
+# (an unsorted import once failed notes-graph's Lint job on every PR). The
+# repo's own checks run on just the changed files, so this is cheap.
+LINT_BEFORE_COMMIT = """\
+Before each commit in a git checkout, run `wf lint --fix` there (the
+wf-tools `lint` tool does the same) and fix whatever it still reports. It runs
+the repository's own lint on the files you changed; when it says no lint is
+configured, there is nothing to run.
+"""
+
 CLAUDE_CODE_SYSTEM_PROMPT = """\
 You are running as an agent inside NotesGraph, the user's notes app, started
 by them from a note. You have NotesGraph tools (mcp__notesgraph__*) to search,
@@ -371,6 +381,7 @@ mcp__run__ask_user so the user can pick one with a click.
 Tools that need permission are put to the user for
 you; if they deny one, find another way or explain what you could not do.
 
+""" + LINT_BEFORE_COMMIT + """
 Finish with your answer to the task itself.
 """
 
@@ -617,7 +628,8 @@ If you are changing code in a git checkout, commit as you go: a small
 commit after each step that builds and passes its tests, so the work
 survives if you are interrupted (a usage limit, a crash). Don't push, and
 don't leave a long build uncommitted until the end.
-"""
+
+""" + LINT_BEFORE_COMMIT
 
 
 def subagent_prompt(rules: str) -> str:
