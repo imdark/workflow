@@ -118,17 +118,21 @@ def test_an_unknown_project_is_refused_before_anything_is_created(world):
 
 
 class FakeNotes:
-    """A NotesGraph workspace of notes keyed by title, enough for upsert_note.
+    """A NotesGraph workspace of notes keyed by title.
 
     With `journals`, it has the server's ensure_journal, which makes a missing
     day with the app's outline; without it, the tool is unknown, as on a
-    server from before it.
+    server from before it. With `append` (the default) it has
+    append_to_section, applied here to the note's markdown the way the server
+    adds blocks. Rewriting an existing note with update_document fails the
+    test: that is what lost content on real journal pages.
     """
 
-    def __init__(self, notes=None, journals=False, outline="## Work\n\n- [ ] \n\n## Inbox\n\n- [ ] \n"):
+    def __init__(self, notes=None, journals=False, outline="## Work\n\n- [ ] \n\n## Inbox\n\n- [ ] \n",
+                 append=True):
         self.notes = dict(notes or {})
         self.calls = []
-        self.journals, self.outline = journals, outline
+        self.journals, self.outline, self.append = journals, outline, append
 
     def find(self, title):
         return {"docId": title, "title": title} if title in self.notes else None
@@ -149,8 +153,16 @@ class FakeNotes:
         if tool == "create_document":
             self.notes[args["title"]] = args["content"]
             return json.dumps({"docId": args["title"]})
-        self.notes[args["docId"]] = args["content"]
-        return "{}"
+        if tool == "append_to_section":
+            from workflow.deploy.notes import NotesGraphError
+            from workflow.journal import insert_task
+            if not self.append:
+                raise NotesGraphError("Unknown tool: append_to_section")
+            for line in args["lines"]:
+                self.notes[args["docId"]] = insert_task(
+                    self.notes[args["docId"]], args["heading"], f"- [ ] {line}")
+            return json.dumps({"success": True})
+        raise AssertionError(f"{tool} would rewrite note {args.get('docId')!r}")
 
 
 @pytest.fixture
@@ -250,6 +262,37 @@ def test_a_day_with_no_journal_gets_its_page_made_first(world, monkeypatch):
 
     assert r.exit_code == 0, r.output
     # Made by ensure_journal with the day's outline, not as a bare page holding the line.
-    assert fake.calls[:2] == ["ensure_journal", "update_document"] and "create_document" not in fake.calls
+    assert fake.calls == ["ensure_journal", "append_to_section"]
     assert fake.notes[date.today().isoformat()] == (
         "## Work\n\n- [ ] \n\n## workflow\n\n- [ ] PERSONAL-7 E2E harness\n\n## Inbox\n\n- [ ] \n")
+
+
+def test_the_journal_page_is_added_to_never_rewritten(world, notes):
+    r = _create("--project", "personal", "--journal")
+
+    assert r.exit_code == 0, r.output
+    assert "update_document" not in notes.calls and "append_to_section" in notes.calls
+
+
+def test_a_server_without_append_to_section_leaves_the_journal_alone(world, monkeypatch):
+    day = date.today().isoformat()
+    fake = FakeNotes({day: "## Work\n\n- [ ] \n\n## Inbox\n"}, journals=True, append=False)
+    monkeypatch.setattr("workflow.cli_notes.reader_from_env", lambda: fake)
+
+    r = _create("--project", "personal", "--journal")
+
+    assert r.exit_code == 0 and "Created task: PERSONAL-7" in r.output
+    assert "Not added to today's journal" in r.output
+    assert fake.notes[day] == "## Work\n\n- [ ] \n\n## Inbox\n"
+    assert "update_document" not in fake.calls
+
+
+def test_with_no_journal_tool_and_no_page_the_day_is_made_with_the_line(world, monkeypatch):
+    fake = FakeNotes()
+    monkeypatch.setattr("workflow.cli_notes.reader_from_env", lambda: fake)
+
+    r = _create("--project", "personal", "--journal")
+
+    assert r.exit_code == 0, r.output
+    assert "create_document" in fake.calls and "append_to_section" not in fake.calls
+    assert "- [ ] PERSONAL-7 E2E harness" in fake.notes[date.today().isoformat()]
