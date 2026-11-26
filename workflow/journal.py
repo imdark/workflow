@@ -7,9 +7,12 @@ tool) from a `wf ai` session lands in Linear, Jira or the markdown store,
 where the user doesn't see it while reading their day; this adds it to the
 journal too, as `- [ ] PERSONAL-290 Title` under the project's heading.
 
-The note is changed by reading its markdown, inserting the one line and
-writing it back: NotesGraph's update_document diffs the blocks, so every
-other block in the note stays as it was.
+An existing page only ever gets the line added, with the server's
+append_to_section, which inserts it as a new block and leaves every other
+block as it was. It is never read and written back whole with
+update_document: that rewrote the page on every task, and can't round-trip
+databases or images. A server without append_to_section leaves the page
+alone (the task is still made; `wf task create` warns).
 """
 
 import json
@@ -25,6 +28,8 @@ AGENT = "wf task create"
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 # The unchecked, empty item a daily note's template leaves under each heading.
 _EMPTY_ITEM = re.compile(r"^\s*[-*]\s+\[ \]\s*$")
+# A task line's `- [ ] ` marker; append_to_section takes the text without it.
+_LINE_MARKER = re.compile(r"^\s*[-*]\s+\[ \]\s*")
 
 
 def _name_key(name: str) -> str:
@@ -123,7 +128,11 @@ def record_task(reader, heading: str, line: str, day: Optional[date] = None) -> 
     outline the app gives a new day (a heading and empty to-do per project,
     then Inbox), so the line lands in a real journal page; the app adopts it
     as that day's journal and adds its todos: lists. A server without that
-    tool gets the old way: a page titled with the date, holding the line.
+    tool gets the old way: the page titled with the date, made holding the
+    line when there is none.
+
+    The line goes in with append_to_section, never by rewriting the page; a
+    server without it raises NotesGraphError and the page is left alone.
 
     Returns {"docId", "title", "created"}.
     """
@@ -131,20 +140,24 @@ def record_task(reader, heading: str, line: str, day: Optional[date] = None) -> 
 
     title = (day or date.today()).isoformat()
 
-    def edit(current):
-        return insert_task(current, heading, line)
-
     try:
         made = json.loads(reader.call("ensure_journal", {"date": title, "agent": AGENT}))
     except (NotesGraphError, ValueError, TypeError):
         made = None
     doc_id = (made or {}).get("docId") if isinstance(made, dict) else None
-    if doc_id:
-        reader.call("update_document", {"docId": doc_id, "content": edit(reader.read(doc_id)), "agent": AGENT})
-        return {"docId": doc_id, "title": title, "created": bool(made.get("created"))}
+    created = bool(made.get("created")) if doc_id else False
+    if not doc_id:
+        page = reader.find(title)
+        if not page:
+            # A new page: nothing on it to lose.
+            result = upsert_note(reader, title, insert_task(None, heading, line), AGENT)
+            return {"docId": result.get("docId"), "title": title, "created": result.get("created")}
+        doc_id = page["docId"]
 
-    result = upsert_note(reader, title, edit, AGENT)
-    return {"docId": result.get("docId"), "title": title, "created": result.get("created")}
+    text = _LINE_MARKER.sub("", line, count=1)
+    reader.call("append_to_section",
+                {"docId": doc_id, "heading": heading, "lines": [text], "agent": AGENT})
+    return {"docId": doc_id, "title": title, "created": created}
 
 
 def record_created_task(project: Optional[str], key: str, title: str, url: Optional[str] = None,
