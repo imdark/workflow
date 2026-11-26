@@ -11,8 +11,10 @@ A journal page holds database blocks (each section's "todos:" list), which
 read_document renders as markdown tables and update_document can't write
 back: rewriting the note with them turns them into plain tables and appends
 a second copy of the page. So the line goes into the heading's empty to-do
-with update_block, which touches that one block. Only a note with no
-database blocks is rewritten whole, the line inserted into its markdown.
+with update_block, which touches that one block. With no empty to-do there
+(or no heading), a new one (and heading) is added with insert_block, on a
+server that has it. Only a note with no database blocks is rewritten whole,
+the line inserted into its markdown.
 """
 
 import json
@@ -120,6 +122,50 @@ def _item_text(line: str) -> str:
     return re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
 
 
+_DATABASE_BLOCK = re.compile(r"<!--\s*block_id=(\S+)\s+flavour=notesgraph:database\s*-->")
+
+
+def _has_tool(reader, name: str) -> bool:
+    from workflow.deploy.notes import NotesGraphError
+
+    try:
+        return any(isinstance(t, dict) and t.get("name") == name for t in reader.tools())
+    except (NotesGraphError, AttributeError):
+        return False
+
+
+def insert_item(reader, doc_id: str, heading: str, line: str) -> bool:
+    """Add `line` as a new to-do under `heading` with insert_block; False when it can't.
+
+    The to-do goes at the end of the section's own items, before its todos:
+    list (a database block), or straight after the heading when the section
+    has none. A missing heading is inserted before Inbox, at Inbox's level,
+    with the to-do under it. False, with nothing written, when the server has
+    no insert_block, or the heading is missing and the page has no Inbox.
+    """
+    if not _has_tool(reader, "insert_block"):
+        return False
+    outline = json.loads(reader.call("doc_outline", {"docId": doc_id}))
+    headings = [h for h in (outline or {}).get("headings") or [] if isinstance(h, dict) and h.get("blockId")]
+    key = _name_key(heading)
+    found = next((h for h in headings if _name_key(str(h.get("title") or "")) == key), None)
+    if found:
+        section = reader.call("read_section", {"docId": doc_id, "blockId": found["blockId"]})
+        database = _DATABASE_BLOCK.search(section or "")
+        anchor = {"beforeBlockId": database.group(1)} if database else {"afterBlockId": found["blockId"]}
+    else:
+        inbox = next((h for h in headings if _name_key(str(h.get("title") or "")) == "inbox"), None)
+        if not inbox:
+            return False
+        made = json.loads(reader.call("insert_block", {
+            "docId": doc_id, "beforeBlockId": inbox["blockId"], "type": "heading",
+            "level": int(inbox.get("level") or 2), "text": heading, "agent": AGENT}))
+        anchor = {"afterBlockId": made["blockId"]}
+    reader.call("insert_block", {"docId": doc_id, **anchor, "type": "todo",
+                                 "text": _item_text(line), "agent": AGENT})
+    return True
+
+
 def _session_repo(repos: dict) -> Optional[str]:
     """The configured repo the current folder is in; a worktree counts as its main checkout."""
     candidates = []
@@ -168,8 +214,8 @@ def record_task(reader, heading: str, line: str, day: Optional[date] = None) -> 
     as that day's journal and adds its todos: lists. A server without that
     tool gets the old way: a page titled with the date, holding the line.
     The line fills the heading's empty to-do when it has one; otherwise a
-    note holding database blocks is refused (NotesGraphError) rather than
-    rewritten.
+    note holding database blocks gets a new to-do from insert_item, or is
+    refused (NotesGraphError) rather than rewritten.
 
     Returns {"docId", "title", "created"}.
     """
@@ -196,9 +242,12 @@ def record_task(reader, heading: str, line: str, day: Optional[date] = None) -> 
             return {"docId": doc_id, "title": title, "created": created}
         current = reader.read(doc_id)
         if _TABLE_DIVIDER.search(current or ""):
+            if insert_item(reader, doc_id, heading, line):
+                return {"docId": doc_id, "title": title, "created": created}
             raise NotesGraphError(
-                f"{title} has no empty to-do under '{heading}' to fill, and rewriting the note "
-                "would break its todos: lists; add the line by hand")
+                f"{title} has no empty to-do under '{heading}' to fill, this NotesGraph has no "
+                "insert_block to add one, and rewriting the note would break its todos: lists; "
+                "add the line by hand")
         reader.call("update_document", {"docId": doc_id, "content": edit(current), "agent": AGENT})
         return {"docId": doc_id, "title": title, "created": created}
 

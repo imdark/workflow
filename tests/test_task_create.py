@@ -321,3 +321,79 @@ def test_a_journal_with_todos_lists_and_no_empty_item_is_left_alone(world, monke
     assert fake.notes[date.today().isoformat()] == full
     assert "update_document" not in fake.calls and "update_block" not in fake.calls
     assert "Not added to today's journal" in r.output and "no empty to-do under 'workflow'" in r.output
+
+
+class FakeInsertNotes(FakeBlockNotes):
+    """FakeBlockNotes on a server with insert_block. Each line is a block named
+    <doc>:<line number>; a "### todos:" line stands for a section's todos: list
+    (a database block), so it is in read_section but not in doc_outline."""
+
+    def tools(self):
+        return [{"name": name} for name in ("list_blocks", "update_block", "insert_block", "doc_outline")]
+
+    def call(self, tool, args):
+        if tool not in ("doc_outline", "read_section", "insert_block"):
+            return super().call(tool, args)
+        self.calls.append(tool)
+        doc = args["docId"]
+        lines = self.notes[doc].split("\n")
+        if tool == "doc_outline":
+            heads = [{"blockId": f"{doc}:{n}", "level": len(t) - len(t.lstrip("#")), "title": t.lstrip("#").strip()}
+                     for n, t in enumerate(lines) if t.startswith("#") and t != "### todos:"]
+            return json.dumps({"docId": doc, "headings": heads})
+        if tool == "read_section":
+            start = int(args["blockId"].rsplit(":", 1)[1])
+            out = [lines[start]]
+            for n in range(start + 1, len(lines)):
+                if lines[n].startswith("## "):
+                    break
+                if lines[n] == "### todos:":
+                    out.append(f"<!-- block_id={doc}:{n} flavour=notesgraph:database -->")
+                out.append(lines[n])
+            return "\n".join(out)
+        self.inserted = getattr(self, "inserted", []) + [args]
+        text = (f"{'#' * args['level']} {args['text']}" if args["type"] == "heading"
+                else f"- [ ] {args['text']}")
+        if "beforeBlockId" in args:
+            n = int(args["beforeBlockId"].rsplit(":", 1)[1])
+            lines[n:n] = [text, ""]
+        else:
+            n = int(args["afterBlockId"].rsplit(":", 1)[1]) + 1
+            lines[n:n] = ["", text]
+        self.notes[doc] = "\n".join(lines)
+        return json.dumps({"success": True, "docId": doc, "blockId": f"{doc}:{lines.index(text)}"})
+
+
+def test_with_no_empty_item_a_new_to_do_goes_before_the_sections_todos_list(world, monkeypatch):
+    full = JOURNAL_WITH_LISTS.replace("## workflow\n\n- [ ] \n", "## workflow\n\n- [ ] older\n")
+    fake = FakeInsertNotes({date.today().isoformat(): full}, journals=True)
+    monkeypatch.setattr("workflow.cli_notes.reader_from_env", lambda: fake)
+    _workflow_world(world)
+
+    r = _create("--project", "personal", "--journal")
+
+    assert r.exit_code == 0, r.output
+    assert "update_document" not in fake.calls and "update_block" not in fake.calls
+    assert fake.notes[date.today().isoformat()] == full.replace(
+        "- [ ] older\n\n### todos:", "- [ ] older\n\n- [ ] PERSONAL-7 E2E harness\n\n### todos:")
+    assert [a["type"] for a in fake.inserted] == ["todo"]
+    assert "Journal: under 'workflow'" in r.output
+
+
+def test_a_missing_project_section_is_added_before_inbox_with_the_task_under_it(world, monkeypatch):
+    day = ("## Work\n\n- [ ] \n\n### todos:\n|Status|Deadline|Scheduled|\n|---|---|---|\n\n"
+           "## Inbox\n\n- [ ] \n\n### todos:\n|Status|Deadline|Scheduled|\n|---|---|---|\n")
+    fake = FakeInsertNotes({date.today().isoformat(): day}, journals=True)
+    monkeypatch.setattr("workflow.cli_notes.reader_from_env", lambda: fake)
+    _workflow_world(world)
+
+    r = _create("--project", "personal", "--journal")
+
+    assert r.exit_code == 0, r.output
+    assert "update_document" not in fake.calls
+    assert fake.notes[date.today().isoformat()] == day.replace(
+        "## Inbox", "## workflow\n\n- [ ] PERSONAL-7 E2E harness\n\n## Inbox")
+    heading, todo = fake.inserted
+    assert (heading["type"], heading["level"], heading["text"]) == ("heading", 2, "workflow")
+    # Under the heading it just made, which took the Inbox heading's place.
+    assert todo["type"] == "todo" and todo["afterBlockId"] == heading["beforeBlockId"]
