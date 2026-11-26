@@ -18,8 +18,8 @@ import pytest
 
 from workflow.deploy import agent_mcp
 from workflow.backends.base import Issue
-from workflow.deploy.jobs import (CLAUDE_CODE_SYSTEM_PROMPT, RESEARCH_SYSTEM_PROMPT,
-                                  Job, JobClient, claude_code_argv, research_argv,
+from workflow.deploy.jobs import (CLAUDE_CODE_SYSTEM_PROMPT, GH_READ_ALLOWED,
+                                  RESEARCH_SYSTEM_PROMPT, Job, JobClient, claude_code_argv, research_argv,
                                   run_job, start_job_task)
 from workflow.session import task_branch_name
 
@@ -576,7 +576,8 @@ def test_claude_code_gets_notesgraph_and_a_way_to_ask(tmp_path):
     assert argv[argv.index("--append-system-prompt") + 1] == CLAUDE_CODE_SYSTEM_PROMPT
     allowed = next(a for a in argv if a.startswith("--allowedTools="))
     assert "mcp__notesgraph" in allowed and "mcp__run__ask_user" in allowed
-    assert "Bash" not in allowed, "the shell must go through the permission prompt"
+    shell = [t for t in allowed.split("=", 1)[1].split(",") if t.startswith("Bash")]
+    assert shell == GH_READ_ALLOWED, "beyond PR lookups, the shell goes through the permission prompt"
     assert int(env["MCP_TOOL_TIMEOUT"]) >= 60 * 60 * 1000
 
     config = json.loads((tmp_path / "mcp.json").read_text())["mcpServers"]
@@ -679,7 +680,7 @@ def test_research_gets_omniseek_on_top_of_claude_code(tmp_path, omniseek_token):
     assert prompt.startswith(CLAUDE_CODE_SYSTEM_PROMPT) and RESEARCH_SYSTEM_PROMPT in prompt
     allowed = next(a for a in argv if a.startswith("--allowedTools="))
     assert "mcp__omniseek" in allowed and "mcp__notesgraph" in allowed
-    assert "Bash" not in allowed
+    assert [t for t in allowed.split("=", 1)[1].split(",") if t.startswith("Bash")] == GH_READ_ALLOWED
     assert argv[-1] == "Survey X"
 
     servers = json.loads((job_dir / "mcp.json").read_text())["mcpServers"]
@@ -1032,6 +1033,9 @@ def test_a_workflow_job_asks_and_remembers_like_claude_code(tmp_path, monkeypatc
     assert argv[argv.index("--append-system-prompt") + 1] == CLAUDE_CODE_SYSTEM_PROMPT
     allowed = next(a for a in argv if a.startswith("--allowedTools="))
     assert "mcp__run__ask_user" in allowed and "mcp__notesgraph" in allowed
+    # Looking up a PR or its CI never stops to ask; pushing or merging still does.
+    assert "Bash(gh pr view:*)" in allowed and "Bash(gh pr checks:*)" in allowed
+    assert "gh pr merge" not in allowed
     assert int(spec["env"]["MCP_TOOL_TIMEOUT"]) >= 60 * 60 * 1000
 
 
@@ -1044,7 +1048,8 @@ def test_the_servers_profile_is_the_agent_when_it_sends_one(tmp_path):
 
     assert argv[argv.index("--append-system-prompt") + 1] == "Be the agent the server says."
     assert next(a for a in argv if a.startswith("--allowedTools=")) == \
-        "--allowedTools=mcp__notesgraph,mcp__run__ask_user,WebSearch"
+        "--allowedTools=" + ",".join(["mcp__notesgraph", "mcp__run__ask_user", "WebSearch",
+                                      *GH_READ_ALLOWED])
     assert env["MCP_TOOL_TIMEOUT"] == "1234"
 
 
@@ -1060,7 +1065,7 @@ def test_research_takes_the_whole_prompt_and_tools_from_the_profile(tmp_path, om
     # Not the built-in research prompt added on top: the server's already has it.
     assert argv[argv.index("--append-system-prompt") + 1] == "notes part\nresearch part"
     assert next(a for a in argv if a.startswith("--allowedTools=")) == \
-        "--allowedTools=mcp__notesgraph,mcp__omniseek"
+        "--allowedTools=" + ",".join(["mcp__notesgraph", "mcp__omniseek", *GH_READ_ALLOWED])
     assert "omniseek" in json.loads((job_dir / "mcp.json").read_text())["mcpServers"]
 
 
