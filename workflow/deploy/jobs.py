@@ -401,6 +401,37 @@ CLAUDE_CODE_ALLOWED_TOOLS = [
 # checking its own PR or CI shouldn't stop to ask for a lookup.
 GH_READ_ALLOWED = [f"Bash(gh pr {cmd}:*)" for cmd in ("view", "list", "checks", "diff")]
 
+# Commands that only read, for parsing a transcript, a log or JSON. Runs
+# that reached for `python3 -c` or a heredoc stopped on a prompt each time;
+# Python stays behind the prompt, because a rule can't hold it to reading.
+READ_SHELL_ALLOWED = [f"Bash({cmd}:*)" for cmd in ("jq", "tail", "head", "wc")]
+
+
+def transcripts_dir() -> Path:
+    """Where Claude Code keeps every project's session transcripts."""
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+
+
+def scratch_dir(job_dir: Path) -> Path:
+    """A run's own folder for throwaway files, in place of /tmp."""
+    return job_dir / "scratch"
+
+
+def read_allowed(job_dir: Path) -> list:
+    """What a run may do without asking, whatever its profile says: look up a
+    PR, parse with read-only commands, read earlier sessions' transcripts
+    (they sit outside the working directory) and write in its scratch folder."""
+    return [*GH_READ_ALLOWED, *READ_SHELL_ALLOWED,
+            f"Read(/{transcripts_dir()}/**)", f"Edit(/{scratch_dir(job_dir)}/**)"]
+
+
+def scratch_note(job_dir: Path) -> str:
+    """Tells the agent which commands and folders won't stop to ask."""
+    return ("Reading without a permission prompt: `jq`, `tail`, `head` and `wc` (one command or a pipe "
+            "of them), `gh pr view|list|checks|diff`, and earlier sessions' transcripts under "
+            f"{transcripts_dir()}. `python3 -c`, heredocs and writes to /tmp wait for approval. "
+            f"Put throwaway files in {scratch_dir(job_dir)}.")
+
 # Claude Code gives an MCP tool call this long (ms) before giving up. A
 # question waits for a person, who may be at dinner.
 ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000
@@ -800,7 +831,9 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     # prompt tells the agent to start with them.
     if WF_TOOLS in (extra_mcp or {}):
         allowed += [tool for tool in WF_TOOLS_ALLOWED if tool not in allowed]
-    allowed += [tool for tool in GH_READ_ALLOWED if tool not in allowed]
+    allowed += [tool for tool in read_allowed(job_dir) if tool not in allowed]
+    scratch_dir(job_dir).mkdir(parents=True, exist_ok=True)
+    session_context = "\n\n".join(part for part in (session_context, scratch_note(job_dir)) if part)
     # The automation's tools are the profile owner's own commands: allowed
     # without asking, like NotesGraph's (the cloud runner does the same).
     if tools_spec and "mcp__automation" not in allowed:
