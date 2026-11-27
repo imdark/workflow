@@ -189,6 +189,12 @@ in notes), there is nothing to commit and `wf done` leaves the task where it
 is. Answer it, then end your answer with this line, so the task isn't left
 open unnoticed:
 "{issue.key} needs no PR: close it by hand."
+
+If you set the task BLOCKED instead (it belongs in another repo, it has no
+spec, or it waits on someone), the work is still owed, so don't use that
+line. End your answer with this one, followed by what it needs (the repo
+to run it in, or the answer to wait for):
+"{issue.key} is blocked: do not close it."
 """)
 
     # Only when the launcher loaded the server: sessions told about tools
