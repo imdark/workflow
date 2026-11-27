@@ -7681,6 +7681,117 @@ def plan():
     tui_app.run()
 
 
+pr_app = typer.Typer(
+    help="Pull requests and CI, one call each: status, checks, runs, and what a review reads",
+    no_args_is_help=True)
+app.add_typer(pr_app, name="pr")
+
+_PR_HELP = "A number, URL, branch or task key (PERSONAL-12); default: the current branch's pull request"
+_PR_REPO_HELP = "owner/name, when not the repository of --repo-path"
+
+
+def _pr_call(fn, formatter, as_json: bool, **kwargs):
+    """Run one of workflow.pr's readers and print it, as text or JSON."""
+    import json as _json
+    from workflow.pr import PrError
+
+    try:
+        result = fn(**kwargs)
+    except PrError as e:
+        typer.echo(f"❌ {e}", err=True)
+        raise typer.Exit(2)
+    typer.echo(_json.dumps(result, indent=2) if as_json else formatter(result))
+    return result
+
+
+@pr_app.command("show")
+def pr_show(
+    pr: str = typer.Argument(None, help=_PR_HELP),
+    repo_path: str = typer.Option(".", "--repo-path", help="Repository the pull request is in"),
+    repo: str = typer.Option(None, "--repo", help=_PR_REPO_HELP),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """Where a pull request stands: mergeable, reviewed, checks, and the task it is for."""
+    from workflow import pr as prs
+    _pr_call(prs.pr_summary, prs.format_summary, as_json, repo_path=repo_path, pr=pr, repo=repo)
+
+
+@pr_app.command("list")
+def pr_list_cmd(
+    state: str = typer.Option("open", "--state", help="open, closed, merged or all"),
+    mine: bool = typer.Option(False, "--mine", help="Only pull requests you opened"),
+    search: str = typer.Option(None, "--search", help="GitHub search terms"),
+    limit: int = typer.Option(30, "--limit", help="How many to list"),
+    repo_path: str = typer.Option(".", "--repo-path", help="Repository to list"),
+    repo: str = typer.Option(None, "--repo", help=_PR_REPO_HELP),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """The repository's pull requests, each with its checks and its task."""
+    from workflow import pr as prs
+    _pr_call(prs.pr_list, prs.format_list, as_json, repo_path=repo_path, state=state, mine=mine,
+             search=search, limit=limit, repo=repo)
+
+
+@pr_app.command("checks")
+def pr_checks_cmd(
+    pr: str = typer.Argument(None, help=_PR_HELP),
+    no_logs: bool = typer.Option(False, "--no-logs", help="Name the failing checks without fetching their logs"),
+    repo_path: str = typer.Option(".", "--repo-path", help="Repository the pull request is in"),
+    repo: str = typer.Option(None, "--repo", help=_PR_REPO_HELP),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """A pull request's checks; for each failing job, the step that failed and the end of its log."""
+    from workflow import pr as prs
+    result = _pr_call(prs.pr_checks, prs.format_checks, as_json, repo_path=repo_path, pr=pr, repo=repo,
+                      logs=not no_logs)
+    if result["failed"]:
+        raise typer.Exit(1)
+
+
+@pr_app.command("runs")
+def pr_runs_cmd(
+    branch: str = typer.Option(None, "--branch", help="Only runs of this branch"),
+    workflow: str = typer.Option(None, "--workflow", help="Only this workflow (its name or file)"),
+    commit: str = typer.Option(None, "--commit", help="Only runs of this commit"),
+    limit: int = typer.Option(10, "--limit", help="How many to list"),
+    repo_path: str = typer.Option(".", "--repo-path", help="Repository whose runs to list"),
+    repo: str = typer.Option(None, "--repo", help=_PR_REPO_HELP),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """Recent GitHub Actions runs (builds, deploys), newest first."""
+    from workflow import pr as prs
+    _pr_call(prs.ci_runs, prs.format_runs, as_json, repo_path=repo_path, branch=branch,
+             workflow=workflow, commit=commit, limit=limit, repo=repo)
+
+
+@pr_app.command("run")
+def pr_run_cmd(
+    run_id: int = typer.Argument(..., help="The run's id, as `wf pr runs` lists it"),
+    no_logs: bool = typer.Option(False, "--no-logs", help="Name the failed jobs without fetching their logs"),
+    repo_path: str = typer.Option(".", "--repo-path", help="Repository the run is in"),
+    repo: str = typer.Option(None, "--repo", help=_PR_REPO_HELP),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """One Actions run: its jobs; for each failed job, the step that failed and the end of its log."""
+    from workflow import pr as prs
+    result = _pr_call(prs.ci_run, prs.format_run, as_json, run_id=run_id, repo_path=repo_path, repo=repo,
+                      logs=not no_logs)
+    if (result["conclusion"] or "").lower() not in ("", "success", "skipped"):
+        raise typer.Exit(1)
+
+
+@pr_app.command("review")
+def pr_review_cmd(
+    pr: str = typer.Argument(None, help=_PR_HELP),
+    repo_path: str = typer.Option(".", "--repo-path", help="Repository the pull request is in"),
+    repo: str = typer.Option(None, "--repo", help=_PR_REPO_HELP),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """Everything a review reads, at once: the task, the description, the discussion, the files and the diff."""
+    from workflow import pr as prs
+    _pr_call(prs.pr_review, prs.format_review, as_json, repo_path=repo_path, pr=pr, repo=repo)
+
+
 @app.command()
 def lint(
     all_files: bool = typer.Option(False, "--all", help="Lint the whole repository, not just the changed files"),

@@ -344,6 +344,107 @@ def lint(
     return json.dumps({"ok": all(r["ok"] for r in results), "steps": results}, indent=2)
 
 
+def _pr_tool(fn, **kwargs) -> str:
+    from workflow.pr import PrError
+    try:
+        return json.dumps(fn(**kwargs), indent=2)
+    except PrError as e:
+        return f"Error: {e}"
+
+
+_PR = "A number, URL, branch or task key (PERSONAL-12); omit for the current branch's pull request"
+_REPO_PATH = "Path inside the git repository"
+_REPO = "owner/name, when not the repository at repo_path"
+
+
+@mcp.tool()
+def pr_status(
+    repo_path: Annotated[str, _REPO_PATH],
+    pr: Annotated[str, _PR] = None,
+    repo: Annotated[str, _REPO] = None,
+) -> str:
+    """Where a pull request stands, in one call instead of several `gh pr view`s.
+
+    Returns JSON: state, draft, base and head, mergeable, review decision,
+    merge commit, size, `checks` (counts, with the failing and pending ones
+    named), `task` (the task it is for, from the branch or title: key,
+    title, status, and its NotesGraph note block) and a one-line `verdict`
+    (e.g. "ready to merge", "not ready: 2 checks failing").
+    """
+    from workflow.pr import pr_summary
+    return _pr_tool(pr_summary, repo_path=repo_path, pr=pr, repo=repo)
+
+
+@mcp.tool()
+def pr_list(
+    repo_path: Annotated[str, _REPO_PATH],
+    state: Annotated[str, "open, closed, merged or all"] = "open",
+    mine: Annotated[bool, "Only pull requests the signed-in user opened"] = False,
+    search: Annotated[str, "GitHub search terms"] = None,
+    limit: Annotated[int, "How many to list"] = 30,
+    repo: Annotated[str, _REPO] = None,
+) -> str:
+    """The repository's pull requests, each with its checks counted and the task it is for."""
+    from workflow.pr import pr_list as _pr_list
+    return _pr_tool(_pr_list, repo_path=repo_path, state=state, mine=mine, search=search,
+                    limit=limit, repo=repo)
+
+
+@mcp.tool()
+def pr_checks(
+    repo_path: Annotated[str, _REPO_PATH],
+    pr: Annotated[str, _PR] = None,
+    logs: Annotated[bool, "Fetch the end of each failing job's log"] = True,
+    repo: Annotated[str, _REPO] = None,
+) -> str:
+    """Why a pull request's checks fail: each failing job, the step that failed, and the end of its log."""
+    from workflow.pr import pr_checks as _pr_checks
+    return _pr_tool(_pr_checks, repo_path=repo_path, pr=pr, repo=repo, logs=logs)
+
+
+@mcp.tool()
+def ci_runs(
+    repo_path: Annotated[str, _REPO_PATH],
+    branch: Annotated[str, "Only runs of this branch"] = None,
+    workflow: Annotated[str, "Only this workflow (its name or file)"] = None,
+    commit: Annotated[str, "Only runs of this commit"] = None,
+    limit: Annotated[int, "How many to list"] = 10,
+    repo: Annotated[str, _REPO] = None,
+) -> str:
+    """Recent GitHub Actions runs (builds, deploys), newest first, with status and conclusion."""
+    from workflow.pr import ci_runs as _ci_runs
+    return _pr_tool(_ci_runs, repo_path=repo_path, branch=branch, workflow=workflow, commit=commit,
+                    limit=limit, repo=repo)
+
+
+@mcp.tool()
+def ci_run(
+    repo_path: Annotated[str, _REPO_PATH],
+    run_id: Annotated[int, "The run's id, as ci_runs lists it"],
+    logs: Annotated[bool, "Fetch the end of each failed job's log"] = True,
+    repo: Annotated[str, _REPO] = None,
+) -> str:
+    """One Actions run: its jobs, and for each failed job the step that failed and the end of its log."""
+    from workflow.pr import ci_run as _ci_run
+    return _pr_tool(_ci_run, run_id=run_id, repo_path=repo_path, repo=repo, logs=logs)
+
+
+@mcp.tool()
+def pr_review_context(
+    repo_path: Annotated[str, _REPO_PATH],
+    pr: Annotated[str, _PR] = None,
+    repo: Annotated[str, _REPO] = None,
+) -> str:
+    """Everything a review of a pull request reads, gathered once.
+
+    The pr_status fields, plus the task's full description, the pull
+    request's description, reviews and comments in order, the changed files
+    and the diff (cut at 60,000 characters; `diff_truncated` says so).
+    """
+    from workflow.pr import pr_review
+    return _pr_tool(pr_review, repo_path=repo_path, pr=pr, repo=repo)
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "install":
