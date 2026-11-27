@@ -141,6 +141,8 @@ def test_build_context_uses_memory_block_not_dead_rag_text(monkeypatch):
     assert 'task_key="T-1"' in context
     # A question-only task has nothing for `wf done` to ship.
     assert "T-1 needs no PR: close it by hand." in context
+    # A BLOCKED task is still owed, so it doesn't end with "close it".
+    assert "T-1 is blocked: do not close it." in context
 
 
 def test_build_context_names_wf_tools_only_when_loaded(monkeypatch):
@@ -258,3 +260,20 @@ def test_block_carries_project_decisions_from_other_tasks(store):
 
     assert "FROM OTHER TASKS IN web:\n- (decision, T-2) Use sqlite, not redis" in block
     assert "unrelated project decision" not in block
+
+
+def test_build_context_asks_for_measurements_before_done(monkeypatch, tmp_path):
+    """An unmeasured speed-up PR was merged and treated as done; every session is told to measure first."""
+    from workflow import ai_context
+
+    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None, **kw: "")
+    monkeypatch.setattr(ai_context, "get_rag", lambda: None)
+    monkeypatch.setattr(ai_context, "get_ai_instructions", lambda issue, repo: [])
+    issue = SimpleNamespace(key="T-1", title="Speed up the build", description="d")
+
+    context = ai_context.build_context(issue, repo_path=str(tmp_path))
+
+    assert "MEASURE BEFORE CALLING IT DONE" in context
+    assert "set the task to BLOCKED" in context
+    # It comes before the shipping steps, so it is read before `wf done`.
+    assert context.index("MEASURE BEFORE CALLING IT DONE") < context.index("WHEN YOU ARE DONE")

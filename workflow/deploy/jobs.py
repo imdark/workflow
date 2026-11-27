@@ -1041,9 +1041,12 @@ def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
 
     from workflow.backends import get_backend
     from workflow.config import is_git_enabled, load_effective_config
-    from workflow.session import (base_branch_for, configured_repos,
-                                  resolve_repo, start_in_worktree)
+    from workflow.session import (TaskBlocked, base_branch_for, configured_repos,
+                                  is_blocked, resolve_repo, start_in_worktree)
 
+    # A BLOCKED item or ticket waits for a person; refused before it moves.
+    if is_blocked(item=job.title):
+        raise TaskBlocked(_task_title(job))
     project, home_repo = job_home(job, strict=True) or (None, None)
     backend = get_backend(load_effective_config(project))
     task_file = job_dir / "task.json"
@@ -1053,6 +1056,8 @@ def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
             issue = backend.get(json.loads(task_file.read_text())["key"])
         except Exception:
             issue = None
+    if issue is not None and is_blocked(issue):
+        raise TaskBlocked(issue.key)
     if issue is None:
         issue = backend.create_issue(_task_title(job), _prompt(job), "Task")
         if issue is None:

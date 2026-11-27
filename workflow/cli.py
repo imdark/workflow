@@ -2684,6 +2684,7 @@ def start(
         None, "--worktree/--no-worktree",
         help="Answer the worktree question up front (asked when another AI session is working, or the repo has uncommitted changes; run by an agent it's yes)",
     ),
+    force: bool = typer.Option(False, "--force", help="Start the task even though it is BLOCKED"),
     # Dynamic custom fields will be handled via kwargs
 ):
     """
@@ -2738,7 +2739,12 @@ def start(
     # The repo the task says it belongs in (#repo:<name>, or its NotesGraph
     # project), before the task moves: tasks for one repo kept being started,
     # and stopped, in another. A repo that isn't here refuses the start.
-    from workflow.session import RepoNotHere, configured_repos, resolve_repo, task_home
+    from workflow.session import (RepoNotHere, TaskBlocked, configured_repos, is_blocked,
+                                  resolve_repo, task_home)
+    # A run set it BLOCKED for a person; starting it again stops in the same place.
+    if is_blocked(issue, issue.title) and not force:
+        typer.echo(f"❌ Not starting {issue.key}: {TaskBlocked(issue.key)} (or pass --force)")
+        raise typer.Exit(1)
     home = None
     if is_git_enabled() and not repo_path:
         try:

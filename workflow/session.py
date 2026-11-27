@@ -104,6 +104,34 @@ def task_home(*texts: Optional[str]) -> Optional[tuple]:
     return None
 
 
+class TaskBlocked(RuntimeError):
+    """The task is BLOCKED: a run set it aside for a person (wrong repo, no
+    spec), so starting it again would only stop at the same place."""
+
+    def __init__(self, key: str):
+        self.key = key
+        super().__init__(
+            f"{key} is BLOCKED; read its note, then move it out of BLOCKED to start it again")
+
+
+# A NotesGraph item marked BLOCKED: the keyword leads its text, after any
+# bullet or checkbox ("- [ ] BLOCKED **Allow gh pr list**").
+_BLOCKED_ITEM_RE = re.compile(r"^[\s*+-]*(?:\[[ xX]\]\s*)?BLOCKED\b")
+
+
+def is_blocked(issue=None, item: Optional[str] = None) -> bool:
+    """Whether a ticket's status, or the first line of a note item's text, says BLOCKED.
+
+    Runs set a wrong-repo or spec-less task BLOCKED and stopped, and the next
+    dispatch started it again; the prompt alone didn't stop that.
+    """
+    status = str(getattr(issue, "status", "") or "")
+    if status.strip().lower() == "blocked":
+        return True
+    first = next((line for line in (item or "").splitlines() if line.strip()), "")
+    return bool(_BLOCKED_ITEM_RE.match(first))
+
+
 def task_branch_name(issue) -> str:
     """`<key>-<title>`, with anything git refuses in a branch name dashed.
 
