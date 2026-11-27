@@ -10,7 +10,8 @@ things, and each is a function here:
     pr_summary   is it open, mergeable, reviewed and green, and what task is
                  it for (the fields `gh pr view --json` was asked for most:
                  state, mergeable, base and head, merge commit, checks)
-    pr_checks    which check failed, at which step, with the end of its log
+    pr_checks    which check failed, at which step, the files and lines it
+                 pointed at, and the end of its log
     ci_runs /    the workflow runs of a branch, and one run's jobs (a deploy
     ci_run       or a build is watched this way as often as a PR's checks)
     pr_review    everything a review reads: the task, the description, the
@@ -39,6 +40,8 @@ LOG_TAIL = 4000
 DIFF_LIMIT = 60000
 # Failing jobs whose logs one call fetches; the rest are named only.
 MAX_FAILED_LOGS = 3
+# Annotations kept per failing job: a linter can leave hundreds.
+MAX_ANNOTATIONS = 20
 
 SUMMARY_FIELDS = (
     "number,title,url,state,isDraft,author,baseRefName,headRefName,headRefOid,"
@@ -318,6 +321,23 @@ def _failed_log(run: Runner, job_id: int, repo_path: Optional[str], repo: Option
     return _tail("\n".join(lines), tail)
 
 
+def _annotations(run: Runner, job_id: int, repo_path: Optional[str], url: Optional[str]) -> List[dict]:
+    """Where a failing job pointed: the file and line of each error it
+    annotated (a linter's findings, a failing test). The log often leaves the
+    file out; the annotation has it. A job's own "exited with code 1" isn't
+    one of these."""
+    owner = _JOB_REPO.search(url or "")
+    if not owner:
+        return []
+    try:
+        raw = _json(run, ["api", f"repos/{owner.group(1)}/check-runs/{job_id}/annotations"], repo_path)
+    except PrError:
+        return []
+    return [{"path": a.get("path"), "line": a.get("start_line"), "message": (a.get("message") or "").strip()}
+            for a in raw or []
+            if a.get("annotation_level") == "failure" and a.get("path") != ".github"][:MAX_ANNOTATIONS]
+
+
 def _jobs(run: Runner, run_id: int, repo_path: Optional[str], repo: Optional[str]) -> dict:
     return _json(run, ["run", "view", str(run_id), "--json",
                        "databaseId,workflowName,displayTitle,status,conclusion,event,headBranch,"
@@ -356,6 +376,9 @@ def pr_checks(repo_path: Optional[str] = None, pr: Optional[str] = None, repo: O
         job = steps_of[run_id].get(job_id)
         if job:
             check["failed_steps"] = job["failed_steps"]
+        annotations = _annotations(run, job_id, repo_path, check.get("url"))
+        if annotations:
+            check["annotations"] = annotations
         if fetched < MAX_FAILED_LOGS and check["conclusion"] != "cancelled":
             check["log_tail"] = _failed_log(run, job_id, repo_path, repo, tail, check.get("url"))
             fetched += 1
@@ -500,6 +523,8 @@ def format_checks(result: dict) -> str:
             lines.append(f"  failed at: {', '.join(check['failed_steps'])}")
         if check.get("url"):
             lines.append(f"  {check['url']}")
+        for note in check.get("annotations") or []:
+            lines.append(f"  {note['path']}:{note['line']}: {note['message']}")
         if check.get("log_tail"):
             lines.append(_indent(check["log_tail"]))
     pending = [check["name"] for check in result["pending_checks"]]

@@ -43,6 +43,8 @@ class Gh:
                 if callable(answer):
                     answer = answer(args)
                 return answer if isinstance(answer, str) else json.dumps(answer)
+        if args[0] == "api" and args[-1].endswith("/annotations"):
+            raise PrError("HTTP 404")  # a job that annotated nothing
         raise AssertionError(f"unexpected gh {' '.join(args)}")
 
 
@@ -188,6 +190,25 @@ def test_a_job_that_failed_in_a_run_still_going_is_read_through_the_api():
     })
     assert prs.pr_checks("/repo", "12", run=neither)["failing"][0]["log_tail"] == \
         "(log not available: still in progress)"
+
+
+def test_a_failing_check_names_the_files_and_lines_it_pointed_at():
+    gh = Gh({
+        "pr view": raw_pr(statusCheckRollup=[check("lint", "FAILURE", job=22)]),
+        "run view 900": {"jobs": []},
+        "run view --job": "j\ts\tFound 0 warnings and 1 error.\n",
+        "api repos/acme/app/check-runs/22/annotations": [
+            {"path": ".github", "start_line": 22, "annotation_level": "failure",
+             "message": "Process completed with exit code 1."},
+            {"path": "src/chat.ts", "start_line": 1, "annotation_level": "failure",
+             "message": "Run autofix to sort these imports!"},
+            {"path": ".github", "start_line": 26, "annotation_level": "warning", "message": "Restore cache failed"},
+        ],
+    })
+    out = prs.pr_checks("/repo", "12", run=gh)
+    assert out["failing"][0]["annotations"] == [
+        {"path": "src/chat.ts", "line": 1, "message": "Run autofix to sort these imports!"}]
+    assert "  src/chat.ts:1: Run autofix to sort these imports!" in prs.format_checks(out)
 
 
 def test_only_the_first_few_failing_jobs_have_their_logs_fetched():
