@@ -14,6 +14,8 @@ Files in <job-dir>:
                  "resumed"?: true when it resumes an interrupted attempt,
                      or the session of the run it follows up,
                  "followsUp"?: the id of the ended run it follows up,
+                 "route"?: the line saying which model and effort the
+                     server picked for it,
                  "caffeinate"?: true to keep the Mac awake while it runs,
                  "job"?: {...what the checkpoint manifest names it by}}
     log.txt      the transcript, appended as the run goes
@@ -296,6 +298,8 @@ def run(job_dir: Path, out: TextIO = sys.stdout) -> int:
         if spec.get("provider") == "research":
             narrator.say("  Researching with OmniSeek: cross-lingual search, papers, "
                          "PDFs and media.")
+        if spec.get("route"):
+            narrator.say(spec["route"])
         if spec.get("resumed") and spec.get("followsUp"):
             narrator.say(f"↻ following up run {spec['followsUp'][:8]}: its session "
                          "resumed, in the worktree it left")

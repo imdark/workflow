@@ -555,6 +555,43 @@ def test_a_job_payload_keeps_its_title():
     assert _Job.from_payload({"id": "j"}).title == ""
 
 
+def test_claude_code_runs_on_the_model_and_effort_the_server_picked(tmp_path):
+    from workflow.deploy.jobs import JobClient, claude_code_argv, model_route, route_line
+
+    client = JobClient("http://ng", "ws-1", token="t")
+
+    def argv_for(routing):
+        job = Job.from_payload({**payload(), "profile": {"routing": routing}})
+        return claude_code_argv(job, "go", tmp_path, client)[0], model_route(job)
+
+    argv, route = argv_for({"model": "opus", "effort": "high", "fallbackModel": "sonnet",
+                            "tier": "hard", "reasons": ["touches code", "long note"]})
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert argv[argv.index("--fallback-model") + 1] == "sonnet"
+    assert argv[-1] == "go"
+    assert route_line(route) == "  Model: opus, effort high (touches code; long note)."
+
+    argv, route = argv_for({"model": "haiku", "effort": "low"})
+    assert argv[argv.index("--model") + 1] == "haiku"
+    assert "--fallback-model" not in argv
+    assert route_line(route) == "  Model: haiku, effort low."
+
+
+def test_without_a_usable_route_claude_code_keeps_its_defaults(tmp_path):
+    from workflow.deploy.jobs import JobClient, claude_code_argv
+
+    client = JobClient("http://ng", "ws-1", token="t")
+    for profile in (None, {}, {"routing": None}, {"routing": "opus"},
+                    {"routing": {"model": "opus"}},
+                    {"routing": {"model": "opus", "effort": "extreme"}},
+                    {"routing": {"model": "", "effort": "high"}}):
+        job = Job.from_payload({**payload(), **({"profile": profile} if profile is not None else {})})
+        argv, _ = claude_code_argv(job, "go", tmp_path, client)
+        assert "--model" not in argv and "--effort" not in argv
+        assert "--fallback-model" not in argv
+
+
 def test_a_run_reports_what_it_cost_and_its_cap_reaches_claude(tmp_path):
     from workflow.deploy.jobs import JobClient, _run_claimed, claude_code_argv
 

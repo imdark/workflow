@@ -704,6 +704,34 @@ def wf_tools_mcp() -> Optional[dict]:
     return {WF_TOOLS: server} if server else None
 
 
+ROUTE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def model_route(job: Job) -> Optional[dict]:
+    """The model and effort the server picked for this run (its
+    profile.routing), or None when it sent none (an older server) or one
+    this runner can't use; Claude Code's own defaults then stand."""
+    route = (job.profile or {}).get("routing")
+    if not isinstance(route, dict):
+        return None
+    model, effort = route.get("model"), route.get("effort")
+    if not isinstance(model, str) or not model.strip() or effort not in ROUTE_EFFORTS:
+        return None
+    fallback = route.get("fallbackModel")
+    reasons = route.get("reasons")
+    return {
+        "model": model.strip(), "effort": effort,
+        "fallbackModel": fallback.strip() if isinstance(fallback, str) and fallback.strip() else None,
+        "reasons": [str(r) for r in reasons] if isinstance(reasons, list) else [],
+    }
+
+
+def route_line(route: dict) -> str:
+    """The transcript line that says which model the run is on, and why."""
+    reasons = f" ({'; '.join(route['reasons'])})" if route["reasons"] else ""
+    return f"  Model: {route['model']}, effort {route['effort']}{reasons}."
+
+
 def claude_code_argv(job: Job, prompt: str, job_dir: Path,
                      client: "JobClient", plugin_dir: Optional[Path] = None,
                      extra_mcp: Optional[dict] = None,
@@ -779,8 +807,12 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
         allowed.append("mcp__automation")
     tool_timeout = int(profile.get("toolTimeoutMs") or ASK_TIMEOUT_MS)
     skills_dir = profile_skills_plugin(job, job_dir)
+    route = model_route(job)
     argv = [
         "claude", "--print", "--verbose", "--output-format", "stream-json",
+        *(["--model", route["model"], "--effort", route["effort"]] if route else []),
+        *(["--fallback-model", route["fallbackModel"]]
+          if route and route["fallbackModel"] else []),
         "--mcp-config", str(mcp_path), "--strict-mcp-config",
         "--append-system-prompt", system_prompt,
         # `=` form: --allowedTools is variadic and would otherwise swallow
@@ -1317,6 +1349,8 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
              **({"automation": automation} if automation else {}),
              **({"resumed": True} if resume else {}),
              **({"followsUp": job.continues} if followed else {}),
+             **({"route": route_line(model_route(job))}
+                if "--model" in argv and model_route(job) else {}),
              **({"caffeinate": True} if keep_awake(config, job_dir) else {}),
              # What its checkpoints name it by.
              "job": {"id": job.id, "agentId": job.agent_id, "agentName": job.agent_name,
