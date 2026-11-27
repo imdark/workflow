@@ -128,25 +128,63 @@ def test_search_conversations_returns_snippets(store):
 def test_build_context_uses_memory_block_not_dead_rag_text(monkeypatch):
     from workflow import ai_context
 
-    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None: f'<wf-memory task="{key}">x</wf-memory>')
+    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None, **kw: f'<wf-memory task="{key}">x</wf-memory>')
+    monkeypatch.setattr(ai_context, "get_rag", lambda: None)
+    monkeypatch.setattr(ai_context, "get_ai_instructions", lambda issue, repo: [])
+    issue = SimpleNamespace(key="T-1", title="t", description="d")
+
+    context = ai_context.build_context(issue, wf_tools=True)
+
+    assert '<wf-memory task="T-1">x</wf-memory>' in context
+    assert "RAG system" not in context
+    assert "search_past_conversations" in context
+    assert 'task_key="T-1"' in context
+    # A question-only task has nothing for `wf done` to ship.
+    assert "T-1 needs no PR: close it by hand." in context
+
+
+def test_build_context_names_wf_tools_only_when_loaded(monkeypatch):
+    from workflow import ai_context
+
+    seen = {}
+    def block(key, project=None, wf_tools=True):
+        seen["wf_tools"] = wf_tools
+        return ""
+    monkeypatch.setattr(ai_context, "memory_block", block)
     monkeypatch.setattr(ai_context, "get_rag", lambda: None)
     monkeypatch.setattr(ai_context, "get_ai_instructions", lambda issue, repo: [])
     issue = SimpleNamespace(key="T-1", title="t", description="d")
 
     context = ai_context.build_context(issue)
 
-    assert '<wf-memory task="T-1">x</wf-memory>' in context
-    assert "RAG system" not in context
-    assert "search_past_conversations" in context
-    # A question-only task has nothing for `wf done` to ship.
-    assert "T-1 needs no PR: close it by hand." in context
+    assert "wf-tools" not in context
+    assert "search_task_facts" not in context
+    assert seen["wf_tools"] is False
+
+
+def test_memory_block_without_wf_tools_does_not_point_at_them(store):
+    _facts(store, "T-1", *[f"fact number {i}" for i in range(recall.MAX_FACTS + 5)])
+
+    block = recall.memory_block("T-1", store=store, wf_tools=False)
+
+    assert "search_task_facts" not in block
+    assert "more not shown" in block
+
+
+def test_wf_tools_server_runs_on_this_python():
+    import sys
+    from workflow import ai_context
+
+    server = ai_context.wf_tools_server()
+
+    assert server == {"type": "stdio", "command": sys.executable, "args": ["-m", "workflow.mcp"]}
 
 
 def test_build_context_asks_to_check_the_repo_first(monkeypatch, tmp_path):
     import subprocess
     from workflow import ai_context
 
-    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None: "")
+    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None, **kw: "")
     monkeypatch.setattr(ai_context, "get_rag", lambda: None)
     monkeypatch.setattr(ai_context, "get_ai_instructions", lambda issue, repo: [])
     repo = tmp_path / "workflow-personal-9-x"
@@ -159,7 +197,8 @@ def test_build_context_asks_to_check_the_repo_first(monkeypatch, tmp_path):
     context = ai_context.build_context(issue, repo_path=str(repo))
 
     assert "checkout of the notes-graph repo" in context
-    assert "BLOCKED" in context
+    # Work for another repo or project is filed there via the skill, after asking the user.
+    assert "file-task-elsewhere skill" in context and "wf task create --repo" in context
     # Without a remote the folder name stands in.
     subprocess.run(["git", "-C", str(repo), "remote", "remove", "origin"], check=True)
     assert ai_context.repo_name(str(repo)) == "workflow-personal-9-x"

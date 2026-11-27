@@ -371,9 +371,12 @@ def create_branch(issue, base, repo_path: Optional[str] = None, skip_uncommitted
         current_branch = repo.active_branch.name
         changes_summary = get_uncommitted_changes_summary(repo_path)
         
+        if not sys.stdin.isatty():
+            raise RuntimeError(f"{repo_path or 'This checkout'} has uncommitted changes ({changes_summary}) on "
+                               f"'{current_branch}'; start with --worktree, or commit them first")
         console.print(f"⚠️  You have {changes_summary} changes on branch '{current_branch}'")
         console.print("📝 Switching branches will lose these changes if not committed.")
-        
+
         proceed = Prompt.ask(
             "Do you want to continue anyway, shelve changes, or cancel?",
             choices=["y", "s", "n"],
@@ -461,6 +464,20 @@ def push_branch(repo_path: Optional[str] = None):
     repo = get_repo(repo_path)
     repo.git.push("--set-upstream", "origin", repo.active_branch.name)
 
+
+def unpushed_commits(repo_path: Optional[str], branch: str, base_branch: str) -> int:
+    """Commits on `branch` that origin does not have: past origin/<branch> when it is on origin, else past
+    origin/<base_branch> (a branch never pushed). 0 when neither can be read."""
+    repo = get_repo(repo_path)
+    try:
+        repo.git.fetch("origin", branch)
+        return len(list(repo.iter_commits(f"origin/{branch}..{branch}")))
+    except Exception:
+        try:
+            return len(list(repo.iter_commits(f"origin/{base_branch}..{branch}")))
+        except Exception:
+            return 0
+
 def base_ref(base_branch: str, repo_path: Optional[str] = None) -> str:
     """The ref a branch is compared against for its PR: origin's `base_branch` when the remote has it (that is what
     the PR is opened against), else the local branch of that name. Raises when neither exists, with the fix."""
@@ -474,6 +491,26 @@ def base_ref(base_branch: str, repo_path: Optional[str] = None) -> str:
             continue
     raise RuntimeError(f"Base branch '{base_branch}' exists neither as origin/{base_branch} nor locally in "
                        f"{repo_path or 'this repo'}; fetch it, or name the branch the PR goes into with --base")
+
+
+def fetch_base(base_branch: str, repo_path: Optional[str] = None) -> Optional[str]:
+    """Bring origin/<base> up to date before a task branches from it, and the local <base> with it
+    (`git fetch origin stage:stage`) when that branch exists and can fast-forward; a local base that is
+    checked out somewhere or has diverged is left alone. Returns why the fetch failed, else None."""
+    if not has_origin_remote(repo_path):
+        return None
+    repo = get_repo(repo_path)
+    if base_branch in get_available_branches(repo_path):
+        try:
+            repo.git.fetch("origin", f"{base_branch}:{base_branch}")
+            return None
+        except Exception:
+            pass
+    try:
+        repo.git.fetch("origin", base_branch)
+        return None
+    except Exception as e:
+        return str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
 
 
 def has_diff_with_base(repo_path: Optional[str] = None, base_branch: Optional[str] = None):
@@ -698,7 +735,9 @@ def create_pr(issue, reviewers: Optional[str] = None, repo_path: Optional[str] =
             return None
 
 def check_existing_prs_for_issue(issue, repo_paths: list) -> dict:
-    """Check if PRs already exist for a given issue across multiple repositories"""
+    """The open PR of each repo's CURRENT branch that names the issue -> {repo_path: pr}. Only that branch's: a task
+    can have several branches, and another branch's PR (a merge PR whose title quotes the task's branch name, say)
+    is not this branch's; counting it made `wf done` skip a new branch without pushing it."""
     import subprocess
     import json
     from pathlib import Path
@@ -718,8 +757,9 @@ def check_existing_prs_for_issue(issue, repo_paths: list) -> dict:
             continue
         current_branch = current_branch_result.stdout.strip()
         
-        # Search for PRs by issue key
-        search_cmd = ["gh", "pr", "list", "--search", f"{issue.key}", "--json", "number,title,url,headRefName"]
+        # This branch's open PRs, then the one that names the issue
+        search_cmd = ["gh", "pr", "list", "--head", current_branch, "--state", "open",
+                      "--json", "number,title,url,headRefName"]
         search_result = subprocess.run(search_cmd, capture_output=True, text=True, cwd=git_repo_path)
         
         found_pr = None
@@ -728,7 +768,7 @@ def check_existing_prs_for_issue(issue, repo_paths: list) -> dict:
                 prs = json.loads(search_result.stdout.strip())
                 for pr in prs:
                     pr_title = pr.get("title", "")
-                    if issue.key.upper() in pr_title.upper():
+                    if pr.get("headRefName") == current_branch and issue.key.upper() in pr_title.upper():
                         found_pr = pr
                         break
             except json.JSONDecodeError:
@@ -813,6 +853,11 @@ def unshelve_changes(repo_path: Optional[str] = None) -> bool:
         return False
 
 
+def safe_branch_dirname(branch_name: str) -> str:
+    """The branch name as a worktree directory suffix: special characters to "_", at most 50 long."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in branch_name)[:50]
+
+
 def get_worktree_path(repo_path: str, branch_name: str) -> str:
     """Generate a worktree path for a branch in a neighboring directory.
     
@@ -829,12 +874,7 @@ def get_worktree_path(repo_path: str, branch_name: str) -> str:
     parent_dir = repo_path.parent
     repo_name = repo_path.name
     
-    # Create a sanitized branch name for the directory
-    # Remove special characters and limit length
-    safe_branch = "".join(c if c.isalnum() or c in "-_" else "_" for c in branch_name)
-    safe_branch = safe_branch[:50]  # Limit length
-    
-    worktree_name = f"{repo_name}-{safe_branch}"
+    worktree_name = f"{repo_name}-{safe_branch_dirname(branch_name)}"
     worktree_path = parent_dir / worktree_name
     
     # If path exists, add a number suffix

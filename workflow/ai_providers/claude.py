@@ -1,3 +1,4 @@
+import json
 import subprocess
 import os
 import uuid
@@ -114,6 +115,11 @@ def claude_command(transcript_file: Path, prompt_file=None, args=None) -> str:
 class ClaudeProvider(AIProvider):
     name = "claude"
 
+    def loads_wf_tools(self, args=None) -> bool:
+        # --strict-mcp-config means only the caller's own servers load.
+        from workflow.ai_context import wf_tools_server
+        return "--strict-mcp-config" not in (args or ()) and wf_tools_server() is not None
+
     def run(self, context, issue=None, args=None, project=None):
         """Run an interactive Claude session; returns the terminal transcript.
 
@@ -167,7 +173,15 @@ class ClaudeProvider(AIProvider):
             args = ["--plugin-dir", str(plugin_dir), *args]
 
         task_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # wf-tools, added to the servers Claude already has, so the prompt's
+        # search_task_facts / search_past_conversations are really there.
+        if self.loads_wf_tools(args):
+            from workflow.ai_context import WF_TOOLS, wf_tools_server
+            mcp_file = task_dir / "wf-tools-mcp.json"
+            mcp_file.write_text(json.dumps({"mcpServers": {WF_TOOLS: wf_tools_server()}}))
+            args = [f"--mcp-config={mcp_file}", *args]
+
         # Clean up any existing prompt file from previous runs
         prompt_file = task_dir / "current.prompt"
         if prompt_file.exists():

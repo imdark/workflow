@@ -2503,18 +2503,19 @@ def skill_install_cmd(
     names: List[str] = typer.Argument(None, help="Skills to install (default: all in claude/skills)"),
     force: bool = typer.Option(False, "--force", help="Replace a same-named skill that isn't ours"),
 ):
-    """Link the skills this repo ships into ~/.claude/skills for every Claude session"""
+    """Link the skills this repo ships into ~/.claude/skills, and each project's Claude account, for every session"""
     from workflow import skill_install
 
-    result = skill_install.install(force=force, names=names or None)
-    for name in result.linked:
-        typer.echo(f"✅ Linked {name} → {skill_install.USER_SKILLS / name}")
-    for name in result.current:
-        typer.echo(f"   {name} already installed")
-    for name in result.skipped:
-        typer.echo(f"⚠️  {name}: {skill_install.USER_SKILLS / name} exists and isn't ours "
-                   "(--force to replace it)")
-    if not (result.linked or result.current or result.skipped):
+    any_skill = False
+    for dest, result in skill_install.install_everywhere(force=force, names=names or None):
+        any_skill = any_skill or bool(result.linked or result.current or result.skipped)
+        for name in result.linked:
+            typer.echo(f"✅ Linked {name} → {dest / name}")
+        if result.current:
+            typer.echo(f"   {len(result.current)} already installed in {dest}")
+        for name in result.skipped:
+            typer.echo(f"⚠️  {name}: {dest / name} exists and isn't ours (--force to replace it)")
+    if not any_skill:
         typer.echo("ℹ️  No skills to install")
 
 
@@ -2651,6 +2652,24 @@ def ask_worktree(question: str, answer: Optional[bool], interactive: Optional[bo
     return Confirm.ask(question, default=True)
 
 
+def run_by_agent() -> bool:
+    """`wf start` from an agent's shell: no terminal to ask on, or a Claude Code session (it sets CLAUDECODE)."""
+    return not sys.stdin.isatty() or bool(os.environ.get("CLAUDECODE"))
+
+
+def worktree_for_checkout(repo_path: str, dirty: bool, answer: Optional[bool], agent: bool) -> bool:
+    """Whether `wf start` puts the task in a worktree rather than switching the branch of the checkout at
+    `repo_path`. A dirty checkout asks (yes without a terminal); an agent gets one either way, so it never
+    checks out in the main checkout. --no-worktree (`answer` False) still keeps it in the checkout."""
+    if dirty:
+        return ask_worktree(f"{repo_path} has uncommitted changes. Create a worktree instead of switching its branch?",
+                            answer, interactive=not agent)
+    if agent and answer is not False:
+        typer.echo("Create a worktree? yes (run by an agent)")
+        return True
+    return bool(answer)
+
+
 @app.command()
 def start(
     task: str = typer.Argument(
@@ -2663,7 +2682,7 @@ def start(
     repo_path: str = typer.Option(None, help="Repository path to work on"),
     worktree: Optional[bool] = typer.Option(
         None, "--worktree/--no-worktree",
-        help="Answer the worktree question up front (asked when another AI session is working, or the repo has uncommitted changes; without a terminal it's yes)",
+        help="Answer the worktree question up front (asked when another AI session is working, or the repo has uncommitted changes; run by an agent it's yes)",
     ),
     # Dynamic custom fields will be handled via kwargs
 ):
@@ -2712,23 +2731,37 @@ def start(
         # Let user select interactively
         issue = backend.select_interactively(takeover)
 
-    # Move task to in progress with custom fields
-    if issue:
-        backend.move_to_in_progress(issue, custom_fields=custom_fields)
-    else:
+    if not issue:
         typer.echo("❌ No issue selected. Exiting.")
         raise typer.Exit(1)
+
+    # The repo the task says it belongs in (#repo:<name>, or its NotesGraph
+    # project), before the task moves: tasks for one repo kept being started,
+    # and stopped, in another. A repo that isn't here refuses the start.
+    from workflow.session import RepoNotHere, configured_repos, resolve_repo, task_home
+    home = None
+    if is_git_enabled() and not repo_path:
+        try:
+            home = task_home(issue.description, issue.title)
+        except RepoNotHere as e:
+            typer.echo(f"❌ Not starting {issue.key}: {e}")
+            raise typer.Exit(1)
+
+    # Move task to in progress with custom fields
+    backend.move_to_in_progress(issue, custom_fields=custom_fields)
 
     # Remember current task locally
     set_current_task(issue)
 
     # Get repository info if git is enabled
     # Check both global repositories AND project-specific repositories
-    from workflow.session import configured_repos, resolve_repo
-    repos = configured_repos()
+    repos = configured_repos(home[0] if home else None)
 
     if is_git_enabled():
-        if not repo_path and repos:
+        if home:
+            repo_path = home[1]
+            typer.echo(f"📁 Using repository (the task's own): {repo_path}")
+        elif not repo_path and repos:
             repo_path, how = resolve_repo(repos)
             if how == "cwd match":
                 typer.echo(f"📁 Using repository (cwd match): {repo_path}")
@@ -2751,7 +2784,7 @@ def start(
         ai_active = False
         ai_session_info = None
         worktree_path = None
-        use_worktree = False
+        use_worktree = None      # not asked yet
         same_issue_active = False
         any_ai_active = False
         
@@ -2801,25 +2834,22 @@ def start(
             typer.echo(f"❌ {e}")
             raise typer.Exit(1)
         
-        # Check for uncommitted changes on non-default branch (someone is working)
+        # Branch from the base as origin has it now (and the local base too, when that can fast-forward)
+        from workflow.git_utils import fetch_base
+        fetch_problem = fetch_base(branch_base, repo_path) if repo_path else None
+        if fetch_problem:
+            typer.echo(f"⚠️  Could not fetch {branch_base} from origin; branching from what is here. {fetch_problem}")
+
+        # Uncommitted changes in the checkout, on any branch, stay where they are: switching its branch
+        # would carry them along or stop at a prompt
         has_changes = has_uncommitted_changes(repo_path) if repo_path else False
-        current_branch = None
-        if has_changes and repo_path:
-            from workflow.git_utils import get_repo
-            repo = get_repo(repo_path)
-            current_branch = repo.active_branch.name
-            default_branches = ["main", "master", "develop", "dev"]
-            is_on_default = any(current_branch.lower() == b.lower() for b in default_branches) or current_branch == branch_base
-            
-            if not is_on_default and not use_worktree:
-                typer.echo(f"⚠️  You have uncommitted changes on branch '{current_branch}'")
-                use_worktree = ask_worktree(
-                    f"You're currently on '{current_branch}' with uncommitted changes. Create a worktree instead?",
-                    worktree,
-                )
-        
+        if has_changes:
+            typer.echo(f"⚠️  Uncommitted changes in {repo_path}: {get_uncommitted_changes_summary(repo_path)}")
+        if use_worktree is None and repo_path:
+            use_worktree = worktree_for_checkout(repo_path, has_changes, worktree, run_by_agent())
+
         try:
-            if use_worktree and (ai_active or same_issue_active or any_ai_active or (has_changes and current_branch and current_branch != branch_base)):
+            if use_worktree:
                 # Create a worktree for the task's branch, with its commit prefix
                 from workflow.session import start_in_worktree
                 worktree_path = start_in_worktree(issue, repo_path, branch_base)
@@ -3080,20 +3110,36 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
             existing_prs = check_existing_prs_for_issue(issue, repo_paths)
             if existing_prs:
                 typer.echo(f"🔍 Found existing PRs in {len(existing_prs)} repositories: {list(existing_prs.keys())}")
-                pr_created = True
             
             for current_repo_path in repo_paths:
                 typer.echo(f"Processing repository: {current_repo_path}")
                 
-                # Skip if PR already exists for this repository
+                from workflow.session import BaseBranchNotConfigured, base_branch_for
+
+                # This branch already has its PR: push what it does not have yet (the PR shows it), nothing more
                 if current_repo_path in existing_prs:
-                    typer.echo(f"⚠️  PR already exists for {current_repo_path}, skipping...")
+                    from workflow.git_utils import current_branch as branch_at, push_branch, unpushed_commits
                     pr_created = True  # Count existing PR as successful for task status
+                    branch = branch_at(current_repo_path)
+                    try:                       # only a branch never pushed needs it, and a PR means it was
+                        pr_base = base_branch_for(current_repo_path, repos, base)
+                    except BaseBranchNotConfigured:
+                        pr_base = None
+                    ahead = unpushed_commits(current_repo_path, branch, pr_base) if branch else 0
+                    url = existing_prs[current_repo_path].get("url", "")
+                    if ahead:
+                        try:
+                            push_branch(current_repo_path)
+                            typer.echo(f"✅ Pushed {ahead} commit(s) of '{branch}' to its PR {url}")
+                        except Exception as e:
+                            typer.echo(f"❌ Failed to push '{branch}' to its PR {url}: {e}")
+                            pr_created = False
+                    else:
+                        typer.echo(f"⚠️  '{branch}' already has its PR, nothing to push: {url}")
                     continue
-                
+
                 # The PR goes into the repo's configured base branch; from a
                 # task worktree that's its main checkout's setting.
-                from workflow.session import BaseBranchNotConfigured, base_branch_for
                 try:
                     base_branch = base_branch_for(current_repo_path, repos, base)
                 except BaseBranchNotConfigured as e:
@@ -3117,25 +3163,16 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                 if not current_branch:
                     current_branch = repo.active_branch.name
                 
-                has_unpushed = False
-                commits_ahead = 0
-                try:
-                    remote_branch = f"origin/{current_branch}"
-                    # Check if branch exists on remote first
-                    repo.git.fetch("origin", current_branch)
-                    commits_ahead = len(list(repo.iter_commits(f"{remote_branch}..{current_branch}")))
-                    has_unpushed = commits_ahead > 0
-                except Exception:
-                    # Branch doesn't exist on remote - check for local commits not yet pushed
-                    try:
-                        base_remote = f"origin/{base_branch}"
-                        commits_ahead = len(list(repo.iter_commits(f"{base_remote}..{current_branch}")))
-                        has_unpushed = commits_ahead > 0
-                    except:
-                        has_unpushed = False
+                from workflow.git_utils import unpushed_commits
+                commits_ahead = unpushed_commits(current_repo_path, current_branch, base_branch)
+                has_unpushed = commits_ahead > 0
                 
                 if has_diff:
                     try:
+                        if has_unpushed:               # on origin already, with newer commits: the PR gets them too
+                            from workflow.git_utils import push_branch
+                            push_branch(current_repo_path)
+                            typer.echo(f"✅ Pushed {commits_ahead} commit(s) of '{current_branch}'")
                         pr = create_pr(issue, reviewers, current_repo_path, base_branch, title=title, body=body)
                         if pr and pr.get("url") and not pr.get("url").startswith("existing"):
                             typer.echo(f"✅ Created PR for {current_repo_path}")
@@ -3188,6 +3225,8 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
         if ship.advance(backend, issue, ship.COMMITTED):
             typer.echo(f"📋 Task {issue.key} → {ship.COMMITTED} (PR open). It becomes "
                        f"{ship.DONE} once merged and deployed with 'wf deploy cloud'.")
+        # Not removed here: `wf done` usually runs from inside the worktree, with a session still in it.
+        typer.echo("🧹 Its worktree goes once the session ends (agent jobs) or with 'wf prune'; the branch stays.")
     else:
         typer.echo(f"⚠️  Nothing was committed for {issue.key}, so it stays where it is. "
                    f"A task is {ship.DONE} only once committed, merged and deployed.")
@@ -3217,6 +3256,31 @@ def done(reviewers: str = typer.Option(None, help="Comma-separated list of revie
                     typer.echo("📢 Posted task completion to Slack")
             else:
                 typer.echo("❌ Invalid webhook URL. Slack notification skipped.")
+
+@app.command()
+def prune(dry_run: bool = typer.Option(False, "--dry-run", help="List what would be removed, remove nothing"),
+          repo_path: str = typer.Option(None, "--repo-path", help="Only this repository (default: every configured one)"),
+          verbose: bool = typer.Option(False, "-v", "--verbose", help="Also list the worktrees kept, and why"),
+          all_worktrees: bool = typer.Option(False, "--all", help="Include worktrees not made by wf start "
+                                                                  "(their ignored files, e.g. .env, are lost)")):
+    """Remove task worktrees whose branch is pushed and has a PR up.
+
+    A worktree stays if it has uncommitted or unpushed work, has no open or
+    merged PR, or an AI session is running in it. Branches are kept; `wf start`
+    recreates the worktree if the task is picked up again. Safe to run from a
+    nightly job.
+    """
+    from workflow import worktree_prune
+    results = worktree_prune.prune([repo_path] if repo_path else None, dry_run=dry_run,
+                                   any_worktree=all_worktrees)
+    removed = [r for r in results if r[2] is None]
+    for path, branch, reason in results:
+        if reason is None:
+            typer.echo(f"{'Would remove' if dry_run else '🧹 Removed'} {path} ({branch})")
+        elif verbose:
+            typer.echo(f"   Kept {path} ({branch or 'no branch'}): {reason}")
+    typer.echo(f"{len(removed)} worktree(s) {'to remove' if dry_run else 'removed'}, "
+               f"{len(results) - len(removed)} kept.")
 
 @app.command()
 def shelve(repo_path: str = typer.Option(None, help="Repository path")):
@@ -3367,7 +3431,8 @@ def ai(
         context = None
         say("🤖 Resuming AI session...")
     elif issue:
-        context = build_context(issue, repo_path=repo_path)
+        wf_tools = get_ai_provider(session_project).loads_wf_tools(claude_args)
+        context = build_context(issue, repo_path=repo_path, wf_tools=wf_tools)
         say("🤖 Starting AI session...")
     elif prints_once(claude_args):
         context = None  # one answer, no task lifecycle to explain
@@ -3465,6 +3530,7 @@ def ai_mcp_config():
         ("list_git_branches", "List available git branches"),
         ("get_current_git_branch", "Get the current git branch"),
         ("list_assigned_tasks", "List Jira tasks assigned to you"),
+        ("create_task", "Create a task in a project's backend"),
         ("list_hooks", "List all configured hooks"),
         ("add_hook", "Add a new hook"),
         ("remove_hook", "Remove a hook"),
@@ -6055,16 +6121,45 @@ def task_create(
     labels: str = typer.Option(None, "--labels", "-l", help="Comma-separated labels"),
     template: str = typer.Option(None, "--template", help="Use a template (bug, feature, task)"),
     project: str = typer.Option(None, "--project", help="Project to create it in (default: the session's project "
-                                                          "from wf ai, else the folder's, else the current one)")
+                                                          "from wf ai, else the folder's, else the current one)"),
+    journal: Optional[bool] = typer.Option(None, "--journal/--no-journal",
+                                           help="Also add it under the project in today's NotesGraph journal "
+                                                "(default: yes inside a wf ai session)"),
+    repo: str = typer.Option(None, "--repo", help="The repo the task's work belongs in (its folder or NotesGraph "
+                                                  "project name), when it isn't this session's: picks the project "
+                                                  "that owns it and the journal heading, and tags the task "
+                                                  "#repo:<name> so starting it goes there"),
 ):
     """Create a task in the project's own backend (Linear, Jira or Markdown).
 
-    The project is --project, else the one this session was started for (`wf ai` / `claude` set WF_PROJECT), else
-    the one whose repositories contain the current folder, else the current project. The task is created where that
-    project tracks its tasks: a Linear project gets a Linear issue in its team (PAN-123), a Jira project a Jira
-    issue, a Markdown project a file under ~/.wf. It never lands in another project's store under a made-up key.
+    The project is --project, else the one that owns --repo, else the one this session was started for (`wf ai` /
+    `claude` set WF_PROJECT), else the one whose repositories contain the current folder, else the current project.
+    The task is created where that project tracks its tasks: a Linear project gets a Linear issue in its team
+    (PAN-123), a Jira project a Jira issue, a Markdown project a file under ~/.wf. It never lands in another
+    project's store under a made-up key.
+
+    Inside a wf ai session (or with --journal) it is also listed in today's journal note in NotesGraph, under the
+    heading of its repo (--repo, else the session's), so the day's note shows the tasks agents filed.
     """
     from workflow.projects import get_project_key
+
+    repo_path = None
+    if repo:
+        from workflow.projects import repo_for_notesgraph_project
+
+        home = repo_for_notesgraph_project(repo, "")
+        if not home:
+            typer.echo(f"❌ No configured repo named '{repo}' (see `wf project list`)")
+            raise typer.Exit(1)
+        owner, repo_path = home
+        if project and owner and owner != project:
+            typer.echo(f"❌ '{repo}' belongs to project '{owner}', not '{project}'")
+            raise typer.Exit(1)
+        project = project or owner
+        # Starting the task reads this from its text, so `wf start` goes to the repo as the journal line does.
+        tag = f"#repo:{repo}"
+        if tag not in (description or ""):
+            description = f"{description}\n\n{tag}" if description else tag
 
     backend, target, backend_type = _project_backend(project)
     # the key prefix that backend wants: the Linear team / Jira project for those, the project's name for markdown
@@ -6078,6 +6173,7 @@ def task_create(
         if issue:
             typer.echo(f"✅ Created task: {issue.key} (from template: {template})")
             typer.echo(f"   Title: {title}")
+            _journal_task(journal, target, backend, issue, title, repo_path, repo)
             return
         typer.echo(f"❌ Template '{template}' not found")
         raise typer.Exit(1)
@@ -6110,6 +6206,26 @@ def task_create(
     typer.echo(f"   Title: {title}")
     typer.echo(f"   Type: {task_type}")
     typer.echo(f"   Priority: {priority}")
+    _journal_task(journal, target, backend, issue, title, repo_path, repo)
+
+
+def _journal_task(journal: Optional[bool], project: Optional[str], backend, issue, title: str,
+                  repo_path: Optional[str] = None, repo_tag: Optional[str] = None) -> None:
+    """List a task just created in today's NotesGraph journal, when asked or inside a wf ai session.
+
+    The task exists either way, so a NotesGraph that can't be reached is a warning, not a failure."""
+    from workflow import journal as journal_notes
+
+    if not (journal if journal is not None else journal_notes.in_wf_session()):
+        return
+    try:
+        link = _issue_link(backend, issue, load_effective_config(project) if project else None)
+        done = journal_notes.record_created_task(project, issue.key, getattr(issue, "title", None) or title, link,
+                                                 repo=repo_path, repo_tag=repo_tag)
+    except Exception as e:
+        typer.echo(f"⚠️  Not added to today's journal: {e}", err=True)
+        return
+    typer.echo(f"   Journal: under '{done['heading']}' in {done['title']}")
 
 
 @task_app.command("list")
@@ -6791,7 +6907,7 @@ from workflow.cli_install import install as install_cmd
 app.command("install")(install_cmd)
 
 
-# Fork the running Claude conversation into a new terminal tab (the /side skill).
+# Fork the running Claude conversation into a new terminal tab (the /side mod's command).
 @app.command("side")
 def side(
     session: str = typer.Option(None, "--session", "-s",
@@ -7553,6 +7669,39 @@ def plan():
     from workflow.tui import TaskBoardApp
     tui_app = TaskBoardApp()
     tui_app.run()
+
+
+@app.command()
+def lint(
+    all_files: bool = typer.Option(False, "--all", help="Lint the whole repository, not just the changed files"),
+    fix: bool = typer.Option(False, "--fix", help="Run each step's fix command where it has one"),
+    base: str = typer.Option(None, "--base", help="Branch to diff against (default: the remote's default branch)"),
+    repo_path: str = typer.Option(".", "--repo-path", help="Repository to lint"),
+    as_json: bool = typer.Option(False, "--json", help="Print the results as JSON"),
+):
+    """Run the repository's lint (wf.yaml `lint`, else package.json) on the files the branch changed."""
+    import json as _json
+    from workflow.lint import LintError, lint_repo
+
+    try:
+        results = lint_repo(repo_path, base=base, all_files=all_files, fix=fix)
+    except LintError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(2)
+
+    if as_json:
+        typer.echo(_json.dumps(results, indent=2))
+    else:
+        for r in results:
+            if r["skipped"]:
+                typer.echo(f"– {r['name']}: skipped (no matching changed files)")
+            elif r["ok"]:
+                typer.echo(f"✓ {r['name']}")
+            else:
+                typer.echo(f"✗ {r['name']} (exit {r['exit_code']})")
+                typer.echo(r["output"])
+    if not all(r["ok"] for r in results):
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

@@ -141,6 +141,30 @@ def list_assigned_tasks() -> str:
 
 
 @mcp.tool()
+def create_task(
+    title: Annotated[str, "Task title"],
+    description: Annotated[str, "What and why"] = "",
+    project: Annotated[str, "wf project to file it in (optional, defaults to the session's)"] = None,
+) -> str:
+    """Create a task in the project's own backend, as `wf task create` does, and list it under the project in
+    today's NotesGraph journal when called from a wf ai session"""
+    import shutil
+    import sys
+
+    wf = shutil.which("wf")
+    command = [wf] if wf else [sys.executable, "-m", "workflow.cli"]
+    command += ["task", "create", title, "--description", description]
+    if project:
+        command += ["--project", project]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"Error: {e}"
+    output = (result.stdout + result.stderr).strip()
+    return output if result.returncode == 0 else f"Error: {output}"
+
+
+@mcp.tool()
 def list_hooks() -> str:
     """List all configured hooks"""
     try:
@@ -297,6 +321,27 @@ def set_config_value(
         return f"✅ Set {key} = {value}"
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def lint(
+    repo_path: Annotated[str, "Path inside the git repository to lint"],
+    all_files: Annotated[bool, "Lint the whole repository instead of the files the branch changed"] = False,
+    fix: Annotated[bool, "Run each step's fix command where it has one"] = False,
+    base: Annotated[str, "Branch to diff against (default: the remote's default branch)"] = None,
+) -> str:
+    """Run the repository's lint on the files the branch changed, before committing.
+
+    The steps come from wf.yaml `lint:` at the repository root (else a `lint`
+    script in package.json). Returns JSON: `ok` overall, and per step its
+    name, ok, skipped, exit_code, files and the tail of its output.
+    """
+    from workflow.lint import LintError, lint_repo
+    try:
+        results = lint_repo(repo_path, base=base, all_files=all_files, fix=fix)
+    except LintError as e:
+        return f"Error: {e}"
+    return json.dumps({"ok": all(r["ok"] for r in results), "steps": results}, indent=2)
 
 
 if __name__ == "__main__":

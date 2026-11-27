@@ -225,17 +225,22 @@ def install_aliases(system: bool = False, files: Optional[List[Path]] = None) ->
 def install_skills() -> Step:
     from workflow import skill_install
     try:
-        result = skill_install.install()
+        results = skill_install.install_everywhere()
     except Exception as e:  # noqa: BLE001 - reported, not fatal
         return Step("skills", False, f"{e}; run: wf skill install")
-    parts = []
-    if result.linked:
-        parts.append(f"linked {', '.join(result.linked)}")
-    if result.current:
-        parts.append(f"{len(result.current)} already installed")
-    if result.skipped:
-        parts.append(f"skipped {', '.join(result.skipped)} (not ours; wf skill install --force)")
-    return Step("skills", True, "; ".join(parts) or "none bundled", changed=bool(result.linked))
+    parts, changed = [], False
+    for dest, result in results:
+        here = []
+        if result.linked:
+            here.append(f"linked {', '.join(result.linked)}")
+        if result.current:
+            here.append(f"{len(result.current)} already installed")
+        if result.skipped:
+            here.append(f"skipped {', '.join(result.skipped)} (not ours; wf skill install --force)")
+        if here:
+            parts.append(f"{dest}: {'; '.join(here)}")
+        changed = changed or bool(result.linked)
+    return Step("skills", True, " | ".join(parts) or "none bundled", changed=changed)
 
 
 # --- everything -------------------------------------------------------------

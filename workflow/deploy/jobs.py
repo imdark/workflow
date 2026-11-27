@@ -81,6 +81,10 @@ class Job:
     payload: Optional[dict] = None
     # For an automation: the workspace secrets its code names. Claims only.
     secrets: Optional[dict] = None
+    # The id of an ended run this one follows up (a request from that run's
+    # chat): it resumes that run's session in that run's working directory,
+    # with this job's instructions as the request. See follow_up.
+    continues: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict) -> "Job":
@@ -99,6 +103,7 @@ class Job:
             kind=payload.get("kind") or "agent",
             payload=payload.get("payload") or None,
             secrets=payload.get("secrets") or None,
+            continues=payload.get("continues") or None,
         )
 
 
@@ -338,6 +343,16 @@ def keep_awake(config: dict, job_dir: Path) -> bool:
 # Appended to Claude Code's own system prompt for a claude-code job. The
 # point is that the agent asks rather than guesses, and that each answer is
 # written into NotesGraph so the next run finds it instead of asking again.
+# Lint failures a run commits come back as a red CI check on its pull request
+# (an unsorted import once failed notes-graph's Lint job on every PR). The
+# repo's own checks run on just the changed files, so this is cheap.
+LINT_BEFORE_COMMIT = """\
+Before each commit in a git checkout, run `wf lint --fix` there (the
+wf-tools `lint` tool does the same) and fix whatever it still reports. It runs
+the repository's own lint on the files you changed; when it says no lint is
+configured, there is nothing to run.
+"""
+
 CLAUDE_CODE_SYSTEM_PROMPT = """\
 You are running as an agent inside NotesGraph, the user's notes app, started
 by them from a note. You have NotesGraph tools (mcp__notesgraph__*) to search,
@@ -371,6 +386,7 @@ mcp__run__ask_user so the user can pick one with a click.
 Tools that need permission are put to the user for
 you; if they deny one, find another way or explain what you could not do.
 
+""" + LINT_BEFORE_COMMIT + """
 Finish with your answer to the task itself.
 """
 
@@ -380,6 +396,10 @@ CLAUDE_CODE_ALLOWED_TOOLS = [
     "mcp__notesgraph", "mcp__run__ask_user", "mcp__run__set_title",
     "WebSearch", "WebFetch", "Read", "Glob", "Grep",
 ]
+
+# Read-only GitHub PR commands, allowed whatever the profile says: an agent
+# checking its own PR or CI shouldn't stop to ask for a lookup.
+GH_READ_ALLOWED = [f"Bash(gh pr {cmd}:*)" for cmd in ("view", "list", "checks", "diff")]
 
 # Claude Code gives an MCP tool call this long (ms) before giving up. A
 # question waits for a person, who may be at dinner.
@@ -467,8 +487,10 @@ def job_rules_scope(job: "Job", home: Optional[tuple] = None) -> dict:
     agents: the agent's name and id. Note and project tags aren't in the
     job, so they don't count here.
     """
+    from workflow.session import NOTESGRAPH_PROJECT_RE
+
     context = job.context or ""
-    projects = [m.group(1).strip() for m in _NOTESGRAPH_PROJECT_RE.finditer(context)]
+    projects = [m.group(1).strip() for m in NOTESGRAPH_PROJECT_RE.finditer(context)]
     tags = []
     for found in _CONTEXT_TAGS_RE.finditer(context):
         tags += [t.strip() for t in found.group(1).split(",") if t.strip()]
@@ -608,6 +630,24 @@ they apply to your part of the work.{scoped} The note, as it is now:
 {rules}
 """
 
+# Every subagent gets this, rules or not: two build subagents lost all their
+# uncommitted work when a usage limit cut them off mid-build.
+SUBAGENT_COMMIT_PROMPT = """\
+If you are changing code in a git checkout, commit as you go: a small
+commit after each step that builds and passes its tests, so the work
+survives if you are interrupted (a usage limit, a crash). Don't push, and
+don't leave a long build uncommitted until the end.
+
+""" + LINT_BEFORE_COMMIT
+
+
+def subagent_prompt(rules: str) -> str:
+    """What the SubagentStart hook hands every subagent: the commit-as-you-go
+    brief, then the user's rules when there are any."""
+    if not rules.strip():
+        return SUBAGENT_COMMIT_PROMPT
+    return SUBAGENT_COMMIT_PROMPT + "\n" + rules_prompt(rules, SUBAGENT_RULES_PROMPT)
+
 
 def _context_hook(job_dir: Path, event: str, context: str) -> list:
     """A hook for `event` that hands the model `context`.
@@ -630,7 +670,8 @@ def run_settings(mcp_path: Path, rules: str = "", session_context: str = "") -> 
     from NotesGraph while it works, after each tool call and when it is about
     to stop (see steer_hook.py). Also always: a PreToolUse hook that refuses
     WebFetch to a site that already failed twice in the run (fetch_guard.py).
-    With `rules`, a SubagentStart hook gives them to every subagent. With
+    Always, a SubagentStart hook tells every subagent to commit as it goes,
+    and with `rules` gives it them too (see subagent_prompt). With
     `session_context` (a task run's code map), a SessionStart hook adds it
     to the conversation.
     """
@@ -643,12 +684,24 @@ def run_settings(mcp_path: Path, rules: str = "", session_context: str = "") -> 
              "PreToolUse": [{"matcher": "WebFetch",
                              "hooks": [{"type": "command", "command": guard, "timeout": 10}]}]}
     job_dir = mcp_path.parent
-    if rules.strip():
-        hooks["SubagentStart"] = _context_hook(
-            job_dir, "SubagentStart", rules_prompt(rules, SUBAGENT_RULES_PROMPT))
+    hooks["SubagentStart"] = _context_hook(job_dir, "SubagentStart", subagent_prompt(rules))
     if session_context.strip():
         hooks["SessionStart"] = _context_hook(job_dir, "SessionStart", session_context)
     return json.dumps({"hooks": hooks})
+
+
+WF_TOOLS = "wf-tools"
+# Read-only, so allowed without asking; the rest still go through approve.
+WF_TOOLS_ALLOWED = [f"mcp__{WF_TOOLS}__{name}" for name in
+                    ("search_task_facts", "search_past_conversations")]
+
+
+def wf_tools_mcp() -> Optional[dict]:
+    """{"wf-tools": server} for a task run's MCP config, or None when the
+    server cannot load on this runner (the prompt then leaves it out)."""
+    from workflow.ai_context import wf_tools_server
+    server = wf_tools_server()
+    return {WF_TOOLS: server} if server else None
 
 
 def claude_code_argv(job: Job, prompt: str, job_dir: Path,
@@ -715,6 +768,11 @@ def claude_code_argv(job: Job, prompt: str, job_dir: Path,
     system_prompt = with_agent_rules(profile.get("systemPrompt") or (
         CLAUDE_CODE_SYSTEM_PROMPT + (f"\n{extra_prompt}" if extra_prompt else "")), rules)
     allowed = list(profile.get("allowedTools") or [*CLAUDE_CODE_ALLOWED_TOOLS, *(extra_allowed or [])])
+    # wf-tools' read-only searches, whatever the profile allows: the task
+    # prompt tells the agent to start with them.
+    if WF_TOOLS in (extra_mcp or {}):
+        allowed += [tool for tool in WF_TOOLS_ALLOWED if tool not in allowed]
+    allowed += [tool for tool in GH_READ_ALLOWED if tool not in allowed]
     # The automation's tools are the profile owner's own commands: allowed
     # without asking, like NotesGraph's (the cloud runner does the same).
     if tools_spec and "mcp__automation" not in allowed:
@@ -816,6 +874,33 @@ def _resume_workdir(job_dir: Path, workdir: Path, interrupted, automation) -> Pa
     return Path(moved) if moved else workdir
 
 
+def follow_up(job: Job) -> Optional[tuple]:
+    """(the earlier run's job directory, the session it ended with) for a job
+    that follows one up; None for any other job.
+
+    The follow-up runs where that run did, with its session resumed, so it
+    has the run's tools and permissions and its work to build on. That is
+    only here on the device the run ran on; elsewhere the job fails saying so.
+    """
+    if not job.continues:
+        return None
+    if Path(job.continues).name != job.continues or job.continues in (".", ".."):
+        raise RuntimeError(f"not a run id: {job.continues!r}")
+    source = JOB_ROOT / job.continues
+    if not source.is_dir():
+        raise RuntimeError(
+            "the run this follows up didn't run on this device, or its files are "
+            "gone: follow it up on the device it ran on")
+    return source, checkpoint.ended_session(source)
+
+
+def _follow_up_prompt(job: Job, resume: Optional[str]) -> str:
+    """The follow-up's request (the item it is about, else its instructions),
+    as the run whose session it carries on is told it."""
+    return checkpoint.follow_up_prompt(job.context.strip() or job.instructions,
+                                       resumed=bool(resume))
+
+
 def _git(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], capture_output=True, text=True)
 
@@ -835,10 +920,28 @@ def job_workdir(job_dir: Path, cwd: Path) -> Path:
     tree = job_dir / "repo"
     # A re-claimed job carries on in the worktree its first attempt left.
     if not tree.exists():
-        added = _git("-C", str(root), "worktree", "add", "--detach", str(tree), "HEAD")
+        # Made again for a follow-up: on the branch the run left it on, when
+        # that branch is free (no other worktree has it checked out).
+        added = None
+        left = _left_branch(job_dir)
+        if left:
+            added = _git("-C", str(root), "worktree", "add", str(tree), left)
+        if added is None or added.returncode != 0:
+            added = _git("-C", str(root), "worktree", "add", "--detach", str(tree), "HEAD")
         if added.returncode != 0:
             raise RuntimeError(f"could not make a worktree: {added.stderr.strip()[:300]}")
     return tree / cwd.resolve().relative_to(root.resolve())
+
+
+# The branch a job's worktree was on when it was removed (see job_workdir).
+LEFT_BRANCH = "worktree.json"
+
+
+def _left_branch(job_dir: Path) -> Optional[str]:
+    try:
+        return json.loads((job_dir / LEFT_BRANCH).read_text()).get("branch") or None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _drop_worktree_if_empty(job_dir: Path) -> None:
@@ -853,13 +956,31 @@ def _drop_worktree_if_empty(job_dir: Path) -> None:
     status = _git("-C", str(tree), "status", "--porcelain")
     if status.returncode != 0 or status.stdout.strip():
         return
-    on_branch = _git("-C", str(tree), "symbolic-ref", "-q", "HEAD").returncode == 0
+    branch = _git("-C", str(tree), "symbolic-ref", "-q", "--short", "HEAD")
+    on_branch = branch.returncode == 0
     if not on_branch:
         held = _git("-C", str(tree), "branch", "-a", "--contains", "HEAD")
         if not held.stdout.strip():
             # Commits made on the detached HEAD: nothing else points at them.
             return
-    _git("-C", str(tree), "worktree", "remove", str(tree))
+    if _git("-C", str(tree), "worktree", "remove", str(tree)).returncode == 0 and on_branch:
+        # So a follow-up gets the worktree back on the same branch.
+        (job_dir / LEFT_BRANCH).write_text(json.dumps({"branch": branch.stdout.strip()}))
+
+
+def _drop_task_worktree(workdir: Path) -> None:
+    """Remove a workflow job's task worktree once its PR is up.
+
+    Only after the session has ended (the agent runs `wf done` from inside
+    it), and only when nothing would be lost: see worktree_prune. The branch
+    stays, so a later run on the task gets the worktree back.
+    """
+    from workflow.worktree_prune import prune_task_worktree
+
+    try:
+        prune_task_worktree(str(workdir))
+    except Exception:
+        pass
 
 
 def _task_title(job: Job) -> str:
@@ -876,28 +997,27 @@ def _task_title(job: Job) -> str:
     return job.agent_name or f"Agent job {job.id[:8]}"
 
 
-# How NotesGraph names the project of the item a run was started on, in
-# the job's context (one line per item; the first is the run's own).
-_NOTESGRAPH_PROJECT_RE = re.compile(r"^Project: (.+) \(projectId: ([^)\s]+)\)\s*$", re.M)
-
-
-def job_home(job: Job) -> Optional[tuple]:
-    """The (wf project, repo) for the NotesGraph project the job's item is
-    in, or None when it names none or no configured repo matches.
+def job_home(job: Job, strict: bool = False) -> Optional[tuple]:
+    """The (wf project, repo) the job's item belongs in (`session.task_home`):
+    the repo its `#repo:<name>` field names, else the one matching its
+    NotesGraph project; None when neither matches.
 
     Without it a job ran in whichever repo the runner was started in, so a
     NotesGraph task filed under "notes graph" was worked on in wf's repo.
+    `strict` (a job that works in a repo) raises session.RepoNotHere when
+    the item names a repo this machine doesn't have, so the job fails
+    saying which repo instead of running, and stopping, in the wrong one.
     """
-    from workflow.projects import repo_for_notesgraph_project
+    from workflow.session import RepoNotHere, task_home
 
-    for text in (job.context, job.instructions):
-        found = _NOTESGRAPH_PROJECT_RE.search(text or "")
-        if found:
-            try:
-                return repo_for_notesgraph_project(found.group(1).strip(), found.group(2))
-            except Exception:
-                return None
-    return None
+    try:
+        return task_home(job.context, job.instructions)
+    except RepoNotHere:
+        if strict:
+            raise
+        return None
+    except Exception:
+        return None
 
 
 def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
@@ -924,7 +1044,7 @@ def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
     from workflow.session import (base_branch_for, configured_repos,
                                   resolve_repo, start_in_worktree)
 
-    project, home_repo = job_home(job) or (None, None)
+    project, home_repo = job_home(job, strict=True) or (None, None)
     backend = get_backend(load_effective_config(project))
     task_file = job_dir / "task.json"
     issue = None
@@ -954,11 +1074,12 @@ def start_job_task(job: Job, job_dir: Path, cwd: Path) -> tuple:
     return issue, job_dir, repo_path
 
 
-def _job_context(issue, job: Job, workdir: Path) -> str:
-    """The prompt `wf ai` would build for the task, or the job's own."""
+def _job_context(issue, job: Job, workdir: Path, wf_tools: bool = False) -> str:
+    """The prompt `wf ai` would build for the task, or the job's own.
+    `wf_tools` says the agent has the wf-tools server (see wf_tools_mcp)."""
     try:
         from workflow.ai_context import build_context
-        return build_context(issue, repo_path=str(workdir))
+        return build_context(issue, repo_path=str(workdir), wf_tools=wf_tools)
     except Exception:
         return _prompt(job)
 
@@ -1096,30 +1217,50 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
     # and its tools, served to the agent (see prepare_automation).
     automation = tools_spec = None
     profiled = is_profiled_claude_job(job)
+    followed = None
+    # Where a claude-code job's worktree is: a follow-up's is the earlier run's.
+    tree_dir = job_dir
+
+    def first_turn(workdir: Optional[Path], default,
+                   claude_env: Optional[dict] = None) -> tuple:
+        """(session to resume, prompt): this job's own interrupted attempt
+        first, then the run it follows up, else a fresh start on `default`
+        (the prompt, or what makes it)."""
+        own = checkpoint.resumable(interrupted, job_dir, workdir, claude_env)
+        if own:
+            return own, checkpoint.RESUME_PROMPT
+        if followed:
+            prior = checkpoint.resumable(followed[1], followed[0], workdir, claude_env)
+            return prior, _follow_up_prompt(job, prior)
+        return None, default() if callable(default) else default
+
     with _SETUP_LOCK:
         claude_job = job.model in CLAUDE_MODELS or profiled
-        found_home = job_home(job) if claude_job else None
+        found_home = job_home(job, strict=job.model == CLAUDE_CODE_MODEL) if claude_job else None
         if claude_job:
             if client is None:
                 raise RuntimeError(f"a {job.model} job needs a NotesGraph connection")
             provider = job.model
             # Only the parts of the rules for this run's project, tags and agent.
             rules = load_agent_rules(client, job_rules_scope(job, found_home))
+            followed = follow_up(job)
         home = found_home if job.model in (CLAUDE_CODE_MODEL, WORKFLOW_MODEL) else None
         if job.model == CLAUDE_CODE_MODEL:
-            workdir = job_workdir(job_dir, Path(home[1]) if home else cwd or Path.cwd())
+            if followed:
+                tree_dir = followed[0]
+            workdir = job_workdir(tree_dir, Path(home[1]) if home else cwd or Path.cwd())
             automation, tools_spec, _ = prepare_automation(job, job_dir, cwd or Path.cwd(), workdir)
-            resume = checkpoint.resumable(interrupted, job_dir, workdir)
+            resume, prompt = first_turn(workdir, _prompt(job))
             argv, env = claude_code_argv(
-                job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
+                job, prompt, job_dir, client,
                 rules=rules, resume=resume, tools_spec=tools_spec)
         elif job.model == RESEARCH_MODEL:
             # Research reads the world, not a repo: the job directory, no worktree.
             automation, tools_spec, workdir = prepare_automation(job, job_dir, cwd or Path.cwd())
             workdir = _resume_workdir(job_dir, workdir or job_dir, interrupted, automation)
-            resume = checkpoint.resumable(interrupted, job_dir, workdir)
+            resume, prompt = first_turn(workdir, _prompt(job))
             argv, env = research_argv(
-                job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
+                job, prompt, job_dir, client,
                 config, rules=rules, resume=resume, tools_spec=tools_spec)
         elif profiled:
             # The server's profile is the whole agent (prompt, tools, skills,
@@ -1127,9 +1268,9 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             # automation says. Setup may be what creates that directory.
             automation, tools_spec, workdir = prepare_automation(job, job_dir, cwd or Path.cwd())
             workdir = _resume_workdir(job_dir, workdir or job_dir, interrupted, automation)
-            resume = checkpoint.resumable(interrupted, job_dir, workdir)
+            resume, prompt = first_turn(workdir, _prompt(job))
             argv, env = claude_code_argv(
-                job, checkpoint.RESUME_PROMPT if resume else _prompt(job), job_dir, client,
+                job, prompt, job_dir, client,
                 rules=rules, resume=resume, tools_spec=tools_spec)
         elif job.model == COMMAND_MODEL:
             provider, argv = COMMAND_MODEL, command_argv(job, config)
@@ -1137,6 +1278,10 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             if timeout is None:
                 timeout = COMMAND_TIMEOUT_SECONDS
         elif job.model == WORKFLOW_MODEL:
+            if followed and not (job_dir / "task.json").exists() \
+                    and (followed[0] / "task.json").exists():
+                # The earlier run's ticket, so its branch and worktree too.
+                shutil.copyfile(followed[0] / "task.json", job_dir / "task.json")
             issue, workdir, repo_path = start_job_task(job, job_dir, cwd or Path.cwd())
             from workflow.ai_providers.claude import skills_plugin_dir
             from workflow.session import apply_claude_env
@@ -1147,11 +1292,14 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
             # Same Claude account and capture proxy as `wf ai`.
             claude_env = apply_claude_env(dict(os.environ), home[0] if home else None)
             automation, tools_spec, _ = prepare_automation(job, job_dir, cwd or Path.cwd(), workdir)
-            resume = checkpoint.resumable(interrupted, job_dir, workdir, claude_env)
+            wf_tools = wf_tools_mcp()
+            resume, prompt = first_turn(
+                workdir, lambda: _job_context(issue, job, workdir, wf_tools=bool(wf_tools)),
+                claude_env)
             argv, env = claude_code_argv(
-                job, checkpoint.RESUME_PROMPT if resume else _job_context(issue, job, workdir),
+                job, prompt,
                 job_dir, client, plugin_dir, rules=rules,
-                session_context=map_context(workdir), resume=resume, tools_spec=tools_spec)
+                extra_mcp=wf_tools, session_context=map_context(workdir), resume=resume, tools_spec=tools_spec)
             env.update(claude_env)
         else:
             provider, argv = _provider_argv(job, config)
@@ -1163,6 +1311,7 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
              **({"claude": True} if job.model in CLAUDE_MODELS or profiled else {}),
              **({"automation": automation} if automation else {}),
              **({"resumed": True} if resume else {}),
+             **({"followsUp": job.continues} if followed else {}),
              **({"caffeinate": True} if keep_awake(config, job_dir) else {}),
              # What its checkpoints name it by.
              "job": {"id": job.id, "agentId": job.agent_id, "agentName": job.agent_name,
@@ -1180,12 +1329,14 @@ def run_job(job: Job, config: Optional[dict] = None, timeout: Optional[int] = No
         (job_dir / "mcp.json").unlink(missing_ok=True)
         with _SETUP_LOCK:
             if job.model == CLAUDE_CODE_MODEL:
-                _drop_worktree_if_empty(job_dir)
+                _drop_worktree_if_empty(tree_dir)
             if issue is not None:
                 _save_session(issue, job_dir, workdir)
             if repo_path:
                 from workflow.pid_manager import remove_ai_pid_file
                 remove_ai_pid_file(repo_path)
+            if job.model == WORKFLOW_MODEL and workdir is not None and workdir != job_dir:
+                _drop_task_worktree(workdir)
 
 
 def _watch(job: Job, job_dir: Path, timeout: Optional[int],
@@ -1394,6 +1545,10 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
     completed = 0
     # Slots taken: jobs running, and a claim in flight.
     running = 0
+    # Ids of the jobs running here. A missed heartbeat can lapse a live job's
+    # lease and the server hands it back to this runner; a second copy would
+    # kill the first's tmux session and delete its mcp.json on the way out.
+    live: set = set()
     slots = threading.Condition()
 
     def limit() -> int:
@@ -1412,6 +1567,8 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
                 with slots:
                     completed += 1
         finally:
+            with slots:
+                live.discard(job.id)
             release()
 
     while True:
@@ -1455,6 +1612,15 @@ def serve(client: JobClient, device_key: str, runner_id: Optional[str] = None,
             time.sleep(poll_seconds)
             continue
 
+        with slots:
+            duplicate = job.id in live
+            if not duplicate:
+                live.add(job.id)
+        if duplicate:
+            # The copy already running keeps reporting, which renews the lease.
+            release()
+            emit("error", f"{job.id[:8]} was claimed again while running here; left running")
+            continue
         if once:
             work(job)
             return completed

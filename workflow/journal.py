@@ -1,0 +1,179 @@
+"""Put a task wf created into the day's journal note in NotesGraph.
+
+A daily note (titled with the date, 2026-11-15) has a heading per project
+("## workflow", "## notes graph") with that day's tasks listed under it. A
+task an agent files with `wf task create` (or the wf-tools `create_task`
+tool) from a `wf ai` session lands in Linear, Jira or the markdown store,
+where the user doesn't see it while reading their day; this adds it to the
+journal too, as `- [ ] PERSONAL-290 Title` under the project's heading.
+
+An existing page only ever gets the line added, with the server's
+append_to_section, which inserts it as a new block and leaves every other
+block as it was. It is never read and written back whole with
+update_document: that rewrote the page on every task, and can't round-trip
+databases or images. A server without append_to_section leaves the page
+alone (the task is still made; `wf task create` warns).
+"""
+
+import json
+import os
+import re
+import subprocess
+from datetime import date
+from pathlib import Path
+from typing import Optional
+
+AGENT = "wf task create"
+
+_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+# The unchecked, empty item a daily note's template leaves under each heading.
+_EMPTY_ITEM = re.compile(r"^\s*[-*]\s+\[ \]\s*$")
+# A task line's `- [ ] ` marker; append_to_section takes the text without it.
+_LINE_MARKER = re.compile(r"^\s*[-*]\s+\[ \]\s*")
+
+
+def _name_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def in_wf_session() -> bool:
+    """True inside a `wf ai` / `claude` session, which sets WF_PROJECT."""
+    from workflow.projects import PROJECT_ENV
+
+    return bool(os.environ.get(PROJECT_ENV))
+
+
+def task_line(key: str, title: str, url: Optional[str] = None) -> str:
+    title = " ".join((title or "").split())
+    label = f"[{key}]({url})" if url else key
+    return f"- [ ] {label} {title}".rstrip()
+
+
+def insert_task(markdown: Optional[str], heading: str, line: str) -> str:
+    """`markdown` with `line` added under the heading named like `heading`.
+
+    The heading is matched ignoring case, spaces and dashes ("notes-graph"
+    finds "## notes graph"). The line takes the place of the section's empty
+    `- [ ]` item when it has one, else goes after the section's last text,
+    before its first subheading ("### todos:"). A missing heading is added
+    before "## Inbox", or at the end.
+    """
+    lines = (markdown or "").rstrip("\n").split("\n") if (markdown or "").strip() else []
+    key = _name_key(heading)
+    start = next((i for i, text in enumerate(lines)
+                  if (m := _HEADING.match(text)) and _name_key(m.group(2)) == key), None)
+    if start is None:
+        block = [f"## {heading}", "", line]
+        inbox = next((i for i, text in enumerate(lines)
+                      if (m := _HEADING.match(text)) and _name_key(m.group(2)) == "inbox"), None)
+        if inbox is None:
+            return "\n".join(lines + ([""] if lines else []) + block) + "\n"
+        return "\n".join(lines[:inbox] + block + [""] + lines[inbox:]) + "\n"
+
+    end = next((i for i in range(start + 1, len(lines)) if _HEADING.match(lines[i])), len(lines))
+    empty = next((i for i in range(start + 1, end) if _EMPTY_ITEM.match(lines[i])), None)
+    if empty is not None:
+        lines[empty] = line
+        return "\n".join(lines) + "\n"
+    last = max((i for i in range(start, end) if lines[i].strip()), default=start)
+    insert = [line] if last > start else ["", line]
+    if end < len(lines) and last + 1 == end:
+        insert.append("")
+    return "\n".join(lines[:last + 1] + insert + lines[last + 1:]) + "\n"
+
+
+def _session_repo(repos: dict) -> Optional[str]:
+    """The configured repo the current folder is in; a worktree counts as its main checkout."""
+    candidates = []
+    try:
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=5)
+        if common.returncode == 0 and common.stdout.strip():
+            candidates.append(str(Path(common.stdout.strip()).parent))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    candidates.append(os.getcwd())
+    for folder in candidates:
+        folder = os.path.realpath(folder)
+        inside = [path for path in repos
+                  if folder == os.path.realpath(path)
+                  or folder.startswith(os.path.realpath(path).rstrip(os.sep) + os.sep)]
+        if inside:
+            return max(inside, key=len)
+    return None
+
+
+def journal_heading(project: Optional[str], repo: Optional[str] = None) -> str:
+    """The journal heading for a task in `project`: the NotesGraph project of
+    `repo` when given (a task filed for another repo), else of the repo the
+    session is in (`notesgraph_project:` in its config, else the repo's
+    folder name), else of the project's default repo, else the project's
+    name."""
+    from workflow.config import get_repositories
+    from workflow.projects import get_project
+
+    conf = get_project(project) if project else None
+    repos = dict((conf or {}).get("repositories") or {}) if project else dict(get_repositories() or {})
+    repo = repo or _session_repo(repos) or (conf or {}).get("default_repo") or next(iter(repos), None)
+    if repo:
+        repo_conf = repos.get(repo) if isinstance(repos.get(repo), dict) else {}
+        return str(repo_conf.get("notesgraph_project") or "") or Path(repo).name
+    return project or "Inbox"
+
+
+def record_task(reader, heading: str, line: str, day: Optional[date] = None) -> dict:
+    """Add `line` under `heading` in the journal note for `day` (today), made if missing.
+
+    The day's page is made first, by the server's ensure_journal, with the
+    outline the app gives a new day (a heading and empty to-do per project,
+    then Inbox), so the line lands in a real journal page; the app adopts it
+    as that day's journal and adds its todos: lists. A server without that
+    tool gets the old way: the page titled with the date, made holding the
+    line when there is none.
+
+    The line goes in with append_to_section, never by rewriting the page; a
+    server without it raises NotesGraphError and the page is left alone.
+
+    Returns {"docId", "title", "created"}.
+    """
+    from workflow.deploy.notes import NotesGraphError, upsert_note
+
+    title = (day or date.today()).isoformat()
+
+    try:
+        made = json.loads(reader.call("ensure_journal", {"date": title, "agent": AGENT}))
+    except (NotesGraphError, ValueError, TypeError):
+        made = None
+    doc_id = (made or {}).get("docId") if isinstance(made, dict) else None
+    created = bool(made.get("created")) if doc_id else False
+    if not doc_id:
+        page = reader.find(title)
+        if not page:
+            # A new page: nothing on it to lose.
+            result = upsert_note(reader, title, insert_task(None, heading, line), AGENT)
+            return {"docId": result.get("docId"), "title": title, "created": result.get("created")}
+        doc_id = page["docId"]
+
+    text = _LINE_MARKER.sub("", line, count=1)
+    reader.call("append_to_section",
+                {"docId": doc_id, "heading": heading, "lines": [text], "agent": AGENT})
+    return {"docId": doc_id, "title": title, "created": created}
+
+
+def record_created_task(project: Optional[str], key: str, title: str, url: Optional[str] = None,
+                        reader=None, repo: Optional[str] = None, repo_tag: Optional[str] = None) -> dict:
+    """record_task for a task wf just created, with the heading from journal_heading.
+
+    `repo` (a path) files it under that repo's heading; `repo_tag` ends the
+    line with `#repo:<name>`, which starting the task reads to go to that repo.
+    """
+    if reader is None:
+        from workflow.cli_notes import reader_from_env
+
+        reader = reader_from_env()
+    heading = journal_heading(project, repo)
+    line = task_line(key, title, url)
+    if repo_tag:
+        line = f"{line} #repo:{repo_tag}"
+    result = record_task(reader, heading, line)
+    return {**result, "heading": heading}

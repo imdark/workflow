@@ -1,3 +1,6 @@
+import sys
+from typing import Optional
+
 from workflow.recall import memory_block
 from workflow.git_utils import get_repo
 from workflow.rag import get_rag
@@ -75,8 +78,12 @@ def get_ai_skills(issue, repo_path=None, project=None):
     return skills
 
 
-def build_context(issue, query: str = None, repo_path: str = None):
-    """Build context using RAG for project information"""
+def build_context(issue, query: str = None, repo_path: str = None, wf_tools: bool = False):
+    """Build context using RAG for project information.
+
+    `wf_tools` says the session has the wf-tools MCP server loaded (see
+    wf_tools_server); only then does the prompt mention its tools.
+    """
     rag = get_rag()
     
     # Get AI instructions
@@ -121,7 +128,7 @@ RELEVANT PROJECT CONTEXT:
     # Small, stable memory goes in the prompt; transcripts and the full fact
     # set stay behind the search_* MCP tools listed below.
     from workflow.projects import get_current_project
-    memory = memory_block(issue.key, project=get_current_project())
+    memory = memory_block(issue.key, project=get_current_project(), wf_tools=wf_tools)
     if memory:
         context_parts.append(f"""
 MEMORY (from earlier sessions on this task):
@@ -157,6 +164,12 @@ changes on this branch, then run
 That pushes the branch, opens a PR and moves the task to Committed. Don't
 stop before this.
 
+Make `wf done` your last step in this checkout. Once the PR is up and the
+branch has no uncommitted or unpushed work, the worktree is removed: by the
+job runner when a background session ends, or by `wf prune` (run by hand
+from the main checkout, or on a schedule). The branch stays. Don't
+leave anything you need in the worktree that isn't committed and pushed.
+
 The title and description are for a reviewer who hasn't seen this task or
 your session. The title says what the change does, in under 70 characters
 (the task key is added in front). The description says what changed and
@@ -171,10 +184,32 @@ open unnoticed:
 "{issue.key} needs no PR: close it by hand."
 """)
 
-    # Add MCP tools information
-    context_parts.append("""
+    # Only when the launcher loaded the server: sessions told about tools
+    # they did not have fell back to greps and missed the task's spec.
+    if wf_tools:
+        context_parts.append(wf_tools_section(issue.key))
+
+    return "\n".join(context_parts)
+
+
+WF_TOOLS = "wf-tools"
+
+
+def wf_tools_server() -> Optional[dict]:
+    """The wf-tools MCP server as an mcpServers entry, run by this Python;
+    None when it cannot load here (its MCP library is missing, say)."""
+    try:
+        import workflow.mcp  # noqa: F401  (same interpreter the server runs on)
+    except Exception:
+        return None
+    return {"type": "stdio", "command": sys.executable, "args": ["-m", "workflow.mcp"]}
+
+
+def wf_tools_section(task_key: str) -> str:
+    return f"""
 AVAILABLE MCP TOOLS:
-You have access to wf-tools MCP server. If Claude Desktop is configured with the wf-tools MCP server, you can use these tools:
+The wf-tools MCP server is loaded in this session (tools named
+mcp__wf-tools__<name>). Pass task_key="{task_key}" to the search tools.
 - search_task_facts: Search durable facts (decisions, constraints, preferences) recorded for this task
 - search_past_conversations: Full-text search over earlier captured agent sessions
 - get_current_task_info: Get the current active task
@@ -183,6 +218,7 @@ You have access to wf-tools MCP server. If Claude Desktop is configured with the
 - list_git_branches: List available git branches
 - get_current_git_branch: Get the current git branch
 - list_assigned_tasks: List Jira tasks assigned to you
+- create_task: Create a task in a project's backend (title, description?, project?), as `wf task create` does
 - list_hooks: List all configured hooks
 - add_hook: Add a new hook (name, trigger, action, success_hook?, fail_hook?, condition?)
 - remove_hook: Remove a hook
@@ -196,9 +232,7 @@ You have access to wf-tools MCP server. If Claude Desktop is configured with the
 
 Before redoing an investigation, search past conversations: an earlier
 session may already have the answer.
-""")
-    
-    return "\n".join(context_parts)
+"""
 
 def repo_name(repo_path: str = None):
     """The repo's name from its origin remote, else its folder; None without a path."""
@@ -231,11 +265,12 @@ def _repo_check(repo_path: str = None) -> str:
     where = (f"This session runs in a checkout of the {name} repo." if name else
              "Find out which repo this checkout is (`git remote get-url origin`).")
     return f"""{where} Before searching for
-code, check that the task's feature belongs to this repo. If it plainly
-belongs to another one (say, an app feature in a tooling repo), don't search
-here and don't run `wf done`: this branch has nothing to ship. Set the task
-to BLOCKED with a note naming the repo it needs (update_task, if you have
-the NotesGraph tools), say so in your answer, and stop."""
+code, check that the task's feature belongs to this repo. If it, or a
+subtask it needs, plainly belongs to another repo or project (say, an app
+feature in a tooling repo), use the file-task-elsewhere skill: it asks the
+user, files the task there with `wf task create --repo <name>` and lists it
+in today's journal. When the whole task was elsewhere, this branch has
+nothing to ship: skip `wf done`, say so in your answer, and stop."""
 
 
 def format_retrieved_context(chunks: list) -> str:

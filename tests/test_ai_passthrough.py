@@ -41,6 +41,18 @@ class _Provider:
         self.projects = getattr(self, "projects", []) + [project]
         return ""
 
+    def loads_wf_tools(self, args=None):
+        return False
+
+
+def test_claude_loads_wf_tools_unless_mcp_is_strict():
+    from workflow.ai_providers.claude import ClaudeProvider
+
+    assert ClaudeProvider().loads_wf_tools(["-c"])
+    assert not ClaudeProvider().loads_wf_tools(["--strict-mcp-config", "--mcp-config", "x.json"])
+    with mock.patch("workflow.ai_context.wf_tools_server", return_value=None):
+        assert not ClaudeProvider().loads_wf_tools()
+
 
 def _invoke(provider, argv, task=None):
     import workflow.cli as cli

@@ -141,8 +141,12 @@ def _legacy_summary(task_key: str) -> str:
     return tail[cut:].strip() if cut != -1 else tail
 
 
-def memory_block(task_key: Optional[str], store=None, project: Optional[str] = None) -> str:
-    """The stable memory block for a task prompt, or "" when there is none."""
+def memory_block(task_key: Optional[str], store=None, project: Optional[str] = None,
+                 wf_tools: bool = True) -> str:
+    """The stable memory block for a task prompt, or "" when there is none.
+
+    `wf_tools` says the session can call search_task_facts for the rest.
+    """
     if not task_key:
         return ""
 
@@ -176,7 +180,8 @@ def memory_block(task_key: Optional[str], store=None, project: Optional[str] = N
         read_ids += [f["id"] for f in facts[:len(lines)]]
         more = len(facts) - len(lines)
         if more > 0:
-            lines.append(f"- ... {more} more: call search_task_facts")
+            lines.append(f"- ... {more} more: call search_task_facts" if wf_tools
+                         else f"- ... {more} more not shown")
         parts.append("KNOWN FACTS:\n" + "\n".join(lines))
 
     if shared:
