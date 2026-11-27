@@ -215,7 +215,7 @@ def test_build_context_asks_to_check_the_repo_first(monkeypatch, tmp_path):
 def test_build_context_blocks_tasks_without_a_description(monkeypatch, description, blocked):
     from workflow import ai_context
 
-    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None: "")
+    monkeypatch.setattr(ai_context, "memory_block", lambda key, project=None, **_: "")
     monkeypatch.setattr(ai_context, "get_rag", lambda: None)
     monkeypatch.setattr(ai_context, "get_ai_instructions", lambda issue, repo: [])
     issue = SimpleNamespace(key="PAN-1", title="no-copy check ratchet", description=description)
