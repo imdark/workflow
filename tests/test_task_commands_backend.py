@@ -132,6 +132,8 @@ def test_transition_names_the_state_in_any_case(world):
     assert world.linear.moved == [("PEN-7", "done")]
     r = _wf("transition", "PEN-7", "Shipped", "--project", "work")
     assert "Invalid transition. Available: Todo, In Progress, Done" in r.output and len(world.linear.moved) == 1
+    # A refused move fails, so a script moving tasks can tell.
+    assert r.exit_code == 1
 
 
 def test_a_markdown_project_keeps_its_store(world):

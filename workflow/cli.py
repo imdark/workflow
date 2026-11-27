@@ -6487,8 +6487,10 @@ def task_transition(
     # Check available transitions first
     transitions = backend.get_available_transitions(key)
     if transitions and status.lower() not in {t.lower() for t in transitions}:
+        # A refusal is a failure: scripts that move tasks rely on the exit code
+        # (a loop once counted 99 refused moves as done).
         typer.echo(f"❌ Invalid transition. Available: {', '.join(transitions)}")
-        return
+        raise typer.Exit(1)
 
     try:
         moved = backend.transition_task(key, status)
