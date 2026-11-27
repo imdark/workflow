@@ -200,3 +200,13 @@ def test_linear_transition_task_by_state_name(monkeypatch):
     assert _sent(client, "issueUpdate")[-1] == {"id": "issue-uuid", "input": {"stateId": "s-review"}}
     assert backend.transition_task("ENG-123", "Shipped") is False
     assert len(_sent(client, "issueUpdate")) == 1
+
+
+def test_update_adds_and_removes_labels(world):
+    # The `wf set` command shadows the set builtin in cli.py; labels used it.
+    r = _wf("update", "PEN-7", "--add-labels", "unneeded, review", "--project", "work")
+    assert r.exit_code == 0, r.output
+    key, updates = world.linear.updated[-1]
+    assert key == "PEN-7" and sorted(updates["labels"]) == ["review", "unneeded"]
+    r = _wf("update", "PEN-7", "--remove-labels", "review", "--project", "work")
+    assert r.exit_code == 0, r.output
