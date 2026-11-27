@@ -90,6 +90,10 @@ class MarkdownTask:
         self.data['updated'] = datetime.now().isoformat()
 
 
+# The status of a task that was decided against: closed, and not done.
+REJECTED = 'Rejected'
+
+
 class MarkdownBackend(TaskBackend):
     """Markdown-based task backend"""
 
@@ -408,6 +412,12 @@ class MarkdownBackend(TaskBackend):
         """Move task to In Review status"""
         self.transition_task(issue.key, 'In Review')
 
+    def reject_task(self, key: str) -> Optional[str]:
+        """Close a task that won't be done. Returns the status it now has, or
+        None when there is no such task. A project's own workflow.yaml doesn't
+        have to list Rejected for this to work."""
+        return REJECTED if self.transition_task(key, REJECTED) else None
+
     def create_issue(self, summary, description, issue_type="Task", project_key=None, custom_fields=None):
         """Create a new issue/task"""
         # Get the project
@@ -540,10 +550,11 @@ class MarkdownBackend(TaskBackend):
 
         # Return default workflow
         return {
-            'To Do': ['In Progress'],
-            'In Progress': ['In Review', 'To Do'],
-            'In Review': ['Done', 'In Progress'],
-            'Done': ['In Progress']
+            'To Do': ['In Progress', REJECTED],
+            'In Progress': ['In Review', 'To Do', REJECTED],
+            'In Review': ['Done', 'In Progress', REJECTED],
+            'Done': ['In Progress'],
+            REJECTED: ['To Do'],
         }
 
     def get_available_transitions(self, key: str) -> List[str]:

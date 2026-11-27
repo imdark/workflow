@@ -210,3 +210,45 @@ def test_update_adds_and_removes_labels(world):
     assert key == "PEN-7" and sorted(updates["labels"]) == ["review", "unneeded"]
     r = _wf("update", "PEN-7", "--remove-labels", "review", "--project", "work")
     assert r.exit_code == 0, r.output
+
+
+# ---------------------------------------------------------------- rejecting a task
+
+def test_reject_closes_a_task_and_keeps_the_reason(world):
+    world.linear.reject_task = lambda key: "Canceled" if key == "PEN-7" else None
+    r = _wf("reject", "PEN-7", "--reason", "one memory note is enough", "--project", "work")
+    assert r.exit_code == 0, r.output
+    assert "Rejected PEN-7 (status: Canceled)" in r.output
+    assert world.linear.comments == [("PEN-7", "Rejected: one memory note is enough")]
+    # No such task, or no state to put it in: a failure, and no comment.
+    r = _wf("reject", "PEN-8", "--reason", "x", "--project", "work")
+    assert r.exit_code == 1 and len(world.linear.comments) == 1
+
+
+def test_a_backend_that_cannot_reject_says_so(world):
+    r = _wf("reject", "PERSONAL-1", "--project", "personal")
+    assert r.exit_code == 1 and "cannot be rejected from wf yet" in r.output
+
+
+def test_markdown_rejects_from_any_open_status_and_reopens_to_to_do(tmp_path):
+    from workflow.backends.markdown import MarkdownBackend, REJECTED
+    backend = MarkdownBackend({"markdown_tasks_dir": str(tmp_path)})
+    flow = backend.get_workflow("personal")
+    assert all(REJECTED in flow[s] for s in ("To Do", "In Progress", "In Review"))
+    assert REJECTED not in flow["Done"] and flow[REJECTED] == ["To Do"]
+    issue = backend.create_issue("Record the access path", "why", project_key="personal")
+    assert backend.reject_task(issue.key) == REJECTED
+    assert backend.get_available_transitions(issue.key) == ["To Do"]
+    assert backend.reject_task("PERSONAL-999") is None
+
+
+def test_linear_rejects_into_the_teams_canceled_state(monkeypatch):
+    backend, client = _linear(monkeypatch)
+    # The fake team has no canceled state.
+    assert backend.reject_task("ENG-123") is None and not _sent(client, "issueUpdate")
+    states = backend._states("ENG") + [{"id": "s-dup", "name": "Duplicate", "type": "canceled"},
+                                       {"id": "s-no", "name": "Won't do", "type": "canceled"}]
+    monkeypatch.setattr(backend, "_states", lambda team=None: states)
+    # A state named for it wins over the first one of the canceled type.
+    assert backend.reject_task("ENG-123") == "Won't do"
+    assert _sent(client, "issueUpdate")[-1] == {"id": "issue-uuid", "input": {"stateId": "s-no"}}

@@ -62,6 +62,10 @@ REVIEW_STATE_NAMES = ("in review", "code review", "peer review", "pr review", "r
 DONE_STATE_NAMES = ("done", "completed", "complete", "closed", "shipped", "merged")
 
 DONE_STATE_TYPES = ("completed",)
+# Where a rejected issue goes: a state the team named for it, else its
+# canceled state (every Linear team has one of that type).
+REJECTED_STATE_NAMES = ("rejected", "won't do", "wont do", "won't fix", "wontfix", "canceled", "cancelled")
+REJECTED_STATE_TYPES = ("canceled",)
 
 # Shared selection set, spliced into queries with %-formatting: GraphQL is
 # full of braces, so f-strings and .format() would need every one escaped.
@@ -949,6 +953,18 @@ class LinearBackend(TaskBackend):
             return False
         self._update_issue(key, {"stateId": state["id"]})
         return True
+
+    def reject_task(self, key: str) -> Optional[str]:
+        """Close an issue that won't be done. Returns the name of the state it
+        moved to, or None when the team has no rejected or canceled state."""
+        team_key = key.split("-")[0].upper() if "-" in str(key) else None
+        states = self._states(team_key)
+        state = next((s for s in states if (s.get("name") or "").lower() in REJECTED_STATE_NAMES), None) \
+            or next((s for s in states if s.get("type") in REJECTED_STATE_TYPES), None)
+        if state is None:
+            return None
+        self._update_issue(key, {"stateId": state["id"]})
+        return state["name"]
 
     # ------------------------------------------------------------------
     # Fields (Linear has none; expose its built-ins under the same API)
