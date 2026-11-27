@@ -6448,13 +6448,15 @@ def task_update(
     if add_labels or remove_labels:
         task = _find_task(backend, key)
         if task:
-            current_labels = set(task.labels)
-            
+            # Set literals, not set(): the `wf set` command below shadows the
+            # builtin in this module, and set(task.labels) called it.
+            current_labels = {*task.labels}
+
             if add_labels:
-                current_labels.update([l.strip() for l in add_labels.split(",") if l.strip()])
-            
+                current_labels.update(l.strip() for l in add_labels.split(",") if l.strip())
+
             if remove_labels:
-                current_labels -= set([l.strip() for l in remove_labels.split(",") if l.strip()])
+                current_labels -= {l.strip() for l in remove_labels.split(",") if l.strip()}
             
             updates["labels"] = list(current_labels)
     
