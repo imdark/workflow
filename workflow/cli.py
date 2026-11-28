@@ -6251,7 +6251,7 @@ def task_list(
     # alongside Jira's, so either backend sorts sensibly.
     status_order = {'Triage': 0, 'Backlog': 0, 'To Do': 0, 'Todo': 0, 'Open': 0,
                     'In Progress': 1, 'In Review': 2, 'Verification': 3, 'Blocked': 4,
-                    'Done': 5, 'Closed': 5, 'Resolved': 5, 'Canceled': 6, 'Cancelled': 6}
+                    'Done': 5, 'Closed': 5, 'Resolved': 5, 'Canceled': 6, 'Cancelled': 6, 'Rejected': 6}
     
     def sort_key(task):
         status_idx = status_order.get(task.status, 99)
@@ -6304,6 +6304,7 @@ def task_list(
                     "Done": "✅",
                     "Canceled": "🚫",
                     "Cancelled": "🚫",
+                    "Rejected": "🚫",
                 }.get(task.status, "⬜")
                 
                 typer.echo(f"  {status_emoji} {task.key}: {task.title}")
@@ -6354,7 +6355,8 @@ def task_list(
                     "To Do": "⬜",
                     "In Progress": "🔄",
                     "In Review": "👀",
-                    "Done": "✅"
+                    "Done": "✅",
+                    "Rejected": "🚫",
                 }.get(task.status, "⬜")
                 
                 typer.echo(f"  {status_emoji} {task.key}: {task.title}")
@@ -6504,6 +6506,38 @@ def task_transition(
     else:
         typer.echo(f"❌ Task '{key}' not found in {_where(target, backend_type)}")
         raise typer.Exit(1)
+
+
+@task_app.command("reject")
+def task_reject(
+    key: str = typer.Argument(..., autocompletion=autocomplete_tasks, help="Task key"),
+    reason: str = typer.Option(None, "--reason", "-r", help="Why it won't be done; kept as a comment on the task"),
+    project: str = typer.Option(None, "--project", help=PROJECT_OPTION_HELP),
+):
+    """Close a task that won't be done: Rejected, or Linear's canceled state.
+
+    The task stays in the tracker, so the decision and its reason can be read
+    later. `wf task transition KEY "To Do"` reopens a markdown one."""
+    backend, target, backend_type = _project_backend(project)
+    if not hasattr(backend, "reject_task"):
+        typer.echo(f"❌ {backend_type} tasks cannot be rejected from wf yet")
+        raise typer.Exit(1)
+    try:
+        status = backend.reject_task(key)
+    except Exception as e:                                  # noqa: BLE001
+        typer.echo(f"❌ {key}: {e}")
+        raise typer.Exit(1)
+    if not status:
+        typer.echo(f"❌ Task '{key}' not found in {_where(target, backend_type)}, or it has no rejected state")
+        raise typer.Exit(1)
+    typer.echo(f"🚫 Rejected {key} (status: {status})")
+    if reason and hasattr(backend, "add_comment"):
+        try:
+            backend.add_comment(key, f"Rejected: {reason}", None)
+        except Exception as e:                              # noqa: BLE001
+            typer.echo(f"⚠️  {key} is rejected, but the reason wasn't saved: {e}")
+            raise typer.Exit(1)
+        typer.echo(f"   Reason: {reason}")
 
 
 @task_app.command("delete")
