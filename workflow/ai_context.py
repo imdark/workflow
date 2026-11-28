@@ -237,6 +237,11 @@ The wf-tools MCP server is loaded in this session (tools named
 mcp__wf-tools__<name>). Pass task_key="{task_key}" to the search tools.
 - search_task_facts: Search durable facts (decisions, constraints, preferences) recorded for this task
 - search_past_conversations: Full-text search over earlier captured agent sessions
+- pr_status: A pull request in one call (repo_path, pr?: number, branch or task key): mergeable, review, checks, its task, and a one-line verdict. Use it instead of several `gh pr view`s
+- pr_checks: Why a pull request's checks fail: each failing job, the step that failed, the end of its log
+- pr_review_context: Everything a review reads at once: the task, the description, the discussion, the files and the diff
+- pr_list: The repository's pull requests, each with its checks and its task
+- ci_runs / ci_run: Recent GitHub Actions runs (builds, deploys), and one run's jobs with the failed step and log
 - get_current_task_info: Get the current active task
 - list_configured_projects: List all configured projects
 - get_current_project: Get the current active project

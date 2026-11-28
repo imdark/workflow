@@ -693,7 +693,10 @@ def run_settings(mcp_path: Path, rules: str = "", session_context: str = "") -> 
 WF_TOOLS = "wf-tools"
 # Read-only, so allowed without asking; the rest still go through approve.
 WF_TOOLS_ALLOWED = [f"mcp__{WF_TOOLS}__{name}" for name in
-                    ("search_task_facts", "search_past_conversations")]
+                    ("search_task_facts", "search_past_conversations",
+                     # Pull requests and CI, read through `gh` (workflow/pr.py).
+                     "pr_status", "pr_list", "pr_checks", "ci_runs", "ci_run",
+                     "pr_review_context")]
 
 
 def wf_tools_mcp() -> Optional[dict]:
