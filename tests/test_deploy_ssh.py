@@ -158,3 +158,31 @@ def test_ssh_host_and_ssh_config_write_the_projects_settings(world):
     assert cfg["ssh"]["user"] == "admin" and cfg["ssh"]["port"] == 2022 and cfg["ssh"]["key"] == "/keys/everywhere"
     listing = _wf("ssh-config").output
     assert "prod" in listing and "ubuntu@18.0.0.1:2022" in listing and "key from project personal defaults" in listing
+
+
+def test_the_tunnel_connects_the_same_way_and_takes_a_named_machine(world, monkeypatch):
+    from workflow.deploy.tunnel import _tunnel_args
+    args = _tunnel_args(Device(id="prod", host="ignored.example"), 8099, 7000)
+    # The project's host, user and key; the tunnel's own safety options stay.
+    assert args[:5] == ["ssh", "-N", "-i", "/keys/personal.pem", "-o"] and args[-1] == "ubuntu@18.0.0.1"
+    assert "ExitOnForwardFailure=yes" in args and args[args.index("-R") + 1] == "8099:127.0.0.1:7000"
+    bastion = _tunnel_args(Device(id="bastion", host="x"), 8099, 7000)
+    assert bastion[bastion.index("-p") + 1] == "2222" and bastion[-1] == "ops@10.0.0.9"
+
+    opened = []
+
+    class Held:
+        def __enter__(self):
+            return type("P", (), {"wait": lambda self: None})()
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("workflow.proxy.daemon.status", lambda: {"running": True})
+    monkeypatch.setattr("workflow.deploy.tunnel.reverse_tunnel",
+                        lambda device, remote_port: opened.append((device, remote_port)) or Held())
+    r = _wf("tunnel", "prod", "--port", "9000")
+    assert r.exit_code == 0, r.output
+    (device, port), = opened
+    assert (device.id, device.ssh_destination, port) == ("prod", "ubuntu@18.0.0.1", 9000)
+    assert _wf("tunnel", "nowhere").exit_code == 1

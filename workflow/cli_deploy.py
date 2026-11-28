@@ -759,10 +759,15 @@ def deploy_tunnel(
     runs against your account and your conversation store without any
     credential being copied onto the machine.
     """
+    from workflow.deploy import ssh_config
     from workflow.deploy.tunnel import export_line, reverse_tunnel
     from workflow.proxy import daemon
 
-    device = _resolve(get_registry(), target)
+    registry = get_registry()
+    # A machine named with `wf deploy ssh-host` works here too.
+    named = None if registry.get(target) else ssh_config.resolve(target, ssh_config.current_project())
+    device = Device(id=named.name, name=named.name, host=named.host, user=named.user, port=named.port) \
+        if named else _resolve(registry, target)
 
     if not daemon.status().get("running"):
         console.print("⚠️  The capture proxy is not running — the tunnel would lead nowhere.")
