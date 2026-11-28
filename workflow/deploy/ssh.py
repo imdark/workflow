@@ -127,6 +127,7 @@ class SshRunner:
         """Copy a local file to the device."""
         args = ["scp", "-o", f"ConnectTimeout={CONNECT_TIMEOUT}",
                 "-o", "StrictHostKeyChecking=accept-new",
+                *self.extra_args,
                 "-P", str(self.device.port), local,
                 f"{self.device.ssh_destination}:{remote}"]
         started = time.time()
@@ -317,4 +318,11 @@ def runner_for(device, **kwargs):
     """Pick the transport for a device: local execution, or SSH."""
     if is_local_host(device.host):
         return LocalRunner(device)
+    if "extra_args" not in kwargs:
+        # The key, user, port and options `wf deploy ssh` would use, so
+        # every deploy command reaches the machine the same way.
+        from workflow.deploy import ssh_config
+        target = ssh_config.for_device(device, ssh_config.current_project())
+        device = ssh_config.device_with_settings(device, target)
+        kwargs["extra_args"] = ssh_config.connection_args(target)
     return SshRunner(device, **kwargs)

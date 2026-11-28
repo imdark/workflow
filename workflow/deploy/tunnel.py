@@ -28,8 +28,12 @@ def export_line(remote_port: int) -> str:
 
 
 def _tunnel_args(device, remote_port: int, local_port: int) -> list:
+    # The key, user, port and options `wf deploy ssh` reaches it with.
+    from workflow.deploy import ssh_config
+    target = ssh_config.for_device(device, ssh_config.current_project())
     return [
         "ssh", "-N",
+        *ssh_config.connection_args(target),
         "-o", f"ConnectTimeout={CONNECT_TIMEOUT}",
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
@@ -38,9 +42,9 @@ def _tunnel_args(device, remote_port: int, local_port: int) -> list:
         "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=3",
         "-o", "ExitOnForwardFailure=yes",
-        "-p", str(device.port),
+        "-p", str(target.port),
         "-R", f"{remote_port}:127.0.0.1:{local_port}",
-        device.ssh_destination,
+        target.destination,
     ]
 
 

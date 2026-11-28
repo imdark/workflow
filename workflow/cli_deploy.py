@@ -564,6 +564,190 @@ def deploy_exec(
     raise typer.Exit(result.exit_code)
 
 
+def _ssh_project(project: Optional[str]) -> Optional[str]:
+    from workflow.deploy import ssh_config
+    from workflow.projects import get_project
+
+    if project and not get_project(project):
+        console.print(f"❌ No project named '{project}'")
+        raise typer.Exit(1)
+    return project or ssh_config.current_project()
+
+
+def _ssh_section(project: Optional[str], is_global: bool) -> tuple:
+    """(config, its `ssh` section, label) to edit: the project's, or the global one."""
+    from workflow.config import load_config
+
+    cfg = load_config()
+    if is_global or not project:
+        return cfg, cfg.setdefault("ssh", {}), "global"
+    return cfg, cfg["projects"][project].setdefault("ssh", {}), f"project {project}"
+
+
+@deploy_app.command("ssh", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def deploy_ssh(
+    ctx: typer.Context,
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the ssh command instead of running it"),
+    project: Optional[str] = typer.Option(None, "--project", help="Use this project's defaults"),
+):
+    """Open ssh to a machine by name, with the project's key, user and port.
+
+    Usage: wf deploy ssh NAME, then any ssh options, then a command to run.
+
+    The key, user, port and options come from the project's `ssh` settings
+    (see `wf deploy ssh-config`); everything after the name goes to ssh as
+    typed. Without a name, the project's default machine.
+
+        wf deploy ssh prod
+        wf deploy ssh prod uptime
+        wf deploy ssh prod -L 8080:localhost:8080 -N
+        wf deploy ssh prod -- tail -f /var/log/syslog
+    """
+    import os
+
+    from workflow.deploy import ssh_config
+
+    project = _ssh_project(project)
+    registry = get_registry()
+    args = list(ctx.args)
+    target = ssh_config.resolve(args[0], project, registry=registry) if args and not args[0].startswith("-") else None
+    if target:
+        args = args[1:]
+    else:
+        # Not a machine's name: the default machine, and all of it is for ssh.
+        default = ssh_config.default_name(project)
+        target = ssh_config.resolve(default, project, registry=registry) if default else None
+        if not target:
+            known = ssh_config.host_names(project) + [d.id for d in registry.list()]
+            what = f"'{args[0]}' is not a machine" if args and not args[0].startswith("-") else "No machine named"
+            console.print(f"❌ {what}, and {'project ' + project if project else 'the config'} "
+                          f"has no default one{' that resolves' if default else ''}.")
+            if known:
+                console.print(f"   known: {', '.join(known)}")
+            console.print("💡 Add one with 'wf deploy ssh-host NAME user@host --key PATH --default'")
+            raise typer.Exit(1)
+
+    options, command = ssh_config.split_args(args)
+    argv = ssh_config.ssh_argv(target, options, command)
+    if dry_run:
+        import shlex
+        typer.echo(" ".join(shlex.quote(a) for a in argv))
+        for setting, source in target.sources.items():
+            typer.echo(f"  {setting}: {source}")
+        return
+    try:
+        # Replace this process: ssh gets the terminal, the signals and the exit code.
+        os.execvp(argv[0], argv)
+    except FileNotFoundError:
+        console.print("❌ ssh is not on PATH")
+        raise typer.Exit(127)
+
+
+@deploy_app.command("ssh-host")
+def deploy_ssh_host(
+    name: str = typer.Argument(..., help="What to call the machine"),
+    destination: Optional[str] = typer.Argument(None, help="[user@]host[:port]"),
+    key: Optional[str] = typer.Option(None, "--key", "-i", help="Private key file for this machine"),
+    option: Optional[List[str]] = typer.Option(None, "--option", "-o", help="ssh -o option, repeatable"),
+    default: bool = typer.Option(False, "--default", help="Make it the machine used when none is named"),
+    remove: bool = typer.Option(False, "--remove", help="Forget this machine"),
+    project: Optional[str] = typer.Option(None, "--project", help="Project to save it in (default: this one)"),
+    is_global: bool = typer.Option(False, "--global", help="Save it for every project"),
+):
+    """Name a machine for `wf deploy ssh`, in the project's settings.
+
+    Kept in the wf config only; unlike `wf deploy add` it isn't published
+    to the deployment registry.
+    """
+    from workflow.config import save_config
+
+    cfg, section, label = _ssh_section(_ssh_project(project), is_global)
+    hosts = section.setdefault("hosts", {})
+    if remove:
+        if hosts.pop(name, None) is None:
+            console.print(f"❌ No machine '{name}' in {label}")
+            raise typer.Exit(1)
+        if section.get("default") == name:
+            section.pop("default")
+        save_config(cfg)
+        console.print(f"🗑  Forgot {name} ({label})")
+        return
+
+    entry = dict(hosts.get(name) or {}) if isinstance(hosts.get(name), dict) else {}
+    if destination:
+        try:
+            parts = parse_destination(destination)
+        except ValueError as e:
+            console.print(f"❌ {e}")
+            raise typer.Exit(1)
+        entry["host"] = parts["host"]
+        if parts["user"]:
+            entry["user"] = parts["user"]
+        if parts["port"] != 22:
+            entry["port"] = parts["port"]
+    if not entry.get("host"):
+        console.print(f"❌ '{name}' is new: give its [user@]host")
+        raise typer.Exit(1)
+    if key:
+        entry["key"] = key
+    if option:
+        entry["options"] = list(option)
+    hosts[name] = entry
+    if default:
+        section["default"] = name
+    save_config(cfg)
+    console.print(f"✅ {name} → {entry.get('user', '') + '@' if entry.get('user') else ''}{entry['host']} ({label})"
+                  + (", default" if section.get("default") == name else ""))
+
+
+@deploy_app.command("ssh-config")
+def deploy_ssh_config(
+    user: Optional[str] = typer.Option(None, "--user", "-l", help="Default user"),
+    key: Optional[str] = typer.Option(None, "--key", "-i", help="Default private key file"),
+    port: Optional[int] = typer.Option(None, "--port", "-p", help="Default port"),
+    option: Optional[List[str]] = typer.Option(None, "--option", "-o", help="Default ssh -o option, repeatable"),
+    default: Optional[str] = typer.Option(None, "--default", help="Machine used when none is named"),
+    project: Optional[str] = typer.Option(None, "--project", help="Project to read or change (default: this one)"),
+    is_global: bool = typer.Option(False, "--global", help="Read or change the defaults for every project"),
+):
+    """Show how `wf deploy ssh` reaches each machine, or set the defaults.
+
+    With no option, lists the machines and where each setting comes from.
+    """
+    from workflow.config import save_config
+    from workflow.deploy import ssh_config
+
+    project = _ssh_project(project)
+    changes = {"user": user, "key": key, "port": port, "options": list(option) if option else None,
+               "default": default}
+    if any(v is not None for v in changes.values()):
+        cfg, section, label = _ssh_section(project, is_global)
+        section.update({k: v for k, v in changes.items() if v is not None})
+        save_config(cfg)
+        console.print(f"✅ Saved ssh defaults ({label}): "
+                      + ", ".join(f"{k}={v}" for k, v in changes.items() if v is not None))
+        return
+
+    project = None if is_global else project
+    registry = get_registry()
+    names = ssh_config.host_names(project) + [d.id for d in registry.list()
+                                              if d.id not in ssh_config.host_names(project)]
+    console.print(f"ssh settings for {'project ' + project if project else 'every project'}"
+                  f" (default machine: {ssh_config.default_name(project) or 'none'})")
+    if not names:
+        console.print("  no machines. Add one with 'wf deploy ssh-host NAME user@host --key PATH'")
+    for name in names:
+        target = ssh_config.resolve(name, project, registry=registry)
+        if not target:
+            continue
+        console.print(f"  [bold]{name}[/bold]  {target.destination}"
+                      + (f":{target.port}" if target.port != 22 else "")
+                      + (f"  key {target.key}" if target.key else "")
+                      + (f"  -o {' -o '.join(target.options)}" if target.options else ""))
+        for setting, source in target.sources.items():
+            console.print(f"      [dim]{setting} from {source}[/dim]")
+
+
 @deploy_app.command("tunnel")
 def deploy_tunnel(
     target: str = typer.Argument(..., help="Target id"),
@@ -575,10 +759,15 @@ def deploy_tunnel(
     runs against your account and your conversation store without any
     credential being copied onto the machine.
     """
+    from workflow.deploy import ssh_config
     from workflow.deploy.tunnel import export_line, reverse_tunnel
     from workflow.proxy import daemon
 
-    device = _resolve(get_registry(), target)
+    registry = get_registry()
+    # A machine named with `wf deploy ssh-host` works here too.
+    named = None if registry.get(target) else ssh_config.resolve(target, ssh_config.current_project())
+    device = Device(id=named.name, name=named.name, host=named.host, user=named.user, port=named.port) \
+        if named else _resolve(registry, target)
 
     if not daemon.status().get("running"):
         console.print("⚠️  The capture proxy is not running — the tunnel would lead nowhere.")
