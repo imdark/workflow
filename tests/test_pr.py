@@ -355,3 +355,38 @@ def test_agent_runs_may_use_the_readers_without_asking():
     from workflow.deploy.jobs import WF_TOOLS_ALLOWED
     for name in ("pr_status", "pr_list", "pr_checks", "ci_runs", "ci_run", "pr_review_context"):
         assert f"mcp__wf-tools__{name}" in WF_TOOLS_ALLOWED
+
+
+def test_workflows_are_listed_with_what_starts_them_and_their_last_run(tmp_path):
+    flows = tmp_path / ".github" / "workflows"
+    flows.mkdir(parents=True)
+    (flows / "ci.yml").write_text(
+        "name: CI\non:\n  push:\n    branches: [main, stage]\n  pull_request:\n  schedule:\n"
+        "    - cron: '0 3 * * *'\n  workflow_dispatch:\n")
+    (flows / "deploy.yml").write_text("name: Deploy\non: workflow_dispatch\n")
+    run_row = {"databaseId": 900, "workflowName": "CI", "displayTitle": "x", "status": "completed",
+               "conclusion": "failure", "event": "push", "headBranch": "stage", "headSha": "f" * 40,
+               "createdAt": "2026-11-27T19:13:36Z", "url": "https://github.com/acme/app/actions/runs/900"}
+    gh = Gh({
+        "workflow list": [
+            {"id": 1, "name": "CI", "path": ".github/workflows/ci.yml", "state": "active"},
+            {"id": 2, "name": "Deploy", "path": ".github/workflows/deploy.yml", "state": "disabled_manually"},
+            {"id": 3, "name": "CodeQL", "path": "dynamic/github-code-scanning/codeql", "state": "active"}],
+        # Newest first: the older CI run is not the last one.
+        "run list": [run_row, dict(run_row, databaseId=800, conclusion="success")],
+    })
+    # From a folder inside the checkout, as an agent calls it.
+    rows = prs.ci_workflows(str(flows), run=gh)
+    ci, deploy, codeql = rows
+    assert ci["triggers"] == ["push (main, stage)", "pull_request", "cron 0 3 * * *", "manual"]
+    assert ci["last_run"]["id"] == 900 and ci["last_run"]["conclusion"] == "failure"
+    assert (deploy["enabled"], deploy["triggers"], deploy["last_run"]) == (False, ["manual"], None)
+    # GitHub runs this one itself: no file to read.
+    assert codeql["triggers"] is None
+    text = prs.format_workflows(rows)
+    assert "✗ CI (ci.yml) · push (main, stage), pull_request, cron 0 3 * * *, manual" in text
+    assert "last: failure · stage · 2026-11-27T19:13:36Z · run 900" in text
+    assert "· Deploy (deploy.yml) [disabled_manually] · manual" in text
+    assert prs.format_workflows([]) == "No workflows."
+    # Another repository's files aren't here to read.
+    assert prs.ci_workflows(str(flows), repo="acme/other", run=gh)[0]["triggers"] is None

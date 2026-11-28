@@ -418,6 +418,46 @@ def ci_runs(
 
 
 @mcp.tool()
+def ci_workflows(
+    repo_path: Annotated[str, _REPO_PATH],
+    repo: Annotated[str, _REPO] = None,
+) -> str:
+    """The repository's CI workflows (what runs are made from): file, enabled or not, what starts each, and its last run."""
+    from workflow.pr import ci_workflows as _ci_workflows
+    return _pr_tool(_ci_workflows, repo_path=repo_path, repo=repo)
+
+
+def _runs_tool(fn, **kwargs) -> str:
+    from workflow.agent_runs import RunsError
+    from workflow.deploy.registry.notesgraph import NotesGraphError
+    try:
+        return json.dumps(fn(**kwargs), indent=2)
+    except (RunsError, NotesGraphError) as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def agent_runs(
+    status: Annotated[str, "queued, running, done, error or cancelled"] = None,
+    device: Annotated[str, "Only runs on this device (cloud, prod, a laptop's key)"] = None,
+    kind: Annotated[str, "agent or automation"] = None,
+    agent: Annotated[str, "Only runs whose agent name or title contains this text"] = None,
+    since: Annotated[str, "Ended within 30m, 24h, 7d, 2w, or since an ISO date"] = None,
+    limit: Annotated[int, "How many to list"] = 20,
+) -> str:
+    """NotesGraph agent and automation runs on every device, newest first: status, device, agent, time, cost, error. No prompts or results."""
+    from workflow.agent_runs import agent_runs as _agent_runs
+    return _runs_tool(_agent_runs, status=status, device=device, kind=kind, agent=agent, since=since, limit=limit)
+
+
+@mcp.tool()
+def agent_templates() -> str:
+    """What NotesGraph runs are started from: ready-made automation templates, the saved automations with their schedule, and the agents recent runs used."""
+    from workflow.agent_runs import agent_templates as _agent_templates
+    return _runs_tool(_agent_templates)
+
+
+@mcp.tool()
 def ci_run(
     repo_path: Annotated[str, _REPO_PATH],
     run_id: Annotated[int, "The run's id, as ci_runs lists it"],
