@@ -6934,6 +6934,10 @@ app.add_typer(deploy_app, name="deploy")
 from workflow.cli_release import release_app
 app.add_typer(release_app, name="release")
 
+# A repository's production data, backed up the way it says.
+from workflow.cli_backup import backup_app
+app.add_typer(backup_app, name="backup")
+
 # Remote agent execution on registered devices.
 from workflow.cli_agent import agent_app
 app.add_typer(agent_app, name="agent")
