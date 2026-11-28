@@ -84,9 +84,10 @@ def main_checkout(path: Optional[str] = None) -> Path:
     return Path(done.stdout.strip()).parent
 
 
-def find_release(path: Optional[str] = None, cfg: Optional[dict] = None) -> dict:
+def find_release(path: Optional[str] = None, cfg: Optional[dict] = None, key: str = "release") -> dict:
     """The release of the repository `path` is in: {project, repo, section}.
-    `section` is empty when the repository is known but has no release yet."""
+    `section` is empty when the repository is known but has no release yet.
+    `key` names another per-repository section kept the same way (`backup`)."""
     from workflow.config import load_config
     cfg = load_config() if cfg is None else cfg
     repo = main_checkout(path).resolve()
@@ -94,15 +95,15 @@ def find_release(path: Optional[str] = None, cfg: Optional[dict] = None) -> dict
         for configured, settings in ((project_cfg or {}).get("repositories") or {}).items():
             if Path(configured).expanduser().resolve() == repo:
                 return {"project": project, "repo": str(configured),
-                        "section": dict((settings or {}).get("release") or {})}
+                        "section": dict((settings or {}).get(key) or {})}
     raise ReleaseError(f"{repo} is not a repository of any wf project (see 'wf project list')")
 
 
-def save_release(info: dict, section: dict) -> None:
+def save_release(info: dict, section: dict, key: str = "release") -> None:
     from workflow.config import load_config, save_config
     cfg = load_config()
     repos = cfg["projects"][info["project"]]["repositories"]
-    repos[info["repo"]] = {**(repos.get(info["repo"]) or {}), "release": section}
+    repos[info["repo"]] = {**(repos.get(info["repo"]) or {}), key: section}
     save_config(cfg)
 
 
