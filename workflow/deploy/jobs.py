@@ -727,7 +727,9 @@ WF_TOOLS_ALLOWED = [f"mcp__{WF_TOOLS}__{name}" for name in
                     ("search_task_facts", "search_past_conversations",
                      # Pull requests and CI, read through `gh` (workflow/pr.py).
                      "pr_status", "pr_list", "pr_checks", "ci_runs", "ci_run",
-                     "pr_review_context")]
+                     "pr_review_context", "ci_workflows",
+                     # NotesGraph runs and what starts them (workflow/agent_runs.py).
+                     "agent_runs", "agent_templates")]
 
 
 def wf_tools_mcp() -> Optional[dict]:

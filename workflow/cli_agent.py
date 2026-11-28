@@ -213,6 +213,48 @@ def agent_jobs(
             console.print(f"      [dim]{job['error'][:120]}[/dim]")
 
 
+def _runs_call(fn, formatter, as_json: bool, **kwargs):
+    """Run one of workflow.agent_runs' readers and print it, as text or JSON."""
+    import json
+
+    from workflow.agent_runs import RunsError
+    from workflow.deploy.registry.notesgraph import NotesGraphError
+
+    try:
+        result = fn(**kwargs)
+    except (RunsError, NotesGraphError) as e:
+        typer.echo(f"❌ {e}", err=True)
+        raise typer.Exit(2)
+    typer.echo(json.dumps(result, indent=2) if as_json else formatter(result))
+
+
+@agent_app.command("runs")
+def agent_runs_cmd(
+    status: Optional[str] = typer.Option(None, "--status", "-s", help="queued, running, done, error or cancelled"),
+    device: Optional[str] = typer.Option(None, "--device", "-d", help="Only runs on this device (cloud, prod, ...)"),
+    kind: Optional[str] = typer.Option(None, "--kind", "-k", help="agent or automation"),
+    agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Only runs whose agent or title has this text"),
+    since: Optional[str] = typer.Option(None, "--since", help="Ended within 30m, 24h, 7d, 2w, or since an ISO date"),
+    limit: int = typer.Option(20, "--limit", "-l", help="How many to list"),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """Agent and automation runs on every device, newest first.
+
+    Unlike `wf agent jobs`, this machine doesn't have to be a registered
+    device. `wf agent logs <id>` shows one run's transcript.
+    """
+    from workflow import agent_runs as runs
+    _runs_call(runs.agent_runs, runs.format_runs, as_json, status=status, device=device, kind=kind,
+               agent=agent, since=since, limit=limit)
+
+
+@agent_app.command("templates")
+def agent_templates_cmd(as_json: bool = typer.Option(False, "--json", help="Print JSON")):
+    """What runs are started from: automation templates, saved automations, and the agents in use."""
+    from workflow import agent_runs as runs
+    _runs_call(runs.agent_templates, runs.format_templates, as_json)
+
+
 @agent_app.command("attach")
 def agent_attach(
     job: Optional[str] = typer.Argument(None, help="Job id or its first 8 characters (default: the newest running job)"),

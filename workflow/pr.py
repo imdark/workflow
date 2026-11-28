@@ -402,6 +402,71 @@ def ci_runs(repo_path: Optional[str] = None, branch: Optional[str] = None, workf
     } for r in _json(run, args, repo_path) or []]
 
 
+# How many recent runs to read to find each workflow's last one.
+WORKFLOW_RUN_SCAN = 100
+
+
+def _workflow_triggers(repo_path: Optional[str], path: Optional[str]) -> Optional[List[str]]:
+    """What starts a workflow, read from its file in the checkout: None when
+    the file isn't there (another repository, or a workflow GitHub runs
+    itself, like CodeQL's)."""
+    from pathlib import Path
+
+    import yaml
+
+    if not path:
+        return None
+    start = Path(repo_path or ".").resolve()
+    file = next((d / path for d in (start, *start.parents) if (d / path).is_file()), None)
+    if not file:
+        return None
+    try:
+        doc = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    # YAML reads a bare `on:` key as the boolean true.
+    on = doc.get("on", doc.get(True)) if isinstance(doc, dict) else None
+    if isinstance(on, str):
+        on = {on: None}
+    elif isinstance(on, list):
+        on = {str(event): None for event in on}
+    if not isinstance(on, dict):
+        return []
+    out = []
+    for event, detail in on.items():
+        if event == "schedule":
+            out += [f"cron {entry.get('cron')}" for entry in detail or [] if isinstance(entry, dict)]
+        elif event == "workflow_dispatch":
+            out.append("manual")
+        elif event == "workflow_run":
+            after = (detail or {}).get("workflows") or []
+            out.append("after " + ", ".join(after) if after else "workflow_run")
+        else:
+            branches = (detail or {}).get("branches") if isinstance(detail, dict) else None
+            out.append(f"{event} ({', '.join(branches)})" if branches else str(event))
+    return out
+
+
+def ci_workflows(repo_path: Optional[str] = None, repo: Optional[str] = None, run: Runner = gh) -> List[dict]:
+    """The repository's workflows (what CI runs are made from): each one's
+    file, whether it is enabled, what starts it, and how its last run went."""
+    raw = _json(run, ["workflow", "list", "--all", "--json", "id,name,path,state", *_repo_args(repo)], repo_path)
+    last: dict = {}
+    for item in ci_runs(repo_path, limit=WORKFLOW_RUN_SCAN, repo=repo, run=run):
+        last.setdefault(item["workflow"], item)          # newest first
+    out = []
+    for w in raw or []:
+        latest = last.get(w.get("name"))
+        out.append({
+            "id": w.get("id"), "name": w.get("name"), "path": w.get("path"),
+            "enabled": w.get("state") == "active", "state": w.get("state"),
+            "triggers": None if repo else _workflow_triggers(repo_path, w.get("path")),
+            "last_run": {k: latest[k] for k in ("id", "status", "conclusion", "branch", "created_at", "url")}
+            if latest else None,
+        })
+    return out
+
+
 def ci_run(run_id: int, repo_path: Optional[str] = None, repo: Optional[str] = None,
            logs: bool = True, tail: int = LOG_TAIL, run: Runner = gh) -> dict:
     """One workflow run: where it stands, its jobs, and for each failed job
@@ -550,6 +615,22 @@ def format_runs(rows: List[dict]) -> str:
     return "\n".join(
         f"{_run_mark(r['status'], r['conclusion'])} {r['id']} {r['workflow']} · {r['branch']} "
         f"{(r['sha'] or '')[:8]} · {r['conclusion'] or r['status']} · {r['created_at']}" for r in rows)
+
+
+def format_workflows(rows: List[dict]) -> str:
+    if not rows:
+        return "No workflows."
+    lines = []
+    for w in rows:
+        latest = w["last_run"]
+        mark = _run_mark(latest["status"], latest["conclusion"]) if latest else "·"
+        file = (w["path"] or "").rsplit("/", 1)[-1]
+        lines.append(f"{mark} {w['name']} ({file})" + ("" if w["enabled"] else f" [{w['state']}]")
+                     + (f" · {', '.join(w['triggers']) or 'no trigger'}" if w["triggers"] is not None else ""))
+        lines.append(f"    last: {latest['conclusion'] or latest['status']} · {latest['branch']} · "
+                     f"{latest['created_at']} · run {latest['id']}" if latest
+                     else f"    last: none in the last {WORKFLOW_RUN_SCAN} runs")
+    return "\n".join(lines)
 
 
 def format_run(result: dict) -> str:

@@ -242,6 +242,8 @@ mcp__wf-tools__<name>). Pass task_key="{task_key}" to the search tools.
 - pr_review_context: Everything a review reads at once: the task, the description, the discussion, the files and the diff
 - pr_list: The repository's pull requests, each with its checks and its task
 - ci_runs / ci_run: Recent GitHub Actions runs (builds, deploys), and one run's jobs with the failed step and log
+- ci_workflows: The repository's CI workflows: file, what starts each, how its last run went
+- agent_runs / agent_templates: NotesGraph agent and automation runs on every device (status, device, agent, since), and the templates, automations and agents they start from
 - get_current_task_info: Get the current active task
 - list_configured_projects: List all configured projects
 - get_current_project: Get the current active project

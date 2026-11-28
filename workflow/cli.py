@@ -7798,6 +7798,17 @@ def pr_runs_cmd(
              workflow=workflow, commit=commit, limit=limit, repo=repo)
 
 
+@pr_app.command("workflows")
+def pr_workflows_cmd(
+    repo_path: str = typer.Option(".", "--repo-path", help="Repository whose workflows to list"),
+    repo: str = typer.Option(None, "--repo", help=_PR_REPO_HELP),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON"),
+):
+    """The repository's CI workflows: file, what starts each, and how its last run went."""
+    from workflow import pr as prs
+    _pr_call(prs.ci_workflows, prs.format_workflows, as_json, repo_path=repo_path, repo=repo)
+
+
 @pr_app.command("run")
 def pr_run_cmd(
     run_id: int = typer.Argument(..., help="The run's id, as `wf pr runs` lists it"),
