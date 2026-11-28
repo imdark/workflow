@@ -6930,6 +6930,10 @@ app.add_typer(desktop_app, name="desktop")
 from workflow.cli_deploy import deploy_app
 app.add_typer(deploy_app, name="deploy")
 
+# wf's own release: every machine that runs it, onto main.
+from workflow.cli_release import release_app
+app.add_typer(release_app, name="release")
+
 # Remote agent execution on registered devices.
 from workflow.cli_agent import agent_app
 app.add_typer(agent_app, name="agent")
