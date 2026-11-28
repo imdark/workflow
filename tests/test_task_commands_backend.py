@@ -230,9 +230,12 @@ def test_a_backend_that_cannot_reject_says_so(world):
     assert r.exit_code == 1 and "cannot be rejected from wf yet" in r.output
 
 
-def test_markdown_rejects_from_any_open_status_and_reopens_to_to_do(tmp_path):
+def test_markdown_rejects_from_any_open_status_and_reopens_to_to_do(tmp_path, monkeypatch):
     from workflow.backends.markdown import MarkdownBackend, REJECTED
-    backend = MarkdownBackend({"markdown_tasks_dir": str(tmp_path)})
+    # The backend keeps its files under the home folder: not the real one.
+    monkeypatch.setattr("workflow.backends.markdown.Path.home", lambda: tmp_path)
+    backend = MarkdownBackend({})
+    assert backend.base_dir == tmp_path / ".wf" / "tasks"
     flow = backend.get_workflow("personal")
     assert all(REJECTED in flow[s] for s in ("To Do", "In Progress", "In Review"))
     assert REJECTED not in flow["Done"] and flow[REJECTED] == ["To Do"]
